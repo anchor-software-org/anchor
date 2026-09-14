@@ -10,7 +10,7 @@ lifecycleViewmodelCompose = "2.8.7"
 kotlinxCoroutinesAndroid = "1.10.2"
 kotlinxSerialization = "1.7.3"
 activityCompose = "1.12.2"
-composeBom = "2024.09.00"
+composeBom = "2026.09.00"
 navigationCompose = "2.9.6"
 camerax = "1.5.0-alpha06"
 
