@@ -12,7 +12,7 @@ kotlinxSerialization = "1.7.3"
 activityCompose = "1.12.2"
 composeBom = "2024.09.00"
 navigationCompose = "2.9.6"
-camerax = "1.5.0-alpha06"
+camerax = "1.7.0-alpha03"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
