@@ -1,0 +1,94 @@
+# ===== Dependencies =====
+node_modules/
+.pnpm-store/
+
+# ===== Cloudflare Wrangler =====
+.wrangler/
+
+# ===== Build artifacts =====
+**/target/
+**/build/
+**/pkg/
+**/dist/
+
+# ===== Environment & secrets =====
+.env
+.env.*
+!.env.example
+*.pem
+
+# ===== Rust =====
+Cargo.lock
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== Android =====
+*.apk
+*.aab
+*.jks
+*.keystore
+*.iml
+.gradle/
+local.properties
+.cxx/
+.externalNativeBuild/
+.navigation/
+*.hprof
+captures/
+
+# ===== iOS =====
+*.xcworkspace/xcuserdata/
+*.xcuserdata/
+*.xcuserstate
+DerivedData/
+Pods/
+*.xcscmblueprint
+
+# ===== macOS =====
+.DS_Store
+**/.DS_Store
+
+# ===== Windows =====
+Thumbs.db
+
+# ===== Editors & IDEs =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== Logs =====
+*.log
+
+# ===== Cache =====
+.cache/
+.vite/
+*.tsbuildinfo
+
+# ===== Temp / misc =====
+*.debug
+*.orig
+*.tmp
+
+# ===== Generated images =====
+*.ppm
+
+# ===== Database files =====
+*.db
+*.db-shm
+*.db-wal
+
+# ===== Arch Linux packaging =====
+*.pkg.tar.zst
+
+# ===== Local dev overrides =====
+.deriveddata-device/
+.kiro/
+.devenv/
+
+# Claude Code session artifacts
+.claude/
+pi-session-*.html

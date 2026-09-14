@@ -1,0 +1,235 @@
+name: AppImage Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "anchor-desktop/**"
+      - "assets/**"
+      - "scripts/build-appimage.sh"
+      - "scripts/build-appimage-container.sh"
+      - "scripts/appimage-builder/**"
+      - ".github/workflows/appimage.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  appimage:
+    name: Build AppImage (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build deps
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: >-
+            protobuf-compiler
+            pkg-config
+            cmake
+            nasm
+            libx264-dev
+            libva-dev
+            libgtk-3-dev
+            libwayland-dev
+            libdrm-dev
+            libgbm-dev
+            libxkbcommon-dev
+            libavcodec-dev
+            libavformat-dev
+            libavutil-dev
+            libavfilter-dev
+            libswscale-dev
+            libswresample-dev
+            libavdevice-dev
+            libclang-dev
+            libdbus-1-dev
+            libssl-dev
+            libayatana-appindicator3-dev
+            libwebkit2gtk-4.1-dev
+            libxdo-dev
+            llvm-dev
+            libfuse2
+            file
+            libjack-jackd2-0
+            libasound2
+            adb
+          # Bump this when the package set changes; otherwise the action can
+          # restore an older architecture-specific cache without new libraries.
+          version: 1.3
+
+      # The apt cache action can restore an older cache that predates a newly
+      # added package. Install protoc explicitly so every architecture has the
+      # compiler required by anchor-sdk's schema build script.
+      - name: Ensure protocol compiler is installed
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: anchor-desktop/frontend
+        run: pnpm install --frozen-lockfile
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            anchor-desktop
+          cache-on-failure: true
+          shared-key: appimage-ubuntu-22.04-${{ matrix.arch }}
+
+      # libsphinxbase links against BLAS/LAPACK. Install via plain apt (real
+      # dpkg runs the postinst -> update-alternatives, creating the
+      # libblas.so.3 / liblapack.so.3 symlinks). The awalsh128 cache action
+      # skips postinst on a cache hit, so the symlinks would be missing and
+      # the link step fails with undefined sposv_/ssymm_/spotrf_ refs.
+      - name: Install BLAS/LAPACK for linking
+        run: sudo apt-get install -y libblas3 liblapack3
+
+      - name: Build frontend assets
+        working-directory: anchor-desktop/frontend
+        run: pnpm run build
+
+      - name: Build Tauri release binary
+        working-directory: anchor-desktop
+        run: cargo build --release --locked --bin anchor
+
+      - name: Cache AppImage tool
+        id: appimage-tools-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/appimage-tools
+          key: appimage-tools-appimagetool-continuous-${{ matrix.arch }}
+
+      - name: Download appimagetool
+        if: steps.appimage-tools-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/appimage-tools
+          curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage" -o /tmp/appimage-tools/appimagetool
+
+      - name: Ensure AppImage tool is executable
+        run: chmod +x /tmp/appimage-tools/appimagetool
+
+      - name: Prepare AppDir
+        run: |
+          APPDIR=anchor-desktop/target/appimage/AppDir
+          mkdir -p $APPDIR/usr/{bin,lib,share/icons/hicolor/256x256/apps,share/applications}
+
+          # Copy binary
+          cp anchor-desktop/target/release/anchor $APPDIR/usr/bin/anchor
+
+          # FFmpeg is static, but its GPL H.264 encoder is the system libx264.
+          # Bundle the exact SONAME used at link time so an image built on
+          # Ubuntu also runs on rolling distributions with a newer x264 ABI.
+          X264_PATH=$(ldd $APPDIR/usr/bin/anchor | awk '$1 ~ /^libx264\.so/ { print $3; exit }')
+          test -n "$X264_PATH"
+          cp -L "$X264_PATH" $APPDIR/usr/lib/"$(basename "$X264_PATH")"
+
+          # Bundle adb and its non-glibc dependency closure separately. Keeping
+          # these libraries out of AppRun's global LD_LIBRARY_PATH prevents the
+          # Ubuntu ADB stack from leaking into Anchor's host GTK/WebKit process.
+          mkdir -p $APPDIR/usr/lib/adb
+          cp "$(command -v adb)" $APPDIR/usr/bin/adb.real
+          ldd $APPDIR/usr/bin/adb.real | awk '/=> \// { print $3 }' | while read -r lib; do
+            case "$(basename "$lib")" in
+              libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*) ;;
+              *) cp -Ln "$lib" $APPDIR/usr/lib/adb/ ;;
+            esac
+          done
+          cat > $APPDIR/usr/bin/adb << 'ADB_RUN'
+          #!/usr/bin/env bash
+          HERE="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+          export LD_LIBRARY_PATH="$HERE/../lib/adb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/adb.real" "$@"
+          ADB_RUN
+          chmod +x $APPDIR/usr/bin/adb
+          $APPDIR/usr/bin/adb version
+
+          # Desktop entry
+          cat > $APPDIR/usr/share/applications/anchor.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Anchor
+          Comment=Phone companion - screen mirroring, SMS, notifications, media control
+          Exec=anchor
+          Icon=anchor
+          StartupWMClass=com.anchor.desktop
+          Categories=Utility;
+          Terminal=false
+          DESKTOP
+
+          # Icon (resize to 256x256)
+          if command -v convert &>/dev/null; then
+            convert assets/anchor_logo_transparent.png -resize 256x256 $APPDIR/usr/share/icons/hicolor/256x256/apps/anchor.png
+          else
+            # Fallback: just copy, hope it's already 256x256
+            cp assets/anchor_logo_transparent.png $APPDIR/usr/share/icons/hicolor/256x256/apps/anchor.png
+          fi
+
+          # Symlinks and launcher at AppDir root. Tauri must use the host
+          # GTK/WebKit stack: copying it into AppDir creates an unsafe hybrid
+          # process with host extensions and can crash inside ld.so.
+          ln -sf usr/share/applications/anchor.desktop $APPDIR/anchor.desktop
+          ln -sf usr/share/icons/hicolor/256x256/apps/anchor.png $APPDIR/anchor.png
+          cat > $APPDIR/AppRun << 'APP_RUN'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          APPDIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
+
+          # Register the embedded desktop entry for direct AppImage launches.
+          if [[ -n "${APPIMAGE:-}" ]]; then
+            XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+            DESKTOP_DIR="$XDG_DATA_HOME/applications"
+            ICON_DIR="$XDG_DATA_HOME/icons/hicolor/256x256/apps"
+            mkdir -p "$DESKTOP_DIR" "$ICON_DIR"
+            awk -v appimage="$APPIMAGE" '$0 == "Exec=anchor" { print "Exec=\"" appimage "\""; next } { print }' \
+              "$APPDIR/usr/share/applications/anchor.desktop" > "$DESKTOP_DIR/com.anchor.desktop.desktop"
+            cp "$APPDIR/usr/share/icons/hicolor/256x256/apps/anchor.png" "$ICON_DIR/anchor.png"
+          fi
+
+          export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
+          export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$APPDIR/usr/bin/anchor" "$@"
+          APP_RUN
+          chmod +x $APPDIR/AppRun
+
+          # Prove the packaged binary resolves x264 from AppDir, not the host.
+          LD_LIBRARY_PATH="$PWD/$APPDIR/usr/lib" ldd $APPDIR/usr/bin/anchor | grep "libx264.*$PWD/$APPDIR/usr/lib"
+
+      - name: Package AppDir with appimagetool
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cd anchor-desktop/target/appimage
+          /tmp/appimage-tools/appimagetool AppDir
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: anchor-AppImage-${{ matrix.arch }}-${{ github.sha }}
+          path: anchor-desktop/target/appimage/Anchor-*.AppImage
+          if-no-files-found: error
+          retention-days: 14

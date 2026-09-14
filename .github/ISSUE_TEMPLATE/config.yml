@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private support and feedback
+    url: mailto:devs@anchor-software.org
+    about: Use email for private feedback, account matters, or reports containing sensitive information.
+  - name: Security vulnerability
+    url: mailto:devs@anchor-software.org
+    about: Do not report security vulnerabilities publicly.

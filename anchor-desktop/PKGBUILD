@@ -1,0 +1,40 @@
+# Maintainer: Anchor Software <devs@anchor-software.org>
+pkgname='anchor-desktop'
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="Wayland monitor extension and other functionality"
+arch=('x86_64')
+url="https://anchor-software.org"
+license=('GPL')
+depends=('wayland' 'webkit2gtk-4.1' 'ffmpeg' 'libdrm' 'mesa' 'gtk3' 'sqlite' 'xdotool' 'libappindicator-gtk3' 'gcc-libs' 'glibc')
+makedepends=('cargo' 'git' 'clang' 'pkg-config' 'cmake' 'perl' 'go')
+source=()
+options=(!lto)
+
+build() {
+	cd "$startdir"
+	chmod 755 pkg 2>/dev/null || true
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --release
+}
+
+package() {
+	cd "$startdir"
+	install -Dm0755 "target/release/anchor" "$pkgdir/usr/bin/anchor-desktop"
+	install -Dm644 "$startdir/../assets/anchor_logo_64.png" "$pkgdir/usr/share/icons/hicolor/64x64/apps/anchor-desktop.png"
+
+	# Create .desktop file for application launchers
+	install -dm755 "$pkgdir/usr/share/applications"
+	cat > "$pkgdir/usr/share/applications/com.anchor.desktop.desktop" <<'EOF'
+[Desktop Entry]
+Name=Anchor
+Comment=Wayland monitor extension and other functionality
+Exec=anchor-desktop
+Icon=anchor-desktop
+StartupWMClass=com.anchor.desktop
+Terminal=false
+Type=Application
+Categories=Utility;
+EOF
+}

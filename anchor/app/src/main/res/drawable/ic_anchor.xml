@@ -1,0 +1,11 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Anchor icon: ring at top, vertical shaft, curved arms at bottom -->
+    <!-- Top ring -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,2C10.34,2 9,3.34 9,5C9,6.3 9.84,7.4 11,7.82V9H8V11H11V19.92C8.16,19.56 5.87,17.46 5.21,14.72L7,14L3,12L2.97,12.03C2.97,12.03 3,16 3,16C3,19.87 6.13,23 10,23H14C17.87,23 21,19.87 21,16L21,12L17,14L18.79,14.72C18.13,17.46 15.84,19.56 13,19.92V11H16V9H13V7.82C14.16,7.4 15,6.3 15,5C15,3.34 13.66,2 12,2ZM12,4C12.55,4 13,4.45 13,5C13,5.55 12.55,6 12,6C11.45,6 11,5.55 11,5C11,4.45 11.45,4 12,4Z"/>
+</vector>

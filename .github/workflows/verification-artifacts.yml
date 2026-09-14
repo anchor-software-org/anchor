@@ -1,0 +1,124 @@
+name: Verification Artifacts
+
+# Build verification artifacts on every pull request and main push:
+#   - the Linux Tauri desktop binary (`anchor`, release build)
+#   - the Android debug APK
+# These are CI outputs only. This workflow does not sign or distribute a
+# release, and it must not receive Play credentials.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Desktop binary (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            pkg-config \
+            cmake \
+            nasm \
+            libx264-dev \
+            libva-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libxkbcommon-dev \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libavfilter-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libavdevice-dev \
+            libclang-dev \
+            libdbus-1-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            llvm-dev
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: anchor-desktop/frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend assets
+        working-directory: anchor-desktop/frontend
+        run: pnpm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            anchor-desktop
+
+      - name: Build Tauri release
+        working-directory: anchor-desktop
+        run: cargo build --release --locked --bin anchor
+
+      - name: Upload desktop binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: anchor-linux-${{ github.sha }}
+          path: anchor-desktop/target/release/anchor
+          if-no-files-found: error
+          retention-days: 30
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # versionName/protocol are derived from git in build.gradle.kts;
+          # full history keeps those reads well-defined.
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install protocol compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        working-directory: anchor
+        run: ./gradlew :anchorSdk:testDebugUnitTest :app:testDebugUnitTest :app:assembleDebug --no-daemon
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: anchor-android-debug-${{ github.sha }}
+          path: anchor/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
