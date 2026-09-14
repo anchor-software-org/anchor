@@ -81,7 +81,7 @@ jobs:
         run: cargo build --release --locked --bin anchor
 
       - name: Upload desktop binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: anchor-linux-${{ github.sha }}
           path: anchor-desktop/target/release/anchor
@@ -116,7 +116,7 @@ jobs:
         run: ./gradlew :anchorSdk:testDebugUnitTest :app:testDebugUnitTest :app:assembleDebug --no-daemon
 
       - name: Upload APKs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: anchor-android-debug-${{ github.sha }}
           path: anchor/app/build/outputs/apk/debug/*.apk
