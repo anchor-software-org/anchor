@@ -62,7 +62,7 @@ mdns-sd = "0.13"
 # Media playback control: read/control local MPRIS players, and expose the
 # phone as an MPRIS player so the system media widget / media keys drive it.
 mpris = "2.1"
-souvlaki = "0.7"
+souvlaki = "0.8"
 mimalloc = "0.1"
 tauri = { version = "2", features = ["tray-icon", "image-png", "custom-protocol"] }
 tauri-plugin-single-instance = "2"
