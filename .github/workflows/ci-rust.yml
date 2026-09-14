@@ -80,7 +80,7 @@ jobs:
           echo "FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-prebuilt" >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ffmpeg-prebuilt/lib" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
 
