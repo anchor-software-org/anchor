@@ -282,7 +282,8 @@ fn send_clipboard_to_device(
         let revision = sdk_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let accepted = sdk_senders.iter().fold(false, |accepted, (sender, origin)| {
             let sent = match mime {
-                anchor_wl_clipboard::MimeType::TextPlain | anchor_wl_clipboard::MimeType::TextPlainUtf8 => {
+                anchor_wl_clipboard::MimeType::TextPlain
+                | anchor_wl_clipboard::MimeType::TextPlainUtf8 => {
                     sender.send_text(*origin, revision, String::from_utf8_lossy(data))
                 }
                 anchor_wl_clipboard::MimeType::ImagePng => {
