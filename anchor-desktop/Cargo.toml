@@ -23,7 +23,7 @@ ffmpeg-vendor = [
 ffmpeg-prebuilt = []
 
 [dependencies]
-drm = "0.14.1"
+drm = "0.15.0"
 gbm = "0.18.0"
 log = { version = "0.4.29", features = ["std"] }
 ffmpeg-next = { version = "8.1" }
