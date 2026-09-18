@@ -1,0 +1,6 @@
+First Google Play release.
+
+• Direct Android-to-Linux pairing with authenticated encrypted transport
+• Optional SMS/MMS and contact sync with clear consent controls
+• Notification, clipboard, file, camera, media, display, and remote-input tools
+• In-app privacy and terms links

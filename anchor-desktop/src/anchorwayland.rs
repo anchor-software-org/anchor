@@ -1,0 +1,9 @@
+pub mod capture_backend;
+pub mod frame_trace;
+pub mod input;
+pub mod screencopy;
+pub mod vaapi_encoder;
+pub mod wayland_dispatch;
+pub mod wayland_mem;
+pub mod wayland_objects;
+pub mod wayland_plugin;

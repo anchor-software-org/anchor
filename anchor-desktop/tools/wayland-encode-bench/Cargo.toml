@@ -1,0 +1,23 @@
+[package]
+name = "wayland-encode-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# This independent crate imports the capture and VAAPI source modules directly
+# from Anchor. It deliberately omits the desktop app, device server, and phone.
+[dependencies]
+drm = "0.14.1"
+ffmpeg-next = { version = "8.1", features = [
+    "build",
+    "build-license-gpl",
+    "build-lib-x264",
+] }
+gbm = "0.18.0"
+libc = "0.2"
+ffmpeg-sys-next = { version = "8.1", features = ["build-drm", "build-vaapi"] }
+log = "0.4.29"
+serde_json = "1.0.149"
+wayland-client = "0.31.11"
+wayland-protocols = "0.32.9"
+wayland-protocols-wlr = { version = "0.3.9", features = ["client"] }

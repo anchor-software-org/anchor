@@ -1,0 +1,1395 @@
+//! High-level Anchor session lifecycle over a caller-owned Quinn endpoint.
+//!
+//! `Session` owns the authenticated control stream and its framing. Callers
+//! never need to know which protobuf record is the first record, how the
+//! length prefix is encoded, or how a session ID is allocated. Capability
+//! providers still own their application policy; an incoming capability-open
+//! request is surfaced as an event and is never approved implicitly.
+
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use bytes::Bytes;
+use prost::Message;
+use rustls::pki_types::CertificateDer;
+use thiserror::Error;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Mutex,
+};
+
+use crate::{
+    ALPN, CONTROL_MAGIC, MAX_CONTROL_RECORD_BYTES, NODE_ID_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ProtocolViolation, pairing, v1, validate_control_envelope,
+};
+
+const FIRST_RECORD_HEADER_BYTES: usize = CONTROL_MAGIC.len() + 2;
+
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error("QUIC connection failed: {0}")]
+    Connection(#[from] quinn::ConnectionError),
+    #[error("QUIC connect failed: {0}")]
+    Connect(#[from] quinn::ConnectError),
+    #[error("QUIC stream read failed: {0}")]
+    Read(#[from] quinn::ReadError),
+    #[error("QUIC stream ended before a complete record was available: {0}")]
+    ReadExact(#[from] quinn::ReadExactError),
+    #[error("control framing read failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("QUIC stream write failed: {0}")]
+    Write(#[from] quinn::WriteError),
+    #[error("QUIC stream closed before its send side could finish: {0}")]
+    ClosedStream(#[from] quinn::ClosedStream),
+    #[error("protocol validation failed: {0}")]
+    Protocol(#[from] ProtocolViolation),
+    #[error("control record is not valid in this session phase: {0}")]
+    UnexpectedRecord(&'static str),
+    #[error("peer does not advertise capability {name}@{major}")]
+    CapabilityUnavailable { name: String, major: u32 },
+    #[error("peer did not acknowledge capability session {0}")]
+    CapabilityNotOpened(u64),
+    #[error("control stream ended")]
+    ControlStreamEnded,
+}
+
+/// Local identity and endpoint advertisements sent in `SessionHello`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionIdentity {
+    pub node_id: [u8; NODE_ID_BYTES],
+    pub display_name: String,
+    pub device_kind: i32,
+    pub endpoints: Vec<v1::EndpointAdvertisement>,
+}
+
+impl SessionIdentity {
+    fn hello(&self) -> v1::ControlEnvelope {
+        v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(v1::control_envelope::Body::SessionHello(v1::SessionHello {
+                protocol_version: Some(v1::ProtocolVersion {
+                    major: u32::from(PROTOCOL_MAJOR),
+                    minor: u32::from(PROTOCOL_MINOR),
+                }),
+                node_id: Some(v1::NodeId {
+                    value: self.node_id.to_vec(),
+                }),
+                display: Some(v1::PeerDisplayInfo {
+                    display_name: self.display_name.clone(),
+                    device_kind: self.device_kind,
+                }),
+                endpoints: self.endpoints.clone(),
+            })),
+        }
+    }
+}
+
+/// The authenticated peer's advertised identity and capability catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionPeer {
+    pub node_id: [u8; NODE_ID_BYTES],
+    pub display_name: String,
+    pub device_kind: i32,
+    pub endpoints: Vec<v1::EndpointAdvertisement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionRole {
+    Initiator,
+}
+
+/// Events that remain after the session handshake. Application policy must
+/// explicitly handle `CapabilityOpenRequested`; the SDK never grants access
+/// merely because a peer is authenticated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionEvent {
+    CapabilityOpenRequested {
+        request_id: u64,
+        capability_session_id: u64,
+        endpoint_id: String,
+        capability_name: String,
+        capability_major: u32,
+    },
+    CapabilityOpened {
+        response_to: u64,
+        capability_session_id: u64,
+    },
+    CapabilityClosed {
+        capability_session_id: u64,
+        reason: i32,
+    },
+    CapabilityRecord {
+        capability_session_id: u64,
+        type_url: String,
+        payload: Vec<u8>,
+    },
+    StreamOpenRequested {
+        request_id: u64,
+        quic_stream_id: u64,
+        capability_session_id: u64,
+        payload_type_url: String,
+    },
+    StreamOpened {
+        response_to: u64,
+        quic_stream_id: u64,
+    },
+    StreamClosed {
+        quic_stream_id: u64,
+    },
+    DatagramFlowOpenRequested {
+        request_id: u64,
+        capability_session_id: u64,
+        flow_id: u64,
+        payload_type_url: String,
+    },
+    DatagramFlowOpened {
+        response_to: u64,
+        flow_id: u64,
+    },
+    DatagramFlowClosed {
+        flow_id: u64,
+    },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
+    ProtocolError {
+        response_to: u64,
+        code: i32,
+        message: String,
+    },
+    SessionClosed {
+        reason: i32,
+    },
+}
+
+/// A negotiated capability session. It validates record type URLs against the
+/// peer's advertisement before anything reaches the wire.
+#[derive(Clone)]
+pub struct Capability {
+    session: Session,
+    session_id: u64,
+    allowed_type_urls: Arc<Vec<String>>,
+    supports_datagrams: bool,
+}
+
+/// A capability-bound reliable QUIC stream.
+///
+/// The SDK owns the raw Quinn handles and the required `StreamOpen` protocol
+/// exchange. Hosts receive only the negotiated stream ID and byte reader/
+/// writer wrappers.
+pub struct ReliableStream {
+    stream_id: u64,
+    send: ReliableSendStream,
+    recv: ReliableRecvStream,
+}
+
+pub struct ReliableSendStream {
+    stream_id: u64,
+    inner: quinn::SendStream,
+}
+
+pub struct ReliableRecvStream {
+    stream_id: u64,
+    inner: quinn::RecvStream,
+}
+
+impl ReliableStream {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    pub fn into_parts(self) -> (ReliableSendStream, ReliableRecvStream) {
+        (self.send, self.recv)
+    }
+}
+
+impl ReliableSendStream {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    pub async fn write_all(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
+        self.inner
+            .write_all(bytes)
+            .await
+            .map_err(SessionError::Write)
+    }
+
+    pub fn finish(&mut self) -> Result<(), SessionError> {
+        self.inner.finish().map_err(SessionError::ClosedStream)
+    }
+}
+
+impl ReliableRecvStream {
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
+    pub async fn read_chunk(
+        &mut self,
+        max_size: usize,
+        ordered: bool,
+    ) -> Result<Option<Bytes>, SessionError> {
+        self.inner
+            .read_chunk(max_size, ordered)
+            .await
+            .map(|chunk| chunk.map(|chunk| chunk.bytes))
+            .map_err(SessionError::Read)
+    }
+}
+
+impl Capability {
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    pub async fn send_record(
+        &self,
+        type_url: &str,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<(), SessionError> {
+        if !self
+            .allowed_type_urls
+            .iter()
+            .any(|allowed| allowed == type_url)
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "record type URL was not advertised",
+            ));
+        }
+        self.session
+            .send(v1::control_envelope::Body::CapabilityRecord(
+                v1::CapabilityRecord {
+                    capability_session_id: self.session_id,
+                    type_url: type_url.to_owned(),
+                    payload: payload.into(),
+                },
+            ))
+            .await
+    }
+
+    /// Negotiates a replaceable QUIC datagram flow for this capability.
+    pub async fn open_datagram_flow(
+        &self,
+        payload_type_url: &str,
+    ) -> Result<DatagramFlow, SessionError> {
+        if !self.supports_datagrams {
+            return Err(SessionError::UnexpectedRecord(
+                "capability does not advertise datagrams",
+            ));
+        }
+        if !self
+            .allowed_type_urls
+            .iter()
+            .any(|allowed| allowed == payload_type_url)
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "datagram type URL was not advertised",
+            ));
+        }
+        let flow_id = self.session.allocate_flow_id();
+        let request_id = self.session.allocate_request_id();
+        self.session
+            .send_with_request(
+                request_id,
+                v1::control_envelope::Body::DatagramFlowOpen(v1::DatagramFlowOpen {
+                    capability_session_id: self.session_id,
+                    flow_id,
+                    payload_type_url: payload_type_url.to_owned(),
+                }),
+            )
+            .await?;
+        loop {
+            match self.session.read_event().await? {
+                SessionEvent::DatagramFlowOpened {
+                    response_to,
+                    flow_id: opened,
+                } if response_to == request_id && opened == flow_id => {
+                    return Ok(DatagramFlow {
+                        session: self.session.clone(),
+                        flow_id,
+                    });
+                }
+                event => self.session.0.queued_events.lock().await.push_back(event),
+            }
+        }
+    }
+
+    /// Opens a reliable bidirectional stream bound to this capability. The
+    /// returned stream is ready for application bytes only after the required
+    /// `StreamOpen`/`StreamOpened` control exchange succeeds.
+    pub async fn open_stream(
+        &self,
+        payload_type_url: &str,
+    ) -> Result<ReliableStream, SessionError> {
+        if !self
+            .allowed_type_urls
+            .iter()
+            .any(|allowed| allowed == payload_type_url)
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "stream type URL was not advertised",
+            ));
+        }
+        let (send, recv) = self.session.0.connection.open_bi().await?;
+        let stream_id = u64::from(send.id());
+        let request_id = self.session.allocate_request_id();
+        self.session
+            .send_with_request(
+                request_id,
+                v1::control_envelope::Body::StreamOpen(v1::StreamOpen {
+                    quic_stream_id: stream_id,
+                    capability_session_id: self.session_id,
+                    payload_type_url: payload_type_url.to_owned(),
+                }),
+            )
+            .await?;
+        loop {
+            match self.session.read_event().await? {
+                SessionEvent::StreamOpened {
+                    response_to,
+                    quic_stream_id,
+                } if response_to == request_id && quic_stream_id == stream_id => {
+                    return Ok(ReliableStream {
+                        stream_id,
+                        send: ReliableSendStream {
+                            stream_id,
+                            inner: send,
+                        },
+                        recv: ReliableRecvStream {
+                            stream_id,
+                            inner: recv,
+                        },
+                    });
+                }
+                event => self.session.0.queued_events.lock().await.push_back(event),
+            }
+        }
+    }
+}
+
+/// A negotiated unreliable datagram path associated with one capability.
+#[derive(Clone)]
+pub struct DatagramFlow {
+    session: Session,
+    flow_id: u64,
+}
+
+/// Failure returned when an application datagram cannot be queued without
+/// re-entering Quinn's lossy `send_datagram` overflow path.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DatagramSendError {
+    /// The connection's queue is busy. Callers carrying replaceable media
+    /// should drop the current access unit and wait for the next one.
+    #[error("datagram send buffer is full (available={available} required={required})")]
+    BufferFull { available: usize, required: usize },
+    /// The underlying transport rejected the datagram or the session closed.
+    #[error("QUIC datagram send failed: {0}")]
+    Transport(String),
+}
+
+/// Connection-wide counters suitable for host diagnostics and media policy.
+/// This intentionally exposes Anchor values rather than Quinn implementation
+/// types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatagramTransportStats {
+    pub rtt: std::time::Duration,
+    pub congestion_window_bytes: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+}
+
+// Quinn 0.11's lossy send path has a queue-accounting bug when it evicts old
+// datagrams after the configured buffer fills. Keep a small reserve so Anchor
+// never asks Quinn to perform that eviction, while still allowing a large
+// scene-change IDR to fit in the 256 KiB queue. The per-fragment allowance
+// below accounts for Quinn's private `Datagram` bookkeeping; the public
+// `datagram_send_buffer_space()` API only subtracts one such item.
+const DATAGRAM_QUEUE_HEADROOM_BYTES: usize = 16 * 1024;
+const DATAGRAM_QUEUE_ITEM_BYTES: usize = 32;
+
+impl DatagramFlow {
+    pub fn flow_id(&self) -> u64 {
+        self.flow_id
+    }
+
+    /// Current transport counters for diagnostics and adaptive media policy.
+    /// These are connection-wide because QUIC congestion control and the
+    /// datagram queue are shared by every capability flow.
+    pub fn transport_stats(&self) -> DatagramTransportStats {
+        let stats = self.session.0.connection.stats();
+        DatagramTransportStats {
+            rtt: stats.path.rtt,
+            congestion_window_bytes: stats.path.cwnd,
+            lost_packets: stats.path.lost_packets,
+            congestion_events: stats.path.congestion_events,
+        }
+    }
+
+    /// Current number of application-datagram bytes Quinn can accept.
+    pub fn send_buffer_space(&self) -> usize {
+        self.session.0.connection.datagram_send_buffer_space()
+    }
+
+    pub fn send(&self, payload: Bytes) -> Result<(), DatagramSendError> {
+        self.session.send_datagram(payload)
+    }
+
+    /// Queue a complete replaceable access unit while holding the
+    /// connection-wide datagram lock. This prevents screen/camera producers
+    /// from interleaving fragments and, importantly, avoids queueing a partial
+    /// frame when there is not enough space for all of its fragments.
+    pub fn send_many<I>(&self, payloads: I) -> Result<(), DatagramSendError>
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        self.session.send_datagrams(payloads)
+    }
+
+    /// Receive the next application datagram on the authenticated session.
+    ///
+    /// QUIC exposes datagrams at connection scope, so callers must validate
+    /// the fixed Anchor frame header and discard packets for other flow IDs.
+    pub async fn recv(&self) -> Result<Bytes, SessionError> {
+        self.session
+            .0
+            .connection
+            .read_datagram()
+            .await
+            .map_err(SessionError::Connection)
+    }
+
+    pub async fn close(&self) -> Result<(), SessionError> {
+        self.session.send_datagram_flow_closed(self.flow_id).await
+    }
+}
+
+struct SessionInner {
+    connection: quinn::Connection,
+    // Quinn's datagram queue is connection-scoped. Serialize submissions
+    // from independent screen/camera producers so queue accounting remains
+    // consistent when both flows are active at once.
+    datagram_send: std::sync::Mutex<()>,
+    control_send: Mutex<quinn::SendStream>,
+    control_recv: Mutex<ControlReader>,
+    queued_events: Mutex<VecDeque<SessionEvent>>,
+    next_request_id: AtomicU64,
+    next_capability_id: AtomicU64,
+    next_flow_id: AtomicU64,
+    peer: SessionPeer,
+    local_endpoints: Vec<v1::EndpointAdvertisement>,
+}
+
+/// An authenticated, protocol-ready Anchor session.
+#[derive(Clone)]
+pub struct Session(Arc<SessionInner>);
+
+/// A pairing-only control stream. It deliberately has no capability, stream,
+/// or datagram APIs: callers can only resolve the pending enrollment.
+pub struct PairingSession {
+    connection: quinn::Connection,
+    control_send: Mutex<quinn::SendStream>,
+    control_recv: Mutex<ControlReader>,
+    hello: pairing::Hello,
+}
+
+/// The first control record determines the connection phase. A peer cannot
+/// smuggle a pairing request into a normal session or vice versa.
+pub enum AcceptedSession {
+    Session(Session),
+    Pairing(Box<PairingSession>),
+}
+
+impl PairingSession {
+    /// Opens a pairing-only QUIC control stream. The caller configures the
+    /// endpoint with the invitation's certificate pin before calling this.
+    pub async fn connect(
+        endpoint: &quinn::Endpoint,
+        address: SocketAddr,
+        server_name: &str,
+        hello: pairing::Hello,
+    ) -> Result<Self, SessionError> {
+        let connection = endpoint.connect(address, server_name)?.await?;
+        validate_alpn(&connection)?;
+        let (mut send, recv) = connection.open_bi().await?;
+        let envelope = v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(v1::control_envelope::Body::PairingHello(hello.to_wire())),
+        };
+        write_record(&mut send, &envelope, true).await?;
+        Ok(Self {
+            connection,
+            control_send: Mutex::new(send),
+            control_recv: Mutex::new(ControlReader::new(recv)),
+            hello,
+        })
+    }
+
+    pub fn hello(&self) -> &pairing::Hello {
+        &self.hello
+    }
+
+    /// Returns the peer leaf certificate DER for host enrollment policy.
+    pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        peer_certificate_der(&self.connection)
+    }
+
+    /// End this pairing-only connection without exposing the QUIC handle.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.connection.close(code.into(), reason);
+    }
+
+    /// Wait until the peer closes this pairing-only connection.
+    pub async fn closed(&self) {
+        let _ = self.connection.closed().await;
+    }
+
+    pub async fn approve(&self, transcript_hash: Vec<u8>) -> Result<(), SessionError> {
+        self.approve_with_identity(transcript_hash, Vec::new(), String::new())
+            .await
+    }
+
+    /// Resolves enrollment and returns the exact server certificate when the
+    /// initiator deliberately used a direct-address bootstrap. Normal pinned
+    /// pairing receives the same fields but does not need to consume them.
+    pub async fn approve_with_identity(
+        &self,
+        transcript_hash: Vec<u8>,
+        certificate_der: Vec<u8>,
+        device_id: String,
+    ) -> Result<(), SessionError> {
+        if certificate_der.len() > 4096 {
+            return Err(SessionError::UnexpectedRecord(
+                "pairing certificate exceeds 4096 bytes",
+            ));
+        }
+        self.send_resolution(v1::control_envelope::Body::PairingApprove(
+            v1::PairingApprove {
+                transcript_hash,
+                approver_certificate_der: certificate_der,
+                approver_device_id: device_id,
+            },
+        ))
+        .await
+    }
+
+    pub async fn reject(&self) -> Result<(), SessionError> {
+        self.send_resolution(v1::control_envelope::Body::PairingReject(
+            v1::PairingReject {},
+        ))
+        .await
+    }
+
+    async fn send_resolution(&self, body: v1::control_envelope::Body) -> Result<(), SessionError> {
+        let envelope = v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(body),
+        };
+        let mut send = self.control_send.lock().await;
+        // This is the responder's first control record, so it carries its own
+        // direction-local ANCR preface even though the initiator already sent
+        // one on the reverse half of the QUIC stream.
+        write_record(&mut send, &envelope, true).await
+    }
+
+    /// Wait for the remote enrollment decision. This is used by a pairing
+    /// initiator after presenting its local approval UI.
+    pub async fn next_resolution(&self) -> Result<v1::control_envelope::Body, SessionError> {
+        let mut recv = self.control_recv.lock().await;
+        let envelope = recv.read_record().await?;
+        match envelope.body {
+            Some(body @ v1::control_envelope::Body::PairingApprove(_))
+            | Some(body @ v1::control_envelope::Body::PairingReject(_)) => Ok(body),
+            _ => Err(SessionError::UnexpectedRecord(
+                "expected pairing resolution",
+            )),
+        }
+    }
+}
+
+impl Session {
+    /// Connects to a peer using the endpoint's configured, pinned Quinn client
+    /// config. `server_name` is the certificate name, not a routing identity.
+    pub async fn connect(
+        endpoint: &quinn::Endpoint,
+        address: SocketAddr,
+        server_name: &str,
+        local: SessionIdentity,
+    ) -> Result<Self, SessionError> {
+        let connection = endpoint.connect(address, server_name)?.await?;
+        Self::establish(connection, local, SessionRole::Initiator).await
+    }
+
+    /// Accepts an incoming Quinn connection. The caller should perform its
+    /// certificate-pin decision in the endpoint's TLS verifier before passing
+    /// the `Incoming` handle here.
+    pub async fn accept(
+        incoming: quinn::Incoming,
+        local: SessionIdentity,
+    ) -> Result<Self, SessionError> {
+        match Self::accept_classified(incoming, local).await? {
+            AcceptedSession::Session(session) => Ok(session),
+            AcceptedSession::Pairing(_) => Err(SessionError::UnexpectedRecord(
+                "pairing connection passed to normal session acceptor",
+            )),
+        }
+    }
+
+    /// Accepts a connection after classifying its first control record. Hosts
+    /// must route `Pairing` to an explicit user-approval flow.
+    pub async fn accept_classified(
+        incoming: quinn::Incoming,
+        local: SessionIdentity,
+    ) -> Result<AcceptedSession, SessionError> {
+        let connection = incoming.await?;
+        validate_alpn(&connection)?;
+        let (send, mut reader) = {
+            let (send, recv) = connection.accept_bi().await?;
+            (send, ControlReader::new(recv))
+        };
+        let first = reader.read_record().await?;
+        match first.body.as_ref() {
+            Some(v1::control_envelope::Body::PairingHello(hello)) => {
+                let hello = pairing::Hello::from_wire(hello)?;
+                Ok(AcceptedSession::Pairing(Box::new(PairingSession {
+                    connection,
+                    control_send: Mutex::new(send),
+                    control_recv: Mutex::new(reader),
+                    hello,
+                })))
+            }
+            Some(v1::control_envelope::Body::SessionHello(_)) => Ok(AcceptedSession::Session(
+                Self::establish_responder(connection, local, send, reader, first).await?,
+            )),
+            _ => Err(SessionError::UnexpectedRecord(
+                "first control record must be SessionHello or PairingHello",
+            )),
+        }
+    }
+
+    pub fn peer(&self) -> &SessionPeer {
+        // The peer is immutable for the lifetime of a QUIC connection. This
+        // accessor avoids forcing callers to clone metadata for every event.
+        &self.0.peer
+    }
+
+    /// Returns the peer leaf certificate DER after the QUIC/TLS handshake.
+    /// Host pairing policy may compare it to its own persisted certificate pin.
+    pub fn peer_certificate_der(&self) -> Option<Vec<u8>> {
+        peer_certificate_der(&self.0.connection)
+    }
+
+    /// End this session without exposing the underlying QUIC connection.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.0.connection.close(code.into(), reason);
+    }
+
+    /// Reads and validates the next control event. Only one task should call
+    /// this at a time; concurrent writers are supported by the session mutex.
+    pub async fn next_event(&self) -> Result<SessionEvent, SessionError> {
+        if let Some(event) = self.0.queued_events.lock().await.pop_front() {
+            return Ok(event);
+        }
+        self.read_event().await
+    }
+
+    async fn read_event(&self) -> Result<SessionEvent, SessionError> {
+        let mut reader = self.0.control_recv.lock().await;
+        let envelope = reader.read_record().await?;
+        decode_event(envelope)
+    }
+
+    /// Opens a peer-advertised capability and waits for its positive reply.
+    /// Unrelated events are preserved for the next `next_event` call.
+    pub async fn open_capability(
+        &self,
+        endpoint_id: &str,
+        capability_name: &str,
+        capability_major: u32,
+    ) -> Result<Capability, SessionError> {
+        let advertisement = self
+            .peer()
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .and_then(|endpoint| {
+                endpoint.capabilities.iter().find(|capability| {
+                    capability.name == capability_name && capability.major == capability_major
+                })
+            })
+            .ok_or_else(|| SessionError::CapabilityUnavailable {
+                name: capability_name.to_owned(),
+                major: capability_major,
+            })?;
+        let capability_session_id = self.allocate_capability_id();
+        let request_id = self.allocate_request_id();
+        self.send_with_request(
+            request_id,
+            v1::control_envelope::Body::CapabilityOpen(v1::CapabilityOpen {
+                capability_session_id,
+                endpoint_id: endpoint_id.to_owned(),
+                capability_name: capability_name.to_owned(),
+                capability_major,
+            }),
+        )
+        .await?;
+
+        loop {
+            match self.read_event().await? {
+                SessionEvent::CapabilityOpened {
+                    response_to,
+                    capability_session_id: opened,
+                } if response_to == request_id && opened == capability_session_id => {
+                    return Ok(Capability {
+                        session: self.clone(),
+                        session_id: capability_session_id,
+                        allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
+                        supports_datagrams: advertisement.supports_datagrams,
+                    });
+                }
+                event => self.0.queued_events.lock().await.push_back(event),
+            }
+        }
+    }
+
+    /// Sends a typed control record for a capability after the host has
+    /// approved an incoming request. The approval policy is intentionally
+    /// outside the connection object.
+    pub async fn send_capability_opened(
+        &self,
+        request_id: u64,
+        capability_session_id: u64,
+    ) -> Result<(), SessionError> {
+        self.send_response(
+            request_id,
+            v1::control_envelope::Body::CapabilityOpened(v1::CapabilityOpened {
+                capability_session_id,
+            }),
+        )
+        .await
+    }
+
+    /// Approves an incoming capability request and returns the provider-side
+    /// handle for sending records back on that negotiated session.
+    pub async fn accept_capability(
+        &self,
+        request_id: u64,
+        capability_session_id: u64,
+        endpoint_id: &str,
+        capability_name: &str,
+        capability_major: u32,
+    ) -> Result<Capability, SessionError> {
+        let advertisement = self
+            .0
+            .local_endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .and_then(|endpoint| {
+                endpoint.capabilities.iter().find(|capability| {
+                    capability.name == capability_name && capability.major == capability_major
+                })
+            })
+            .ok_or_else(|| SessionError::CapabilityUnavailable {
+                name: capability_name.to_owned(),
+                major: capability_major,
+            })?;
+        self.send_capability_opened(request_id, capability_session_id)
+            .await?;
+        Ok(Capability {
+            session: self.clone(),
+            session_id: capability_session_id,
+            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
+            supports_datagrams: advertisement.supports_datagrams,
+        })
+    }
+
+    pub async fn send_stream_opened(
+        &self,
+        request_id: u64,
+        quic_stream_id: u64,
+    ) -> Result<(), SessionError> {
+        self.send_response(
+            request_id,
+            v1::control_envelope::Body::StreamOpened(v1::StreamOpened { quic_stream_id }),
+        )
+        .await
+    }
+
+    /// Accept a peer-requested capability stream. The SDK confirms the stream
+    /// binding and verifies that the accepted QUIC stream ID matches the
+    /// negotiated ID before returning application byte handles.
+    pub async fn accept_stream(
+        &self,
+        request_id: u64,
+        expected_stream_id: u64,
+    ) -> Result<ReliableStream, SessionError> {
+        self.send_stream_opened(request_id, expected_stream_id)
+            .await?;
+        let (send, recv) = self.0.connection.accept_bi().await?;
+        let stream_id = u64::from(recv.id());
+        if stream_id != expected_stream_id {
+            return Err(SessionError::UnexpectedRecord(
+                "accepted QUIC stream ID did not match StreamOpen",
+            ));
+        }
+        Ok(ReliableStream {
+            stream_id,
+            send: ReliableSendStream {
+                stream_id,
+                inner: send,
+            },
+            recv: ReliableRecvStream {
+                stream_id,
+                inner: recv,
+            },
+        })
+    }
+
+    pub async fn send_capability_closed(
+        &self,
+        capability_session_id: u64,
+        reason: i32,
+    ) -> Result<(), SessionError> {
+        self.send(v1::control_envelope::Body::CapabilityClose(
+            v1::CapabilityClose {
+                capability_session_id,
+                reason,
+            },
+        ))
+        .await
+    }
+
+    pub async fn send_stream_closed(&self, quic_stream_id: u64) -> Result<(), SessionError> {
+        self.send(v1::control_envelope::Body::StreamClose(v1::StreamClose {
+            quic_stream_id,
+        }))
+        .await
+    }
+
+    pub async fn send_datagram_flow_opened(
+        &self,
+        request_id: u64,
+        flow_id: u64,
+    ) -> Result<(), SessionError> {
+        self.send_response(
+            request_id,
+            v1::control_envelope::Body::DatagramFlowOpened(v1::DatagramFlowOpened { flow_id }),
+        )
+        .await
+    }
+
+    /// Accept a peer-requested datagram flow after the application has
+    /// checked the capability session and payload type.
+    pub async fn accept_datagram_flow(
+        &self,
+        request_id: u64,
+        flow_id: u64,
+    ) -> Result<DatagramFlow, SessionError> {
+        self.send_datagram_flow_opened(request_id, flow_id).await?;
+        Ok(DatagramFlow {
+            session: self.clone(),
+            flow_id,
+        })
+    }
+
+    pub async fn send_datagram_flow_closed(&self, flow_id: u64) -> Result<(), SessionError> {
+        self.send(v1::control_envelope::Body::DatagramFlowClose(
+            v1::DatagramFlowClose { flow_id },
+        ))
+        .await
+    }
+
+    pub async fn send_ping(&self, nonce: u64) -> Result<(), SessionError> {
+        self.send(v1::control_envelope::Body::Ping(v1::Ping { nonce }))
+            .await
+    }
+
+    pub async fn send_pong(&self, nonce: u64) -> Result<(), SessionError> {
+        self.send(v1::control_envelope::Body::Pong(v1::Pong { nonce }))
+            .await
+    }
+
+    /// Sends an application datagram. Flow negotiation and the capability's
+    /// fixed binary header remain explicit at the capability layer.
+    pub fn send_datagram(&self, payload: Bytes) -> Result<(), DatagramSendError> {
+        self.send_datagrams(std::iter::once(payload))
+    }
+
+    fn send_datagrams<I>(&self, payloads: I) -> Result<(), DatagramSendError>
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        let payloads: Vec<Bytes> = payloads.into_iter().collect();
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let _guard = self
+            .0
+            .datagram_send
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available = self.0.connection.datagram_send_buffer_space();
+        let required = payloads
+            .iter()
+            .map(|payload| payload.len().saturating_add(DATAGRAM_QUEUE_ITEM_BYTES))
+            .sum::<usize>()
+            .saturating_add(DATAGRAM_QUEUE_HEADROOM_BYTES);
+        if available < required {
+            return Err(DatagramSendError::BufferFull {
+                available,
+                required,
+            });
+        }
+        for payload in payloads {
+            self.0
+                .connection
+                .send_datagram(payload)
+                .map_err(|error| DatagramSendError::Transport(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn establish(
+        connection: quinn::Connection,
+        local: SessionIdentity,
+        role: SessionRole,
+    ) -> Result<Self, SessionError> {
+        validate_alpn(&connection)?;
+        let (mut send, recv) = connection.open_bi().await?;
+        let mut reader = ControlReader::new(recv);
+        // Both peers send their two handshake records immediately. Keep the
+        // pair in one QUIC write: this makes the initial control batch
+        // indivisible across implementations with different send schedulers.
+        let ready = v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(v1::control_envelope::Body::SessionReady(v1::SessionReady {
+                protocol_version: Some(v1::ProtocolVersion {
+                    major: u32::from(PROTOCOL_MAJOR),
+                    minor: u32::from(PROTOCOL_MINOR),
+                }),
+            })),
+        };
+        write_records(&mut send, &[(&local.hello(), true), (&ready, false)]).await?;
+        let peer_hello = reader.read_record().await?;
+        let peer = peer_from_hello(peer_hello)?;
+        let ready = reader.read_record().await?;
+        if !matches!(
+            ready.body,
+            Some(v1::control_envelope::Body::SessionReady(_))
+        ) {
+            return Err(SessionError::UnexpectedRecord("expected SessionReady"));
+        }
+        let next_capability_id = match role {
+            SessionRole::Initiator => 1,
+        };
+        Ok(Self(Arc::new(SessionInner {
+            connection,
+            datagram_send: std::sync::Mutex::new(()),
+            control_send: Mutex::new(send),
+            control_recv: Mutex::new(reader),
+            queued_events: Mutex::new(VecDeque::new()),
+            next_request_id: AtomicU64::new(1),
+            next_capability_id: AtomicU64::new(next_capability_id),
+            next_flow_id: AtomicU64::new(next_capability_id),
+            peer,
+            local_endpoints: local.endpoints,
+        })))
+    }
+
+    async fn establish_responder(
+        connection: quinn::Connection,
+        local: SessionIdentity,
+        mut send: quinn::SendStream,
+        mut reader: ControlReader,
+        first: v1::ControlEnvelope,
+    ) -> Result<Self, SessionError> {
+        let peer = peer_from_hello(first)?;
+        let ready = v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(v1::control_envelope::Body::SessionReady(v1::SessionReady {
+                protocol_version: Some(v1::ProtocolVersion {
+                    major: u32::from(PROTOCOL_MAJOR),
+                    minor: u32::from(PROTOCOL_MINOR),
+                }),
+            })),
+        };
+        write_records(&mut send, &[(&local.hello(), true), (&ready, false)]).await?;
+        let ready = reader.read_record().await?;
+        if !matches!(
+            ready.body,
+            Some(v1::control_envelope::Body::SessionReady(_))
+        ) {
+            return Err(SessionError::UnexpectedRecord("expected SessionReady"));
+        }
+        Ok(Self(Arc::new(SessionInner {
+            connection,
+            datagram_send: std::sync::Mutex::new(()),
+            control_send: Mutex::new(send),
+            control_recv: Mutex::new(reader),
+            queued_events: Mutex::new(VecDeque::new()),
+            next_request_id: AtomicU64::new(1),
+            next_capability_id: AtomicU64::new(2),
+            next_flow_id: AtomicU64::new(2),
+            peer,
+            local_endpoints: local.endpoints,
+        })))
+    }
+
+    async fn send(&self, body: v1::control_envelope::Body) -> Result<(), SessionError> {
+        self.send_envelope(v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(body),
+        })
+        .await
+    }
+
+    async fn send_with_request(
+        &self,
+        request_id: u64,
+        body: v1::control_envelope::Body,
+    ) -> Result<(), SessionError> {
+        self.send_envelope(v1::ControlEnvelope {
+            request_id,
+            response_to: 0,
+            body: Some(body),
+        })
+        .await
+    }
+
+    async fn send_response(
+        &self,
+        response_to: u64,
+        body: v1::control_envelope::Body,
+    ) -> Result<(), SessionError> {
+        self.send_envelope(v1::ControlEnvelope {
+            request_id: 0,
+            response_to,
+            body: Some(body),
+        })
+        .await
+    }
+
+    async fn send_envelope(&self, envelope: v1::ControlEnvelope) -> Result<(), SessionError> {
+        validate_control_envelope(&envelope)?;
+        let mut send = self.0.control_send.lock().await;
+        write_record(&mut send, &envelope, false).await
+    }
+
+    fn allocate_request_id(&self) -> u64 {
+        allocate_nonzero(&self.0.next_request_id)
+    }
+    fn allocate_capability_id(&self) -> u64 {
+        allocate_nonzero(&self.0.next_capability_id)
+    }
+
+    fn allocate_flow_id(&self) -> u64 {
+        allocate_nonzero(&self.0.next_flow_id)
+    }
+}
+
+fn peer_certificate_der(connection: &quinn::Connection) -> Option<Vec<u8>> {
+    connection
+        .peer_identity()
+        .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+        .and_then(|certificates| {
+            certificates
+                .first()
+                .map(|certificate| certificate.as_ref().to_vec())
+        })
+}
+
+fn validate_alpn(connection: &quinn::Connection) -> Result<(), SessionError> {
+    if connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol)
+        .as_deref()
+        != Some(ALPN)
+    {
+        return Err(SessionError::UnexpectedRecord("QUIC ALPN is not anchor/1"));
+    }
+    Ok(())
+}
+
+fn allocate_nonzero(counter: &AtomicU64) -> u64 {
+    loop {
+        let value = counter.fetch_add(1, Ordering::Relaxed);
+        if value != 0 {
+            return value;
+        }
+    }
+}
+
+async fn write_record(
+    send: &mut quinn::SendStream,
+    envelope: &v1::ControlEnvelope,
+    first: bool,
+) -> Result<(), SessionError> {
+    validate_control_envelope(envelope)?;
+    let frame = encode_record(envelope, first)?;
+    send.write_all(&frame).await?;
+    send.flush().await?;
+    Ok(())
+}
+
+async fn write_records(
+    send: &mut quinn::SendStream,
+    records: &[(&v1::ControlEnvelope, bool)],
+) -> Result<(), SessionError> {
+    let mut frame = Vec::new();
+    for (envelope, first) in records {
+        frame.extend_from_slice(&encode_record(envelope, *first)?);
+    }
+    send.write_all(&frame).await?;
+    send.flush().await?;
+    Ok(())
+}
+
+fn encode_record(envelope: &v1::ControlEnvelope, first: bool) -> Result<Vec<u8>, SessionError> {
+    validate_control_envelope(envelope)?;
+    let payload = envelope.encode_to_vec();
+    if payload.len() > MAX_CONTROL_RECORD_BYTES {
+        return Err(ProtocolViolation::ControlRecordTooLarge.into());
+    }
+    let mut frame = Vec::with_capacity(payload.len() + 16);
+    if first {
+        frame.extend_from_slice(&CONTROL_MAGIC);
+        frame.push(PROTOCOL_MAJOR);
+        frame.push(PROTOCOL_MINOR);
+    }
+    encode_varint(payload.len() as u64, &mut frame);
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+struct ControlReader {
+    recv: quinn::RecvStream,
+    first: bool,
+}
+
+impl ControlReader {
+    fn new(recv: quinn::RecvStream) -> Self {
+        Self { recv, first: true }
+    }
+
+    async fn read_record(&mut self) -> Result<v1::ControlEnvelope, SessionError> {
+        if self.first {
+            let mut prefix = [0_u8; FIRST_RECORD_HEADER_BYTES];
+            self.recv.read_exact(&mut prefix).await?;
+            if prefix[..CONTROL_MAGIC.len()] != CONTROL_MAGIC {
+                return Err(ProtocolViolation::InvalidControlMagic.into());
+            }
+            // Major must match exactly. A peer's minor may be behind or equal
+            // to ours (minor changes are additive by policy); a peer ahead of
+            // us may rely on control-layer behavior we don't understand yet.
+            if prefix[CONTROL_MAGIC.len()] != PROTOCOL_MAJOR
+                || prefix[CONTROL_MAGIC.len() + 1] > PROTOCOL_MINOR
+            {
+                return Err(ProtocolViolation::UnsupportedControlVersion {
+                    major: prefix[CONTROL_MAGIC.len()],
+                    minor: prefix[CONTROL_MAGIC.len() + 1],
+                }
+                .into());
+            }
+            self.first = false;
+        }
+        let length = read_varint(&mut self.recv).await?;
+        let length =
+            usize::try_from(length).map_err(|_| ProtocolViolation::ControlRecordTooLarge)?;
+        if length > MAX_CONTROL_RECORD_BYTES {
+            return Err(ProtocolViolation::ControlRecordTooLarge.into());
+        }
+        let mut payload = vec![0_u8; length];
+        self.recv.read_exact(&mut payload).await?;
+        let envelope = v1::ControlEnvelope::decode(payload.as_slice())
+            .map_err(|_| ProtocolViolation::MalformedControlRecord)?;
+        validate_control_envelope(&envelope)?;
+        Ok(envelope)
+    }
+}
+
+async fn read_varint(recv: &mut quinn::RecvStream) -> Result<u64, SessionError> {
+    let mut value = 0_u64;
+    for index in 0..10 {
+        let byte = recv.read_u8().await?;
+        if index == 9 && byte > 1 {
+            return Err(ProtocolViolation::ControlRecordTooLarge.into());
+        }
+        value |= u64::from(byte & 0x7f) << (index * 7);
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(ProtocolViolation::ControlRecordTooLarge.into())
+}
+
+fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn peer_from_hello(envelope: v1::ControlEnvelope) -> Result<SessionPeer, SessionError> {
+    let Some(v1::control_envelope::Body::SessionHello(hello)) = envelope.body else {
+        return Err(SessionError::UnexpectedRecord("expected SessionHello"));
+    };
+    let version = hello
+        .protocol_version
+        .ok_or(SessionError::UnexpectedRecord(
+            "SessionHello missing version",
+        ))?;
+    if version.major != u32::from(PROTOCOL_MAJOR) || version.minor > u32::from(PROTOCOL_MINOR) {
+        return Err(ProtocolViolation::UnsupportedControlVersion {
+            major: version.major as u8,
+            minor: version.minor as u8,
+        }
+        .into());
+    }
+    let node_id = hello.node_id.ok_or(SessionError::UnexpectedRecord(
+        "SessionHello missing node ID",
+    ))?;
+    let node_id_bytes = node_id.value;
+    let node_id_length = node_id_bytes.len();
+    let node_id = node_id_bytes
+        .try_into()
+        .map_err(|_| ProtocolViolation::InvalidLength {
+            field: "node_id",
+            expected: NODE_ID_BYTES,
+            actual: node_id_length,
+        })?;
+    let display = hello.display.ok_or(SessionError::UnexpectedRecord(
+        "SessionHello missing display",
+    ))?;
+    Ok(SessionPeer {
+        node_id,
+        display_name: display.display_name,
+        device_kind: display.device_kind,
+        endpoints: hello.endpoints,
+    })
+}
+
+fn decode_event(envelope: v1::ControlEnvelope) -> Result<SessionEvent, SessionError> {
+    let response_to = envelope.response_to;
+    match envelope.body.ok_or(ProtocolViolation::MissingBody)? {
+        v1::control_envelope::Body::CapabilityOpen(message) => {
+            Ok(SessionEvent::CapabilityOpenRequested {
+                request_id: envelope.request_id,
+                capability_session_id: message.capability_session_id,
+                endpoint_id: message.endpoint_id,
+                capability_name: message.capability_name,
+                capability_major: message.capability_major,
+            })
+        }
+        v1::control_envelope::Body::CapabilityOpened(message) => {
+            Ok(SessionEvent::CapabilityOpened {
+                response_to,
+                capability_session_id: message.capability_session_id,
+            })
+        }
+        v1::control_envelope::Body::CapabilityClose(message) => {
+            Ok(SessionEvent::CapabilityClosed {
+                capability_session_id: message.capability_session_id,
+                reason: message.reason,
+            })
+        }
+        v1::control_envelope::Body::CapabilityRecord(message) => {
+            Ok(SessionEvent::CapabilityRecord {
+                capability_session_id: message.capability_session_id,
+                type_url: message.type_url,
+                payload: message.payload,
+            })
+        }
+        v1::control_envelope::Body::StreamOpen(message) => Ok(SessionEvent::StreamOpenRequested {
+            request_id: envelope.request_id,
+            quic_stream_id: message.quic_stream_id,
+            capability_session_id: message.capability_session_id,
+            payload_type_url: message.payload_type_url,
+        }),
+        v1::control_envelope::Body::StreamOpened(message) => Ok(SessionEvent::StreamOpened {
+            response_to,
+            quic_stream_id: message.quic_stream_id,
+        }),
+        v1::control_envelope::Body::StreamClose(message) => Ok(SessionEvent::StreamClosed {
+            quic_stream_id: message.quic_stream_id,
+        }),
+        v1::control_envelope::Body::DatagramFlowOpen(message) => {
+            Ok(SessionEvent::DatagramFlowOpenRequested {
+                request_id: envelope.request_id,
+                capability_session_id: message.capability_session_id,
+                flow_id: message.flow_id,
+                payload_type_url: message.payload_type_url,
+            })
+        }
+        v1::control_envelope::Body::DatagramFlowOpened(message) => {
+            Ok(SessionEvent::DatagramFlowOpened {
+                response_to,
+                flow_id: message.flow_id,
+            })
+        }
+        v1::control_envelope::Body::DatagramFlowClose(message) => {
+            Ok(SessionEvent::DatagramFlowClosed {
+                flow_id: message.flow_id,
+            })
+        }
+        v1::control_envelope::Body::Ping(message) => Ok(SessionEvent::Ping {
+            nonce: message.nonce,
+        }),
+        v1::control_envelope::Body::Pong(message) => Ok(SessionEvent::Pong {
+            nonce: message.nonce,
+        }),
+        v1::control_envelope::Body::ProtocolError(message) => Ok(SessionEvent::ProtocolError {
+            response_to,
+            code: message.code,
+            message: message.message,
+        }),
+        v1::control_envelope::Body::SessionClose(message) => Ok(SessionEvent::SessionClosed {
+            reason: message.reason,
+        }),
+        _ => Err(SessionError::UnexpectedRecord(
+            "session setup record after handshake",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_nonzero_and_skip_wraparound() {
+        let counter = AtomicU64::new(u64::MAX);
+        assert_eq!(allocate_nonzero(&counter), u64::MAX);
+        assert_eq!(allocate_nonzero(&counter), 1);
+    }
+
+    #[test]
+    fn capability_records_require_advertised_type_url() {
+        let capability = v1::CapabilityAdvertisement {
+            name: "org.anchor.clipboard".into(),
+            major: 1,
+            record_type_urls: vec!["type.googleapis.com/example.Clipboard".into()],
+            supports_datagrams: false,
+        };
+        assert!(
+            capability
+                .record_type_urls
+                .iter()
+                .any(|url| url == "type.googleapis.com/example.Clipboard")
+        );
+    }
+}

@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Maritime/Anchor themed colors -->
+
+    <!-- Primary anchor/ocean blues -->
+    <color name="anchor_blue_80">#FF1565C0</color>
+    <color name="anchor_blue_40">#FF42A5F5</color>
+    <color name="deep_ocean">#FF0277BD</color>
+    <color name="wave_blue">#FF03A9F4</color>
+
+    <!-- Navy blues -->
+    <color name="navy_blue_80">#FF0D47A1</color>
+    <color name="navy_blue_40">#FF1976D2</color>
+
+    <!-- Sea greens -->
+    <color name="sea_green_80">#FF00695C</color>
+    <color name="sea_green_40">#FF26A69A</color>
+    <color name="sea_foam">#FF4DB6AC</color>
+
+    <!-- Beach/sand tones -->
+    <color name="sand_beige_80">#FFD7CCC8</color>
+    <color name="sand_beige_40">#FFA1887F</color>
+    <color name="rope_beige">#FFBCAAA4</color>
+
+    <!-- Coral/accent colors -->
+    <color name="coral_red_80">#FFD32F2F</color>
+    <color name="coral_red_40">#FFEF5350</color>
+    <color name="lighthouse">#FFFF7043</color>
+
+    <!-- Neutral grays and basics -->
+    <color name="anchor_gray">#FF607D8B</color>
+    <color name="pure_white">#FFFFFFFF</color>
+    <color name="off_white">#FFFAFAFA</color>
+    <color name="light_gray">#FFE0E0E0</color>
+    <color name="medium_gray">#FF9E9E9E</color>
+    <color name="dark_gray">#FF424242</color>
+    <color name="charcoal_black">#FF212121</color>
+
+    <!-- Legacy colors for compatibility -->
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

@@ -1,0 +1,22 @@
+Anchor connects your Android phone or tablet directly to your Linux desktop.
+
+Use the devices you already own together:
+
+• Read SMS and MMS conversations on your desktop and send replies you initiate
+• Mirror phone notifications and control active media
+• Sync clipboard content and transfer files
+• Use your phone camera as a Linux webcam
+• Extend or view your desktop display on Android
+• Control your desktop with remote touch and keyboard input
+
+Private by design
+
+Anchor has no account, advertising, behavioral analytics, or cloud storage for your personal content. Devices pair using certificate fingerprints. Control messages, camera video, and display video travel directly between paired devices over mutually authenticated, certificate-pinned TLS.
+
+You stay in control
+
+Sensitive features are optional. Anchor explains SMS/MMS, contacts, camera, and notification access before you enable them. You can exclude individual notification apps, unpair desktops, clear local histories, and delete the desktop's local message cache.
+
+Linux companion required
+
+Most features require the free, open-source Anchor desktop app on a compatible Linux system. Both devices generally need to be able to reach each other on the same local network. Hardware and desktop-environment support varies; see anchor-software.org for downloads and compatibility information.

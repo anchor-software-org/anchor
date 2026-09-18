@@ -1,0 +1,7 @@
+*.ppm
+*/target/*
+gen/
+*.db*
+*CLAUDE.md
+gmon.out
+.devenv/

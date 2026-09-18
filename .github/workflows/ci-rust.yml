@@ -1,0 +1,133 @@
+name: Rust CI
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: anchor-desktop
+
+jobs:
+  sdk-conformance:
+    name: SDK source conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install protocol compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify SDK source checkout
+        working-directory: .
+        run: bash scripts/verify-sdk-source.sh
+
+  ci:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            protobuf-compiler \
+            pkg-config \
+            cmake \
+            nasm \
+            libx264-dev \
+            libva-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libxkbcommon-dev \
+            libclang-dev \
+            libdbus-1-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            llvm-dev
+
+      # Building FFmpeg 8.1 from source (the local/release default, kept for
+      # compatibility) dominates this job's runtime. PR validation doesn't
+      # ship this binary, so link a pinned, hash-verified prebuilt instead.
+      # Never do this for local development or verification-artifacts.yml.
+      - name: Link prebuilt FFmpeg (PR CI only)
+        env:
+          FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-13-14-50/ffmpeg-n8.1.2-52-g5a03dfa0f6-linux64-gpl-shared-8.1.tar.xz
+          FFMPEG_SHA256: 8621a28ecbbe87df59b571e2709f4d5492c7c87c11455028f10b2f6324578160
+        run: |
+          curl -fsSL -o /tmp/ffmpeg-prebuilt.tar.xz "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  /tmp/ffmpeg-prebuilt.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg-prebuilt"
+          tar xf /tmp/ffmpeg-prebuilt.tar.xz -C "$RUNNER_TEMP/ffmpeg-prebuilt" --strip-components=1
+          echo "FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-prebuilt" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ffmpeg-prebuilt/lib" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
+
+      - name: Install Tauri frontend dependencies
+        working-directory: anchor-desktop/frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Tauri frontend
+        working-directory: anchor-desktop/frontend
+        run: pnpm run check
+
+      - name: Build Tauri frontend
+        working-directory: anchor-desktop/frontend
+        run: pnpm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            anchor-desktop
+
+      - name: cargo fmt --check
+        run: |
+          cargo fmt --all --check
+
+      - name: cargo clippy
+        env:
+          RUSTFLAGS: "-D warnings"
+        run: |
+          cargo clippy --all-targets --no-default-features --features ffmpeg-prebuilt
+
+      - name: cargo test
+        run: cargo test --no-default-features --features ffmpeg-prebuilt -- --nocapture
+
+      - name: Check standalone video benchmarks
+        run: |
+          cargo test --manifest-path tools/frame-queue-bench/Cargo.toml
+          cargo check --manifest-path tools/wayland-encode-bench/Cargo.toml
+
+      - name: Check Tauri host
+        run: cargo check --locked --no-default-features --features ffmpeg-prebuilt
