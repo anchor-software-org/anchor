@@ -1,7 +1,7 @@
 name: Bug report
 description: Report a reproducible problem in Anchor.
 title: "bug: "
-labels: [bug]
+labels: [bug, "state:needs triage"]
 body:
   - type: markdown
     attributes:

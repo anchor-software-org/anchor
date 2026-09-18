@@ -280,7 +280,7 @@ private fun ClipboardScreenPreview() {
         ClipboardScreenContent(
             history = listOf(
                 ClipboardHistoryEntry(
-                    text = "ssh hiatus@10.0.0.38\ncargo run --release\n./gradlew installDebug",
+                    text = "git status\ncargo run --release\n./gradlew installDebug",
                     source = "local",
                     timestamp = 1_712_345_678_000,
                     compressed = true,

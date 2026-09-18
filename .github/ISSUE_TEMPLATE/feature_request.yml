@@ -1,7 +1,7 @@
 name: Feature request
 description: Propose an improvement to Anchor.
 title: "feature: "
-labels: [enhancement]
+labels: [feature, "state:needs triage"]
 body:
   - type: textarea
     id: problem
