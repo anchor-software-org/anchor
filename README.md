@@ -18,26 +18,31 @@ The supported desktop session is Linux Wayland. Android support requires
 Android 11 (API 30) or newer. See the [compatibility guide](docs/public/getting-started/compatibility.md)
 before installing.
 
-## Install and build
+## Install and develop
 
 See the [installation guide](docs/public/getting-started/installation.md) for
 packages and compositor requirements.
 
-To build the Android app from a checkout:
+Development commands run inside one of two [devenv](https://devenv.sh/)
+environments. Enter the environment for the part of Anchor you are working on.
+
+To build and install the Android debug app:
 
 ```bash
-cd anchor
-./gradlew installDebug
+devenv shell
+android-install
 ```
 
-To build the Linux desktop application:
+To run the Linux desktop app in development:
 
 ```bash
 cd anchor-desktop
-cargo run --release
+devenv shell
+dev
 ```
 
-The desktop build needs the native libraries listed in the installation guide.
+See the [development environment guide](docs/developer/development-environment.md)
+for SDK setup, checks, production builds, and the complete command reference.
 
 ## Learn more
 
