@@ -482,9 +482,14 @@ impl Reassembler {
             entry.received += 1;
         }
         let received = entry.received;
-        let fragment_count = entry.fragment_count;
-        if received != usize::from(fragment_count) {
-            return self.try_parity_recovery(header.sequence);
+        let fragment_count = usize::from(entry.fragment_count);
+        if received != fragment_count {
+            // Only the one-short state can be parity-recoverable; skip the
+            // lookup for every other in-flight fragment.
+            if received + 1 == fragment_count {
+                return self.try_parity_recovery(header.sequence);
+            }
+            return None;
         }
         let entry = self.partial.remove(&header.sequence)?;
         let mut frame = Vec::with_capacity(entry.total_bytes);
