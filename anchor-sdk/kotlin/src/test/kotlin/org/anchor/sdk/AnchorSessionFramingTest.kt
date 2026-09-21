@@ -65,4 +65,24 @@ class AnchorSessionFramingTest {
         frame[5] = 1.toByte()
         assertThrows(AnchorSessionException::class.java) { ControlFramer().feed(frame) }
     }
+
+    @Test
+    fun controlLengthAboveIntMaxIsRejectedAsProtocolFraming() {
+        val frame = "ANCR".encodeToByteArray() + byteArrayOf(1, 0) + referenceVarint(
+            Int.MAX_VALUE.toLong() + 1,
+        )
+
+        assertThrows(AnchorSessionException::class.java) { ControlFramer().feed(frame) }
+    }
+
+    private fun referenceVarint(input: Long): ByteArray {
+        var value = input
+        val bytes = ArrayList<Byte>()
+        while (value >= 0x80) {
+            bytes += ((value and 0x7f) or 0x80).toByte()
+            value = value ushr 7
+        }
+        bytes += value.toByte()
+        return bytes.toByteArray()
+    }
 }

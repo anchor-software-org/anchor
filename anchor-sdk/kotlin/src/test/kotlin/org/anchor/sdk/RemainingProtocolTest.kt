@@ -108,4 +108,33 @@ class RemainingProtocolTest {
         assertEquals(0, decoded.exitCode)
         assertEquals(CommandsProtocol.CAPABILITY_NAME, CommandsProtocol.endpointAdvertisement().capabilitiesList.single().name)
     }
+
+    @Test
+    fun everyPublicCapabilityAdvertisesNonEmptyUniqueRecordTypeUrls() {
+        val advertisements = listOf(
+            CameraProtocol.advertisement(),
+            ClipboardProtocol.advertisement(),
+            CommandsProtocol.advertisement(),
+            DeviceProtocol.advertisement(),
+            FilesProtocol.advertisement(),
+            InputProtocol.advertisement(),
+            MediaProtocol.advertisement(),
+            NotificationsProtocol.advertisement(),
+            ScreenProtocol.advertisement(),
+            SmsProtocol.advertisement(),
+        )
+
+        advertisements.forEach { advertisement ->
+            assertTrue(advertisement.name.isNotEmpty())
+            assertTrue(advertisement.major > 0)
+            assertTrue(advertisement.recordTypeUrlsCount > 0)
+            assertEquals(
+                advertisement.recordTypeUrlsCount,
+                advertisement.recordTypeUrlsList.toSet().size,
+            )
+            advertisement.recordTypeUrlsList.forEach { typeUrl ->
+                assertTrue(typeUrl.isNotEmpty())
+            }
+        }
+    }
 }

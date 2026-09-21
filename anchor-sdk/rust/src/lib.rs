@@ -259,7 +259,18 @@ fn decode_varint(input: &[u8]) -> Result<(u64, usize), ProtocolViolation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use v1::control_envelope::Body;
+
+    fn reference_varint(mut value: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while value >= 0x80 {
+            bytes.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+        bytes
+    }
 
     #[test]
     fn pairing_reject_matches_control_fixture() {
@@ -286,6 +297,12 @@ mod tests {
             include_str!("../../protocol/fixtures/v1/control/capability-open.hex"),
             include_str!("../../protocol/fixtures/v1/control/stream-open.hex"),
             include_str!("../../protocol/fixtures/v1/control/datagram-flow-open.hex"),
+            include_str!("../../protocol/fixtures/v1/control/ping.hex"),
+            include_str!("../../protocol/fixtures/v1/control/pong.hex"),
+            include_str!("../../protocol/fixtures/v1/control/capability-opened.hex"),
+            include_str!("../../protocol/fixtures/v1/control/stream-opened.hex"),
+            include_str!("../../protocol/fixtures/v1/control/datagram-flow-opened.hex"),
+            include_str!("../../protocol/fixtures/v1/control/session-close.hex"),
         ] {
             let bytes = hex::decode(fixture.trim()).unwrap();
             let (_, consumed) = decode_first_control_record(&bytes).unwrap();
@@ -442,5 +459,108 @@ mod tests {
             decode_first_control_record(b"ANCR\x01\x00\x80"),
             Err(ProtocolViolation::TruncatedControlRecord)
         );
+    }
+
+    #[test]
+    fn control_decoder_rejects_an_oversized_declared_length_before_reading_payload() {
+        let mut frame = Vec::from(CONTROL_MAGIC);
+        frame.extend_from_slice(&[PROTOCOL_MAJOR, PROTOCOL_MINOR]);
+        frame.extend_from_slice(&reference_varint((MAX_CONTROL_RECORD_BYTES + 1) as u64));
+
+        assert_eq!(
+            decode_first_control_record(&frame),
+            Err(ProtocolViolation::ControlRecordTooLarge),
+        );
+    }
+
+    #[test]
+    fn control_decoder_reports_only_the_first_record_length_with_a_trailing_record() {
+        let first = v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(Body::Ping(v1::Ping {
+                nonce: 0x0102_0304_0506_0708,
+            })),
+        };
+        let second = v1::ControlEnvelope {
+            request_id: 0,
+            response_to: 0,
+            body: Some(Body::Pong(v1::Pong {
+                nonce: 0x1112_1314_1516_1718,
+            })),
+        };
+        let first_record = encode_first_control_record(&first).unwrap();
+        let mut stream = first_record.clone();
+        stream.extend_from_slice(&encode_first_control_record(&second).unwrap());
+
+        let (decoded, consumed) = decode_first_control_record(&stream).unwrap();
+        assert_eq!(decoded, first);
+        assert_eq!(consumed, first_record.len());
+    }
+
+    #[test]
+    fn every_public_capability_advertises_a_nonempty_unique_record_allow_list() {
+        let advertisements = [
+            camera::advertisement(),
+            clipboard::advertisement(),
+            commands::advertisement(),
+            device::advertisement(),
+            files::advertisement(),
+            input::advertisement(),
+            media::advertisement(),
+            notifications::advertisement(),
+            screen::advertisement(),
+            sms::advertisement(),
+        ];
+
+        for advertisement in advertisements {
+            assert!(!advertisement.name.is_empty());
+            assert_ne!(advertisement.major, 0);
+            assert!(!advertisement.record_type_urls.is_empty());
+            for type_url in &advertisement.record_type_urls {
+                assert!(!type_url.is_empty());
+                assert_eq!(
+                    advertisement
+                        .record_type_urls
+                        .iter()
+                        .filter(|candidate| *candidate == type_url)
+                        .count(),
+                    1,
+                    "{} advertises {type_url} more than once",
+                    advertisement.name,
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn control_varint_decoder_matches_an_independent_reference(value in any::<u64>()) {
+            let bytes = reference_varint(value);
+            let (decoded, consumed) = decode_varint(&bytes).unwrap();
+            prop_assert_eq!(decoded, value);
+            prop_assert_eq!(consumed, bytes.len());
+        }
+
+        #[test]
+        fn control_decoder_reports_truncation_at_every_boundary_of_a_valid_record(
+            nonce in any::<u64>(),
+        ) {
+            let envelope = v1::ControlEnvelope {
+                request_id: 0,
+                response_to: 0,
+                body: Some(Body::Ping(v1::Ping { nonce })),
+            };
+            let record = encode_first_control_record(&envelope).unwrap();
+            for length in 0..record.len() {
+                prop_assert!(
+                    matches!(
+                        decode_first_control_record(&record[..length]),
+                        Err(ProtocolViolation::TruncatedControlRecord)
+                    ),
+                    "truncation at byte {length} was not reported as a truncated control record",
+                );
+            }
+        }
     }
 }
