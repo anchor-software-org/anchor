@@ -1405,3 +1405,117 @@ async fn datagram_flows_receive_only_their_own_flows_packets() {
 
     server_task.await.unwrap();
 }
+
+#[tokio::test]
+async fn parity_recovers_a_fragment_lost_over_real_quic_datagrams() {
+    use anchor_sdk::video_frame::{
+        FrameHeader, Reassembler, fragment_frame_with_parity, FRAME_KIND_CAMERA,
+        FRAME_KIND_PARITY,
+    };
+
+    let (server_config, client_config) = configs();
+    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.unwrap();
+        let session = Session::accept(
+            incoming,
+            identity(vec![anchor_sdk::camera::endpoint_advertisement()]),
+        )
+        .await
+        .unwrap();
+        let SessionEvent::CapabilityOpenRequested {
+            request_id,
+            capability_session_id,
+            endpoint_id,
+            capability_name,
+            capability_major,
+        } = session.next_event().await.unwrap()
+        else {
+            panic!("expected capability open request");
+        };
+        session
+            .accept_capability(
+                request_id,
+                capability_session_id,
+                &endpoint_id,
+                &capability_name,
+                capability_major,
+            )
+            .await
+            .unwrap();
+        let SessionEvent::DatagramFlowOpenRequested {
+            request_id, flow_id, ..
+        } = session.next_event().await.unwrap()
+        else {
+            panic!("expected datagram flow open request");
+        };
+        let flow = session.accept_datagram_flow(request_id, flow_id).await.unwrap();
+
+        // Reassemble whatever datagrams arrive; one data fragment was
+        // withheld by the sender, so only parity can complete the frame.
+        let mut assembler = Reassembler::default();
+        let frame = timeout(Duration::from_secs(5), async {
+            loop {
+                let datagram = flow.recv().await.expect("flow must stay open");
+                if let Some(frame) = assembler.add_datagram(
+                    &datagram,
+                    FRAME_KIND_CAMERA,
+                    capability_session_id,
+                    flow_id,
+                ) {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("parity must rebuild the withheld fragment within 5s");
+        assert!(
+            frame.iter().enumerate().all(|(i, b)| *b == (i % 239) as u8),
+            "recovered frame must match byte-exact"
+        );
+        session.close(0, b"test complete");
+    });
+
+    let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client_config);
+    let client = Session::connect(&client_endpoint, address, "anchor.test", identity(vec![]))
+        .await
+        .unwrap();
+    let capability = client
+        .open_capability(
+            anchor_sdk::camera::ENDPOINT_ID,
+            anchor_sdk::camera::CAPABILITY_NAME,
+            anchor_sdk::camera::CAPABILITY_MAJOR,
+        )
+        .await
+        .unwrap();
+    let flow = capability
+        .open_datagram_flow(anchor_sdk::camera::FRAME_TYPE_URL)
+        .await
+        .unwrap();
+
+    let frame: Vec<u8> = (0..20 * 1024 + 13).map(|i| (i % 239) as u8).collect();
+    let packets = fragment_frame_with_parity(
+        FRAME_KIND_CAMERA,
+        0,
+        capability.session_id(),
+        flow.flow_id(),
+        1,
+        0,
+        0,
+        &frame,
+    )
+    .unwrap();
+    // Withhold data fragment 5 — simulates a single datagram lost on the
+    // wire; parity for group 0 must cover it.
+    let withheld = 5_usize;
+    for packet in packets.iter() {
+        let header = FrameHeader::decode(packet).unwrap().0;
+        if header.kind != FRAME_KIND_PARITY && header.fragment_index as usize == withheld {
+            continue;
+        }
+        flow.send(packet.clone()).unwrap();
+    }
+    server_task.await.unwrap();
+}
