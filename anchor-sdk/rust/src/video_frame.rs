@@ -571,6 +571,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn wire_packet(
         kind: u8,
         flags: u16,
