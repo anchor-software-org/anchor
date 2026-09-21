@@ -439,12 +439,19 @@ pub struct DatagramTransportStats {
 
 // Quinn 0.11's lossy send path has a queue-accounting bug when it evicts old
 // datagrams after the configured buffer fills. Keep a small reserve so Anchor
-// never asks Quinn to perform that eviction, while still allowing a large
-// scene-change IDR to fit in the 256 KiB queue. The per-fragment allowance
+// never asks Quinn to perform that eviction. The per-fragment allowance
 // below accounts for Quinn's private `Datagram` bookkeeping; the public
 // `datagram_send_buffer_space()` API only subtracts one such item.
 const DATAGRAM_QUEUE_HEADROOM_BYTES: usize = 16 * 1024;
 const DATAGRAM_QUEUE_ITEM_BYTES: usize = 32;
+/// Staleness bound for the unreliable media queue: a burst may never leave
+/// more than this many bytes waiting behind congestion, so scene changes
+/// cannot stack a second of stale frames ahead of the live one. Quinn's
+/// buffer itself is sized for the largest legal access unit
+/// (`DATAGRAM_SEND_BUFFER_BYTES`); this admission cap preserves the old
+/// 256 KiB latency policy while still letting an oversized keyframe through
+/// whenever the queue has drained below the bound.
+const DATAGRAM_STALE_QUEUE_BYTES: usize = 256 * 1024;
 
 impl DatagramFlow {
     pub fn flow_id(&self) -> u64 {
@@ -1114,7 +1121,7 @@ impl Session {
             .map(|payload| payload.len().saturating_add(DATAGRAM_QUEUE_ITEM_BYTES))
             .sum::<usize>()
             .saturating_add(DATAGRAM_QUEUE_HEADROOM_BYTES);
-        if available < required {
+        if self.datagram_admission_denied(available, required) {
             return Err(DatagramSendError::BufferFull {
                 available,
                 required,
@@ -1127,6 +1134,16 @@ impl Session {
                 .map_err(|error| DatagramSendError::Transport(error.to_string()))?;
         }
         Ok(())
+    }
+
+    /// All-or-nothing admission: the burst must physically fit in Quinn's
+    /// queue, and the backlog already waiting there must not exceed the
+    /// staleness bound. Oversized access units are not special-cased — they
+    /// pass as soon as congestion drains the backlog under the bound, which
+    /// is also what keeps a huge keyframe from starving forever.
+    fn datagram_admission_denied(&self, available: usize, required: usize) -> bool {
+        let queued = crate::quinn_transport::DATAGRAM_SEND_BUFFER_BYTES.saturating_sub(available);
+        required > available || queued > DATAGRAM_STALE_QUEUE_BYTES
     }
 
     /// Owned-packet variant of `send_datagrams`: identical admission logic,
@@ -1146,7 +1163,7 @@ impl Session {
             .map(|payload| payload.len().saturating_add(DATAGRAM_QUEUE_ITEM_BYTES))
             .sum::<usize>()
             .saturating_add(DATAGRAM_QUEUE_HEADROOM_BYTES);
-        if available < required {
+        if self.datagram_admission_denied(available, required) {
             return Err(DatagramSendError::BufferFull {
                 available,
                 required,
