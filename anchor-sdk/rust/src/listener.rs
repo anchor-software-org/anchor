@@ -94,7 +94,8 @@ impl AnchorListener {
             .ok();
         let server_config = quinn_transport::server_config(config.identity.server_config()?)
             .map_err(|_| ListenerError::TransportConfiguration)?;
-        let socket = bind_udp_socket(config.bind_address).map_err(ListenerError::Bind)?;
+        let socket =
+            quinn_transport::bind_udp_socket(config.bind_address).map_err(ListenerError::Bind)?;
         let runtime = quinn::default_runtime()
             .ok_or_else(|| ListenerError::Bind(std::io::Error::other("no async runtime")))?;
         let endpoint = quinn::Endpoint::new(
@@ -123,30 +124,6 @@ impl AnchorListener {
             session_identity: self.session_identity.clone(),
         }))
     }
-}
-
-/// Bind the QUIC UDP socket with enlarged kernel buffers. Media datagram
-/// bursts (multi-MiB IDR keyframes at 60fps) can overrun the ~200 KiB Linux
-/// default and drop packets before Quinn ever sees them; the kernel clamps
-/// to rmem_max/wmem_max, so asking for 8 MiB is safe.
-fn bind_udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(address),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-    // Best-effort: a kernel that rejects the size still serves the default.
-    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
-    let _ = socket.set_send_buffer_size(SOCKET_BUFFER_BYTES);
-    if address.is_ipv6() {
-        // Match quinn::Endpoint::server: an IPv6 bind stays dual-stack so an
-        // IPv4 phone on the same LAN can still reach it.
-        let _ = socket.set_only_v6(false);
-    }
-    socket.bind(&address.into())?;
-    socket.set_nonblocking(true)?;
-    Ok(socket.into())
 }
 
 #[derive(Debug)]

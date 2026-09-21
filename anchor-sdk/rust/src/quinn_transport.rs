@@ -11,6 +11,38 @@ use thiserror::Error;
 
 use crate::ALPN;
 
+/// Quinn datagram send queue capacity. Sized to admit the largest legal
+/// access unit; `Session` applies the smaller stale-queue bound on top.
+pub(crate) const DATAGRAM_SEND_BUFFER_BYTES: usize = 10 * 1024 * 1024;
+
+/// Bind a QUIC UDP socket with enlarged kernel buffers. Media datagram
+/// bursts (multi-MiB IDR keyframes at 60fps) can overrun the ~200 KiB Linux
+/// default and drop packets before Quinn ever sees them; the kernel clamps
+/// to rmem_max/wmem_max, so asking for 8 MiB is safe. Applies to outbound
+/// endpoints too — a client that only ever *receives* a large screen frame
+/// bursts just as hard on its recv buffer.
+pub fn bind_udp_socket(
+    address: std::net::SocketAddr,
+) -> std::io::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(address),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    const SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+    // Best-effort: a kernel that rejects the size still serves the default.
+    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+    let _ = socket.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+    if address.is_ipv6() {
+        // Match quinn::Endpoint::server: an IPv6 bind stays dual-stack so an
+        // IPv4 phone on the same LAN can still reach it.
+        let _ = socket.set_only_v6(false);
+    }
+    socket.bind(&address.into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
 #[derive(Debug, Error)]
 pub enum QuinnConfigError {
     #[error("TLS configuration is not QUIC/TLS-1.3 compatible: {0}")]
@@ -46,11 +78,14 @@ pub fn server_config(mut tls: rustls::ServerConfig) -> Result<ServerConfig, Quin
 /// same way on the wire.
 fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut config = quinn::TransportConfig::default();
-    // Keep the unreliable media queue small enough that scene-change bursts
-    // cannot build a second of stale frames behind the one being displayed.
-    // DatagramFlow applies its own reserve before enqueueing a complete access
-    // unit, so this bounds latency without invoking Quinn's lossy eviction path.
-    config.datagram_send_buffer_size(256 * 1024);
+    // Physical room for the largest legal access unit (~8.7MiB once a
+    // MAX_FRAME_BYTES frame is split into datagrams plus per-item overhead);
+    // Quinn accounts queued bytes rather than preallocating, so the size costs
+    // nothing while idle. Staleness is bounded at the admission layer instead
+    // (Session caps the *backlog*, not the capacity): a smaller buffer here
+    // would make any frame above ~245KiB categorically unsendable even on an
+    // idle connection — a keyframe that large can never be recovered.
+    config.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER_BYTES);
     // Anchor sessions run on LAN/Wi-Fi peer-to-peer paths; the 333ms spec
     // default initial RTT delays the congestion controller's ramp-up right
     // after connect, when the first keyframe burst matters most.
