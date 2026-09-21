@@ -28,9 +28,10 @@ pub fn advertisement() -> CapabilityAdvertisement {
             STATUS_TYPE_URL.into(),
             FRAME_TYPE_URL.into(),
         ],
-        // Screen video is ordered/reliable; datagrams remain available only
-        // to capabilities whose payload is explicitly transient.
-        supports_datagrams: false,
+        // Screen video tolerates datagram loss: parity lets receivers rebuild
+        // a singly-lost fragment, and skipping head-of-line blocking removes
+        // the ~1 RTT stall a dropped stream packet would otherwise cost.
+        supports_datagrams: true,
     }
 }
 pub fn endpoint_advertisement() -> EndpointAdvertisement {

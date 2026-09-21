@@ -389,9 +389,6 @@ class VideoPlugin(
             sideboatTrace = trace
             trace.event("run_start", "capability_session_id" to capability.sessionId)
             try {
-                val stream = capability.openStream(ScreenProtocol.FRAME_TYPE_URL)
-                Log.i(TAG, "SDK screen reliable stream opened (stream=${stream.streamId})")
-                trace.event("stream_open", "stream_id" to stream.streamId)
                 val assembler = ScreenFrameAssembler(onEvent = { outcome ->
                     trace.event(
                         "assembler_${outcome.outcome.name.lowercase(Locale.US)}",
@@ -406,6 +403,36 @@ class VideoPlugin(
                         "reason" to outcome.reason,
                     )
                 })
+                // Prefer the lossy datagram flow: it skips head-of-line
+                // blocking and carries XOR parity so a singly-lost fragment is
+                // rebuilt instead of stalling the whole stream ~1 RTT. Peers
+                // that did not advertise datagram support fail here and take
+                // the reliable-stream path below.
+                val datagramFlow = try {
+                    capability.openDatagramFlow(ScreenProtocol.FRAME_TYPE_URL)
+                } catch (error: Exception) {
+                    Log.i(TAG, "SDK screen datagram flow unavailable: ${error.message}")
+                    null
+                }
+                if (datagramFlow != null) {
+                    Log.i(TAG, "SDK screen datagram flow opened (flow=${datagramFlow.flowId})")
+                    trace.event("datagram_flow_open", "flow_id" to datagramFlow.flowId)
+                    while (true) {
+                        val datagram = datagramFlow.receive()
+                        val completed =
+                            assembler.add(datagram, datagramFlow.flowId, capability.sessionId)
+                        if (assembler.takeKeyframeRequest()) {
+                            requestKeyframe()
+                            trace.event("keyframe_request_needed", "flow_id" to datagramFlow.flowId)
+                        }
+                        for (assembled in completed) {
+                            feedFrame(assembled)
+                        }
+                    }
+                }
+                val stream = capability.openStream(ScreenProtocol.FRAME_TYPE_URL)
+                Log.i(TAG, "SDK screen reliable stream opened (stream=${stream.streamId})")
+                trace.event("stream_open", "stream_id" to stream.streamId)
                 val packetReader = ScreenStreamPacketReader()
                 var lastIngressMetricsNs = 0L
                 while (true) {
@@ -451,6 +478,7 @@ class VideoPlugin(
                     for (packet in packets) {
                         val completed = assembler.add(packet, stream.streamId, capability.sessionId)
                         if (assembler.takeKeyframeRequest()) {
+                            requestKeyframe()
                             trace.event("keyframe_request_needed", "stream_id" to stream.streamId)
                         }
                         for (assembled in completed) {
