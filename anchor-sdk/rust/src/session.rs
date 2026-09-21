@@ -55,6 +55,8 @@ pub enum SessionError {
     CapabilityNotOpened(u64),
     #[error("control stream ended")]
     ControlStreamEnded,
+    #[error("datagram flow ended")]
+    DatagramFlowEnded,
 }
 
 /// Local identity and endpoint advertisements sent in `SessionHello`.
@@ -230,6 +232,17 @@ impl ReliableSendStream {
             .map_err(SessionError::Write)
     }
 
+    /// Writes every chunk without concatenating them first. Producers that
+    /// already hold `Bytes` fragments (for example ANFR packets with their
+    /// stream length prefixes) avoid a per-frame copy through an intermediate
+    /// buffer.
+    pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), SessionError> {
+        self.inner
+            .write_all_chunks(bufs)
+            .await
+            .map_err(SessionError::Write)
+    }
+
     pub fn finish(&mut self) -> Result<(), SessionError> {
         self.inner.finish().map_err(SessionError::ClosedStream)
     }
@@ -330,6 +343,7 @@ impl Capability {
         Ok(DatagramFlow {
             session: self.session.clone(),
             flow_id,
+            recv: Arc::new(Mutex::new(self.session.route_datagram_flow(flow_id))),
         })
     }
 
@@ -387,10 +401,16 @@ impl Capability {
 }
 
 /// A negotiated unreliable datagram path associated with one capability.
+///
+/// Received datagrams arrive through the connection-level dispatcher, which
+/// routes by the ANFR flow ID — so concurrent flows can never steal each
+/// other's packets the way multiple `connection.read_datagram()` callers
+/// would.
 #[derive(Clone)]
 pub struct DatagramFlow {
     session: Session,
     flow_id: u64,
+    recv: Arc<Mutex<tokio::sync::mpsc::Receiver<Bytes>>>,
 }
 
 /// Failure returned when an application datagram cannot be queued without
@@ -457,27 +477,28 @@ impl DatagramFlow {
     /// connection-wide datagram lock. This prevents screen/camera producers
     /// from interleaving fragments and, importantly, avoids queueing a partial
     /// frame when there is not enough space for all of its fragments.
-    pub fn send_many<I>(&self, payloads: I) -> Result<(), DatagramSendError>
-    where
-        I: IntoIterator<Item = Bytes>,
-    {
-        self.session.send_datagrams(payloads)
+    ///
+    /// Takes the packet vector by value so each fragment's `Bytes` moves into
+    /// the send queue — no per-fragment refcount churn on large keyframes.
+    pub fn send_many(&self, payloads: Vec<Bytes>) -> Result<(), DatagramSendError> {
+        self.session.send_datagrams_owned(payloads)
     }
 
-    /// Receive the next application datagram on the authenticated session.
-    ///
-    /// QUIC exposes datagrams at connection scope, so callers must validate
-    /// the fixed Anchor frame header and discard packets for other flow IDs.
+    /// Receive the next application datagram routed to this flow. The
+    /// dispatcher only forwards packets whose ANFR flow ID matches; the
+    /// per-flow queue is bounded, so a stalled consumer drops rather than
+    /// accumulating stale media.
     pub async fn recv(&self) -> Result<Bytes, SessionError> {
-        self.session
-            .0
-            .connection
-            .read_datagram()
+        self.recv
+            .lock()
             .await
-            .map_err(SessionError::Connection)
+            .recv()
+            .await
+            .ok_or(SessionError::DatagramFlowEnded)
     }
 
     pub async fn close(&self) -> Result<(), SessionError> {
+        self.session.0.datagram_routes.lock().unwrap().remove(&self.flow_id);
         self.session.send_datagram_flow_closed(self.flow_id).await
     }
 }
@@ -488,6 +509,12 @@ struct SessionInner {
     // from independent screen/camera producers so queue accounting remains
     // consistent when both flows are active at once.
     datagram_send: std::sync::Mutex<()>,
+    // Receiving is connection-scoped too: one dispatcher task reads
+    // `read_datagram` and routes each packet to its flow's channel by the
+    // ANFR flow ID. Without it, two concurrent `DatagramFlow::recv` callers
+    // would steal each other's datagrams and drop them as wrong-flow.
+    datagram_routes: std::sync::Mutex<HashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>,
+    datagram_dispatch_started: std::sync::atomic::AtomicBool,
     control_send: Mutex<quinn::SendStream>,
     control_recv: Mutex<ControlReader>,
     event_wait: Mutex<()>,
@@ -1027,6 +1054,7 @@ impl Session {
         Ok(DatagramFlow {
             session: self.clone(),
             flow_id,
+            recv: Arc::new(Mutex::new(self.route_datagram_flow(flow_id))),
         })
     }
 
@@ -1050,14 +1078,60 @@ impl Session {
     /// Sends an application datagram. Flow negotiation and the capability's
     /// fixed binary header remain explicit at the capability layer.
     pub fn send_datagram(&self, payload: Bytes) -> Result<(), DatagramSendError> {
-        self.send_datagrams(std::iter::once(payload))
+        self.send_datagrams(std::slice::from_ref(&payload))
     }
 
-    fn send_datagrams<I>(&self, payloads: I) -> Result<(), DatagramSendError>
-    where
-        I: IntoIterator<Item = Bytes>,
-    {
-        let payloads: Vec<Bytes> = payloads.into_iter().collect();
+    /// Register a receive route for one datagram flow and lazily start the
+    /// connection-level dispatcher. Each route is a bounded channel: a full
+    /// queue drops the datagram, preserving QUIC's lossy semantics for media
+    /// without letting a stalled consumer grow unbounded.
+    fn route_datagram_flow(&self, flow_id: u64) -> tokio::sync::mpsc::Receiver<Bytes> {
+        const DATAGRAM_ROUTE_CAPACITY: usize = 512;
+        let (tx, rx) = tokio::sync::mpsc::channel(DATAGRAM_ROUTE_CAPACITY);
+        self.0
+            .datagram_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(flow_id, tx);
+        if !self.0.datagram_dispatch_started.swap(true, Ordering::AcqRel) {
+            tokio::spawn(dispatch_datagrams(self.clone()));
+        }
+        rx
+    }
+
+    fn send_datagrams(&self, payloads: &[Bytes]) -> Result<(), DatagramSendError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let _guard = self
+            .0
+            .datagram_send
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available = self.0.connection.datagram_send_buffer_space();
+        let required = payloads
+            .iter()
+            .map(|payload| payload.len().saturating_add(DATAGRAM_QUEUE_ITEM_BYTES))
+            .sum::<usize>()
+            .saturating_add(DATAGRAM_QUEUE_HEADROOM_BYTES);
+        if available < required {
+            return Err(DatagramSendError::BufferFull {
+                available,
+                required,
+            });
+        }
+        for payload in payloads {
+            self.0
+                .connection
+                .send_datagram(payload.clone())
+                .map_err(|error| DatagramSendError::Transport(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Owned-packet variant of `send_datagrams`: identical admission logic,
+    /// but each `Bytes` moves into Quinn's queue instead of taking a refcount.
+    fn send_datagrams_owned(&self, payloads: Vec<Bytes>) -> Result<(), DatagramSendError> {
         if payloads.is_empty() {
             return Ok(());
         }
@@ -1119,6 +1193,8 @@ impl Session {
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
+            datagram_routes: std::sync::Mutex::new(HashMap::new()),
+            datagram_dispatch_started: std::sync::atomic::AtomicBool::new(false),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
             event_wait: Mutex::new(()),
@@ -1156,6 +1232,8 @@ impl Session {
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
+            datagram_routes: std::sync::Mutex::new(HashMap::new()),
+            datagram_dispatch_started: std::sync::atomic::AtomicBool::new(false),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
             event_wait: Mutex::new(()),
@@ -1205,7 +1283,8 @@ impl Session {
     }
 
     async fn send_envelope(&self, envelope: v1::ControlEnvelope) -> Result<(), SessionError> {
-        validate_control_envelope(&envelope)?;
+        // encode_record applies the envelope invariants; validating here too
+        // would double the check on every control send.
         let mut send = self.0.control_send.lock().await;
         write_record(&mut send, &envelope, false).await
     }
@@ -1260,8 +1339,8 @@ async fn write_record(
     envelope: &v1::ControlEnvelope,
     first: bool,
 ) -> Result<(), SessionError> {
-    validate_control_envelope(envelope)?;
-    let frame = encode_record(envelope, first)?;
+    let mut frame = Vec::new();
+    encode_record_into(envelope, first, &mut frame)?;
     send.write_all(&frame).await?;
     send.flush().await?;
     Ok(())
@@ -1273,28 +1352,72 @@ async fn write_records(
 ) -> Result<(), SessionError> {
     let mut frame = Vec::new();
     for (envelope, first) in records {
-        frame.extend_from_slice(&encode_record(envelope, *first)?);
+        encode_record_into(envelope, *first, &mut frame)?;
     }
     send.write_all(&frame).await?;
     send.flush().await?;
     Ok(())
 }
 
-fn encode_record(envelope: &v1::ControlEnvelope, first: bool) -> Result<Vec<u8>, SessionError> {
+/// Encode one control record directly into `frame`. Prost's
+/// `encode_length_delimited` emits the same LEB128 length prefix as
+/// `encode_varint`, so this avoids the intermediate `encode_to_vec`
+/// allocation and payload memcpy the old two-step path needed.
+fn encode_record_into(
+    envelope: &v1::ControlEnvelope,
+    first: bool,
+    frame: &mut Vec<u8>,
+) -> Result<(), SessionError> {
     validate_control_envelope(envelope)?;
-    let payload = envelope.encode_to_vec();
-    if payload.len() > MAX_CONTROL_RECORD_BYTES {
+    if envelope.encoded_len() > MAX_CONTROL_RECORD_BYTES {
         return Err(ProtocolViolation::ControlRecordTooLarge.into());
     }
-    let mut frame = Vec::with_capacity(payload.len() + 16);
+    frame.reserve(envelope.encoded_len() + 16);
     if first {
         frame.extend_from_slice(&CONTROL_MAGIC);
         frame.push(PROTOCOL_MAJOR);
         frame.push(PROTOCOL_MINOR);
     }
-    encode_varint(payload.len() as u64, &mut frame);
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    envelope
+        .encode_length_delimited(frame)
+        .map_err(|_| ProtocolViolation::MalformedControlRecord)?;
+    Ok(())
+}
+
+/// Read connection-scoped QUIC datagrams and fan them out to per-flow
+/// channels by the ANFR flow ID. Datagrams for unregistered or closed flows
+/// are dropped; a full flow queue drops too — the receiver treats that as
+/// ordinary media loss and recovers from the next keyframe.
+async fn dispatch_datagrams(session: Session) {
+    loop {
+        let Ok(datagram) = session.0.connection.read_datagram().await else {
+            // Connection ended; dropping the session closes every channel.
+            return;
+        };
+        let Some(flow_id) = crate::video_frame::datagram_flow_id(&datagram) else {
+            continue;
+        };
+        let sender = session
+            .0
+            .datagram_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&flow_id)
+            .cloned();
+        let Some(sender) = sender else {
+            continue;
+        };
+        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
+            sender.try_send(datagram)
+        {
+            session
+                .0
+                .datagram_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&flow_id);
+        }
+    }
 }
 
 struct ControlReader {
@@ -1373,14 +1496,6 @@ async fn read_varint(recv: &mut quinn::RecvStream) -> Result<u64, SessionError> 
         }
     }
     Err(ProtocolViolation::ControlRecordTooLarge.into())
-}
-
-fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 0x80 {
-        output.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
 }
 
 fn peer_from_hello(envelope: v1::ControlEnvelope) -> Result<SessionPeer, SessionError> {

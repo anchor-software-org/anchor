@@ -1298,3 +1298,110 @@ async fn pairing_first_record_is_classified_and_cannot_open_capabilities() {
     pairing.close(0, b"pairing complete");
     server_task.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn datagram_flows_receive_only_their_own_flows_packets() {
+    let (server_config, client_config) = configs();
+    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let incoming = server.accept().await.unwrap();
+        let session = Session::accept(
+            incoming,
+            identity(vec![anchor_sdk::camera::endpoint_advertisement()]),
+        )
+        .await
+        .unwrap();
+        let SessionEvent::CapabilityOpenRequested {
+            request_id,
+            capability_session_id,
+            endpoint_id,
+            capability_name,
+            capability_major,
+        } = session.next_event().await.unwrap()
+        else {
+            panic!("expected capability open request");
+        };
+        session
+            .accept_capability(
+                request_id,
+                capability_session_id,
+                &endpoint_id,
+                &capability_name,
+                capability_major,
+            )
+            .await
+            .unwrap();
+
+        let mut flows = Vec::new();
+        for _ in 0..2 {
+            let SessionEvent::DatagramFlowOpenRequested {
+                request_id, flow_id, ..
+            } = session.next_event().await.unwrap()
+            else {
+                panic!("expected datagram flow open request");
+            };
+            flows.push(session.accept_datagram_flow(request_id, flow_id).await.unwrap());
+        }
+        assert_ne!(flows[0].flow_id(), flows[1].flow_id());
+
+        // Only flow[1]'s datagrams were sent: its receiver must get a packet
+        // while flow[0]'s receiver must observe nothing (no cross-flow steal).
+        let delivered = timeout(Duration::from_millis(500), flows[1].recv())
+            .await
+            .expect("flow packets must reach their own receiver")
+            .expect("flow receiver must deliver a packet");
+        let (header, payload) =
+            anchor_sdk::video_frame::FrameHeader::decode(&delivered).unwrap();
+        assert_eq!(header.flow_id, flows[1].flow_id());
+        assert_eq!(payload, b"flow-b");
+
+        assert!(
+            timeout(Duration::from_millis(150), flows[0].recv()).await.is_err(),
+            "a flow must never observe another flow's datagrams",
+        );
+        session.close(0, b"test complete");
+    });
+
+    let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client_config);
+    let client = Session::connect(&client_endpoint, address, "anchor.test", identity(vec![]))
+        .await
+        .unwrap();
+    let capability = client
+        .open_capability(
+            anchor_sdk::camera::ENDPOINT_ID,
+            anchor_sdk::camera::CAPABILITY_NAME,
+            anchor_sdk::camera::CAPABILITY_MAJOR,
+        )
+        .await
+        .unwrap();
+    let _flow_a = capability
+        .open_datagram_flow(anchor_sdk::camera::FRAME_TYPE_URL)
+        .await
+        .unwrap();
+    let flow_b = capability
+        .open_datagram_flow(anchor_sdk::camera::FRAME_TYPE_URL)
+        .await
+        .unwrap();
+
+    // Give the accept side a moment to register its routes, then send
+    // flow-b-only packets a few times to absorb loopback/race loss.
+    sleep(Duration::from_millis(30)).await;
+    for _ in 0..8 {
+        let packets = anchor_sdk::video_frame::fragment_frame(
+            anchor_sdk::video_frame::FRAME_KIND_CAMERA,
+            capability.session_id(),
+            flow_b.flow_id(),
+            1,
+            0,
+            0,
+            b"flow-b",
+        )
+        .unwrap();
+        flow_b.send(packets[0].clone()).unwrap();
+        sleep(Duration::from_millis(5)).await;
+    }
+
+    server_task.await.unwrap();
+}

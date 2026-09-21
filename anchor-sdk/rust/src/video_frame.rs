@@ -6,6 +6,10 @@
 //! records can be carried in QUIC datagrams or in the length-prefixed reliable
 //! stream framing below.
 
+use rustc_hash::FxHashMap;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
 use thiserror::Error;
 
 pub const FRAME_MAGIC: [u8; 4] = *b"ANFR";
@@ -68,19 +72,30 @@ impl FrameHeader {
             return Err(FrameError::TooLarge(FRAME_PAYLOAD_BYTES));
         }
         let mut bytes = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&FRAME_MAGIC);
-        bytes.push(FRAME_VERSION);
-        bytes.push(self.kind);
-        bytes.extend_from_slice(&self.flags.to_le_bytes());
-        bytes.extend_from_slice(&self.capability_session_id.to_le_bytes());
-        bytes.extend_from_slice(&self.flow_id.to_le_bytes());
-        bytes.extend_from_slice(&self.sequence.to_le_bytes());
-        bytes.extend_from_slice(&self.fragment_index.to_le_bytes());
-        bytes.extend_from_slice(&self.fragment_count.to_le_bytes());
-        bytes.extend_from_slice(&self.presentation_time_us.to_le_bytes());
-        bytes.extend_from_slice(&self.codec_config_id.to_le_bytes());
-        bytes.extend_from_slice(payload);
+        self.write(&mut bytes, payload);
         Ok(bytes)
+    }
+
+    /// Appends the encoded header and payload to `out`. The header fields are
+    /// validated by the caller once per access unit, so this stays on the
+    /// fragmentation fast path.
+    fn write(self, out: &mut Vec<u8>, payload: &[u8]) {
+        // Fixed-size stack layout: the compiler turns these into plain
+        // stores and the whole header lands in `out` with one memcpy.
+        let mut header = [0_u8; FRAME_HEADER_BYTES];
+        header[..4].copy_from_slice(&FRAME_MAGIC);
+        header[4] = FRAME_VERSION;
+        header[5] = self.kind;
+        header[6..8].copy_from_slice(&self.flags.to_le_bytes());
+        header[8..16].copy_from_slice(&self.capability_session_id.to_le_bytes());
+        header[16..24].copy_from_slice(&self.flow_id.to_le_bytes());
+        header[24..32].copy_from_slice(&self.sequence.to_le_bytes());
+        header[32..34].copy_from_slice(&self.fragment_index.to_le_bytes());
+        header[34..36].copy_from_slice(&self.fragment_count.to_le_bytes());
+        header[36..44].copy_from_slice(&self.presentation_time_us.to_le_bytes());
+        header[44..52].copy_from_slice(&self.codec_config_id.to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(payload);
     }
 
     pub fn decode(datagram: &[u8]) -> Result<(Self, &[u8]), FrameError> {
@@ -129,6 +144,9 @@ impl FrameHeader {
 }
 
 /// Split one encoded access unit into bounded QUIC datagrams.
+///
+/// Every fragment is a zero-copy slice of one arena allocation, so the whole
+/// access unit costs a single buffer plus `count` cheap `Bytes` handles.
 pub fn fragment_frame(
     kind: u8,
     capability_session_id: u64,
@@ -137,7 +155,7 @@ pub fn fragment_frame(
     presentation_time_us: u64,
     codec_config_id: u64,
     frame: &[u8],
-) -> Result<Vec<Vec<u8>>, FrameError> {
+) -> Result<Vec<Bytes>, FrameError> {
     fragment_frame_with_flags(
         kind,
         0,
@@ -164,7 +182,10 @@ pub fn fragment_frame_with_flags(
     presentation_time_us: u64,
     codec_config_id: u64,
     frame: &[u8],
-) -> Result<Vec<Vec<u8>>, FrameError> {
+) -> Result<Vec<Bytes>, FrameError> {
+    if !matches!(kind, FRAME_KIND_SCREEN | FRAME_KIND_CAMERA) {
+        return Err(FrameError::InvalidKind(kind));
+    }
     if frame.is_empty() {
         return Err(FrameError::Truncated);
     }
@@ -178,24 +199,44 @@ pub fn fragment_frame_with_flags(
         ));
     }
     let count = count as u16;
-    frame
-        .chunks(FRAME_PAYLOAD_BYTES)
-        .enumerate()
-        .map(|(index, payload)| {
-            FrameHeader {
-                kind,
-                flags,
-                capability_session_id,
-                flow_id,
-                sequence,
-                fragment_index: index as u16,
-                fragment_count: count,
-                presentation_time_us,
-                codec_config_id,
-            }
-            .encode(payload)
-        })
-        .collect()
+    // Pack every fragment into a single arena, then hand out zero-copy slice
+    // handles. Quinn keeps each `Bytes` alive until the datagram is flushed,
+    // so the arena is freed only after the last fragment leaves the queue.
+    let mut arena =
+        Vec::with_capacity(frame.len() + usize::from(count) * FRAME_HEADER_BYTES);
+    let mut packets = Vec::with_capacity(usize::from(count));
+    for (index, payload) in frame.chunks(FRAME_PAYLOAD_BYTES).enumerate() {
+        let start = arena.len();
+        FrameHeader {
+            kind,
+            flags,
+            capability_session_id,
+            flow_id,
+            sequence,
+            fragment_index: index as u16,
+            fragment_count: count,
+            presentation_time_us,
+            codec_config_id,
+        }
+        .write(&mut arena, payload);
+        packets.push((start, arena.len()));
+    }
+    let arena = Bytes::from(arena);
+    Ok(packets
+        .into_iter()
+        .map(|(start, end)| arena.slice(start..end))
+        .collect())
+}
+
+/// Read the routing flow ID out of an ANFR datagram. Used by the session's
+/// datagram dispatcher before per-flow validation — it deliberately skips
+/// kind and fragment checks so a malformed packet still reaches the flow
+/// that owns it and is rejected there with full context.
+pub fn datagram_flow_id(datagram: &[u8]) -> Option<u64> {
+    if datagram.len() < FRAME_HEADER_BYTES || datagram[..4] != FRAME_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(datagram[16..24].try_into().unwrap()))
 }
 
 /// Prefix one ANFR packet for a reliable QUIC stream.
@@ -209,6 +250,138 @@ pub fn encode_stream_packet(packet: &[u8]) -> Result<Vec<u8>, FrameError> {
     bytes.extend_from_slice(&length.to_le_bytes());
     bytes.extend_from_slice(packet);
     Ok(bytes)
+}
+
+/// Interleave little-endian length prefixes with ANFR packets for a vectored
+/// reliable-stream write. Each packet becomes two consecutive chunks — a
+/// 4-byte length prefix and the packet itself — so callers can submit the
+/// result to `write_all_chunks` without concatenating anything.
+pub fn stream_chunks(packets: &[Bytes]) -> Result<Vec<Bytes>, FrameError> {
+    let mut prefixes = Vec::with_capacity(packets.len() * STREAM_PACKET_LENGTH_BYTES);
+    for packet in packets {
+        if packet.is_empty() || packet.len() > FRAME_DATAGRAM_BYTES {
+            return Err(FrameError::TooLarge(FRAME_DATAGRAM_BYTES));
+        }
+        prefixes.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+    }
+    let prefixes = Bytes::from(prefixes);
+    let mut chunks = Vec::with_capacity(packets.len() * 2);
+    for (index, packet) in packets.iter().enumerate() {
+        let start = index * STREAM_PACKET_LENGTH_BYTES;
+        chunks.push(prefixes.slice(start..start + STREAM_PACKET_LENGTH_BYTES));
+        chunks.push(packet.clone());
+    }
+    Ok(chunks)
+}
+
+/// Bounds applied while reassembling ANFR fragments. Datagrams are
+/// intentionally lossy, so incomplete access units must never accumulate
+/// without limit.
+const PARTIAL_FRAME_TTL: Duration = Duration::from_millis(500);
+const MAX_PARTIAL_FRAMES: usize = 32;
+
+struct PartialFrame {
+    created: Instant,
+    fragment_count: u16,
+    fragments: Vec<Option<Bytes>>,
+    received: usize,
+    total_bytes: usize,
+}
+
+/// Reassembles ANFR datagrams back into complete access units.
+///
+/// Fragments are stored as zero-copy slices of the received datagrams, so the
+/// only payload copy happens once, when the complete frame is produced. The
+/// map is bounded and half-assembled frames expire quickly.
+#[derive(Default)]
+pub struct Reassembler {
+    partial: FxHashMap<u64, PartialFrame>,
+    /// Expiry sweeps are throttled to once per TTL: running `retain` on every
+    /// datagram costs an O(map) scan for no benefit — stale entries can sit
+    /// one extra interval without harm since the map is bounded anyway.
+    last_sweep: Option<Instant>,
+}
+
+impl Reassembler {
+    /// Feed one received datagram. Returns the complete access unit once its
+    /// last fragment arrives. Datagrams for other flows, other kinds, or with
+    /// inconsistent fragment counts are discarded.
+    pub fn add_datagram(
+        &mut self,
+        datagram: &Bytes,
+        kind: u8,
+        capability_session_id: u64,
+        flow_id: u64,
+    ) -> Option<Vec<u8>> {
+        let (header, _) = FrameHeader::decode(datagram).ok()?;
+        if header.kind != kind
+            || header.capability_session_id != capability_session_id
+            || header.flow_id != flow_id
+        {
+            return None;
+        }
+        let now = Instant::now();
+        if !self.partial.is_empty()
+            && self
+                .last_sweep
+                .is_none_or(|t| now.duration_since(t) >= PARTIAL_FRAME_TTL)
+        {
+            self.partial
+                .retain(|_, frame| now.duration_since(frame.created) <= PARTIAL_FRAME_TTL);
+            self.last_sweep = Some(now);
+        }
+        if self.partial.len() >= MAX_PARTIAL_FRAMES
+            && !self.partial.contains_key(&header.sequence)
+            && let Some(oldest) = self
+                .partial
+                .iter()
+                .min_by_key(|(_, frame)| frame.created)
+                .map(|(sequence, _)| *sequence)
+        {
+            self.partial.remove(&oldest);
+        }
+        let entry = self.partial.entry(header.sequence).or_insert_with(|| PartialFrame {
+            created: now,
+            fragment_count: header.fragment_count,
+            // A frame can never legitimately exceed MAX_FRAME_BYTES, so a
+            // claimed fragment count above the maximum possible can never
+            // complete — cap the slot vector rather than trusting the wire.
+            fragments: vec![None; usize::from(header.fragment_count)
+                .min(MAX_FRAME_BYTES.div_ceil(FRAME_PAYLOAD_BYTES))],
+            received: 0,
+            total_bytes: 0,
+        });
+        if entry.fragment_count != header.fragment_count {
+            self.partial.remove(&header.sequence);
+            return None;
+        }
+        let index = usize::from(header.fragment_index);
+        if index >= entry.fragments.len() {
+            // Impossible fragment index for a capped slot vector — this frame
+            // could never complete within MAX_FRAME_BYTES anyway.
+            self.partial.remove(&header.sequence);
+            return None;
+        }
+        if entry.fragments[index].is_none() {
+            let payload = datagram.slice(FRAME_HEADER_BYTES..);
+            entry.total_bytes += payload.len();
+            if entry.total_bytes > MAX_FRAME_BYTES {
+                self.partial.remove(&header.sequence);
+                return None;
+            }
+            entry.fragments[index] = Some(payload);
+            entry.received += 1;
+        }
+        if entry.received != usize::from(entry.fragment_count) {
+            return None;
+        }
+        let entry = self.partial.remove(&header.sequence)?;
+        let mut frame = Vec::with_capacity(entry.total_bytes);
+        for fragment in entry.fragments {
+            frame.extend_from_slice(&fragment?);
+        }
+        Some(frame)
+    }
 }
 
 #[cfg(test)]
@@ -522,5 +695,77 @@ mod tests {
         let mut packet = vec![0u8; FRAME_HEADER_BYTES];
         packet[..4].copy_from_slice(b"NOPE");
         assert_eq!(FrameHeader::decode(&packet), Err(FrameError::InvalidMagic));
+    }
+
+    #[test]
+    fn stream_chunks_interleave_prefixes_without_copying_payloads() {
+        let packets = fragment_frame(FRAME_KIND_SCREEN, 9, 4, 77, 123, 1, &[7; 3000]).unwrap();
+        let chunks = stream_chunks(&packets).unwrap();
+        assert_eq!(chunks.len(), packets.len() * 2);
+        for (index, packet) in packets.iter().enumerate() {
+            let prefix = &chunks[index * 2];
+            assert_eq!(prefix.len(), STREAM_PACKET_LENGTH_BYTES);
+            assert_eq!(
+                u32::from_le_bytes(prefix[..].try_into().unwrap()) as usize,
+                packet.len()
+            );
+            // The payload chunk must be the same arena storage, not a copy.
+            assert!(std::ptr::eq(chunks[index * 2 + 1].as_ptr(), packet.as_ptr()));
+        }
+        let mut stream = Vec::new();
+        for chunk in &chunks {
+            stream.extend_from_slice(chunk);
+        }
+        let mut offset = 0;
+        let mut reassembled = Vec::new();
+        while offset < stream.len() {
+            let end = offset + STREAM_PACKET_LENGTH_BYTES;
+            let length =
+                u32::from_le_bytes(stream[offset..end].try_into().unwrap()) as usize;
+            let (header, payload) =
+                FrameHeader::decode(&stream[end..end + length]).unwrap();
+            assert_eq!(header.sequence, 77);
+            reassembled.extend_from_slice(payload);
+            offset = end + length;
+        }
+        assert_eq!(reassembled, vec![7u8; 3000]);
+    }
+
+    #[test]
+    fn reassembler_reassembles_out_of_order_and_filters_flow() {
+        let payload: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let packets =
+            fragment_frame(FRAME_KIND_CAMERA, 9, 4, 77, 123, 1, &payload).unwrap();
+        let mut reassembler = Reassembler::default();
+        // Wrong flow id, duplicate fragment, then out-of-order completion.
+        assert!(reassembler.add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 999).is_none());
+        assert!(reassembler.add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4).is_none());
+        assert!(reassembler.add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4).is_none());
+        assert!(reassembler.add_datagram(&packets[1], FRAME_KIND_CAMERA, 9, 4).is_none());
+        let rebuilt = reassembler
+            .add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 4)
+            .unwrap();
+        assert_eq!(rebuilt, payload);
+    }
+
+    #[test]
+    fn reassembler_drops_foreign_kinds_and_sessions() {
+        let packets = fragment_frame(FRAME_KIND_SCREEN, 1, 2, 3, 0, 0, &[1, 2, 3]).unwrap();
+        let mut reassembler = Reassembler::default();
+        assert!(reassembler.add_datagram(&packets[0], FRAME_KIND_CAMERA, 1, 2).is_none());
+        assert!(reassembler.add_datagram(&packets[0], FRAME_KIND_SCREEN, 2, 2).is_none());
+        // A malformed datagram never reaches the map at all.
+        assert!(
+            reassembler
+                .add_datagram(&Bytes::from_static(b"ANFR"), FRAME_KIND_SCREEN, 1, 2)
+                .is_none()
+        );
+        // But a correct packet still completes.
+        assert_eq!(
+            reassembler.add_datagram(&packets[0], FRAME_KIND_SCREEN, 1, 2),
+            Some(vec![1, 2, 3])
+        );
     }
 }

@@ -1153,7 +1153,7 @@ fn encode_streaming_frame(
                     cpu_convert_us,
                     cpu_codec_us,
                 );
-                concat_packets(&packets, concat_us)
+                concat_packets(packets, concat_us)
             }
         }
     } else if encoder.selected_encoder == "h264_vaapi" {
@@ -1169,7 +1169,7 @@ fn encode_streaming_frame(
             cpu_convert_us,
             cpu_codec_us,
         );
-        concat_packets(&packets, concat_us)
+        concat_packets(packets, concat_us)
     } else if encoder.vpp_available {
         match encoder.encode_dmabuf_vpp(
             buf_params.fd.as_raw_fd(),
@@ -1178,7 +1178,7 @@ fn encode_streaming_frame(
             u64::from(buf_params.modifier),
             compositor_fourcc,
         ) {
-            Ok(pkts) => concat_packets(&pkts, concat_us),
+            Ok(pkts) => concat_packets(pkts, concat_us),
             Err(e) => {
                 // A failed DMA-BUF import is normally a capability mismatch (for
                 // example AVERROR(ENOSYS)), not a transient per-frame error.  Keep
@@ -1198,7 +1198,7 @@ fn encode_streaming_frame(
                     cpu_convert_us,
                     cpu_codec_us,
                 );
-                concat_packets(&packets, concat_us)
+                concat_packets(packets, concat_us)
             }
         }
     } else {
@@ -1214,7 +1214,7 @@ fn encode_streaming_frame(
             cpu_convert_us,
             cpu_codec_us,
         );
-        concat_packets(&packets, concat_us)
+        concat_packets(packets, concat_us)
     };
 
     *encode_us = t.elapsed().as_micros();
@@ -1244,7 +1244,7 @@ fn encode_cpu_streaming_frame(
             timing.cpu_copy_us = cpu.copy_us;
             timing.cpu_convert_us = cpu.convert_us;
             timing.cpu_codec_us = cpu.codec_us;
-            if let Some(data) = concat_packets(&packets, &mut timing.concat_us) {
+            if let Some(data) = concat_packets(packets, &mut timing.concat_us) {
                 timing.encoded_size = data.len();
                 if let Some(bc) = broadcaster {
                     let publish = Instant::now();
@@ -1258,14 +1258,19 @@ fn encode_cpu_streaming_frame(
     timing.encode_us = start.elapsed().as_micros();
 }
 
-fn concat_packets(packets: &[Vec<u8>], concat_us: &mut u128) -> Option<Vec<u8>> {
+fn concat_packets(mut packets: Vec<Vec<u8>>, concat_us: &mut u128) -> Option<Vec<u8>> {
     if packets.is_empty() {
         return None;
+    }
+    // Encoders usually emit one AVPacket per access unit — move it instead
+    // of copying the whole frame into a fresh buffer.
+    if packets.len() == 1 {
+        return Some(packets.pop().unwrap());
     }
     let t = Instant::now();
     let total: usize = packets.iter().map(|p| p.len()).sum();
     let mut buf = Vec::with_capacity(total);
-    for pkt in packets {
+    for pkt in &packets {
         buf.extend_from_slice(pkt);
     }
     *concat_us += t.elapsed().as_micros();

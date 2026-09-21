@@ -1407,9 +1407,13 @@ impl VaapiEncoder {
                 }));
             }
 
-            // Take ownership of the buffer; it will be re-allocated on next frame's clear().
-            // This avoids a copy — the Vec moves to the caller, and packet_buf becomes empty.
-            Ok((std::mem::take(&mut self.packet_buf), timing))
+            // Clone into a right-sized output Vec instead of taking the
+            // staging buffer: taking it left packet_buf empty, so every
+            // frame reallocated ~256KiB from scratch. At that size glibc
+            // serves the alloc via mmap, so each frame paid mmap +
+            // page-fault-in on fresh pages followed by munmap on drop —
+            // far costlier than one memcpy into an arena-sized output.
+            Ok((self.packet_buf.clone(), timing))
         }
     }
 
