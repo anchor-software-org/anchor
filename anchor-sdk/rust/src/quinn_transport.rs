@@ -33,6 +33,13 @@ pub fn bind_udp_socket(
     // Best-effort: a kernel that rejects the size still serves the default.
     let _ = socket.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
     let _ = socket.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+    // DSCP EF (TOS 0xB8): most APs map EF into the WMM voice/video queue, so
+    // media datagrams bypass bulk-transfer queueing under load. Same reason
+    // FaceTime/Sidecar mark their streams — costs nothing, matters on a
+    // congested AP.
+    const DSCP_EF_TOS: u32 = 0xB8;
+    let _ = socket.set_tos_v4(DSCP_EF_TOS);
+    let _ = socket.set_tclass_v6(DSCP_EF_TOS);
     if address.is_ipv6() {
         // Match quinn::Endpoint::server: an IPv6 bind stays dual-stack so an
         // IPv4 phone on the same LAN can still reach it.
