@@ -59,11 +59,12 @@ tokio = { version = "1.48.0", features = ["io-util", "rt", "time", "sync"] }
 zstd = "0.13"
 flate2 = "1"
 mdns-sd = "0.13"
+memchr = "2"
+mimalloc = "0.1"
 # Media playback control: read/control local MPRIS players, and expose the
 # phone as an MPRIS player so the system media widget / media keys drive it.
 mpris = "2.1"
 souvlaki = "0.7"
-mimalloc = "0.1"
 tauri = { version = "2", features = ["tray-icon", "image-png", "custom-protocol"] }
 tauri-plugin-single-instance = "2"
 
@@ -73,9 +74,12 @@ tauri-build = { version = "2", features = [] }
 [profile.release]
 debug = false
 overflow-checks = false
-lto = false
-codegen-units = 16
-opt-level = 2
+# The frame pipeline (fragmentation, codec plumbing, per-packet allocation)
+# is hot enough that release builds should optimize aggressively rather than
+# keep debug-build-like codegen settings.
+lto = "thin"
+codegen-units = 1
+opt-level = 3
 
 [profile.profiling]
 inherits = "release"

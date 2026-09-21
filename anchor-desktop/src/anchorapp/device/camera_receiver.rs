@@ -364,28 +364,45 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    /// Fill the entire YUV420P canvas with limited-range black
-    /// (Y=16, U=128, V=128) so letterbox bars are neutral.
-    fn fill_canvas_black(canvas: &mut [u8], y_size: usize, uv_size: usize) {
-        // Y plane
-        canvas[..y_size].fill(16);
-        // U plane
-        canvas[y_size..y_size + uv_size].fill(128);
-        // V plane
-        canvas[y_size + uv_size..y_size + 2 * uv_size].fill(128);
+    /// Fill only the letterbox margins of one contiguous plane. The pasted
+    /// content rect [off_x, off_y, inner_w × inner_h] is left untouched, so a
+    /// full-canvas content rect costs nothing and a pillarboxed portrait
+    /// stream fills just the side columns rather than the whole canvas.
+    fn fill_plane_margins(
+        plane: &mut [u8],
+        stride: usize,
+        plane_h: usize,
+        off_x: usize,
+        off_y: usize,
+        inner_w: usize,
+        inner_h: usize,
+        val: u8,
+    ) {
+        plane[..off_y * stride].fill(val);
+        plane[(off_y + inner_h) * stride..plane_h * stride].fill(val);
+        // `off_x` is rounded down to an even column, so the right margin can
+        // be nonzero even when `off_x == 0`; fill both margins per row.
+        for row in off_y..off_y + inner_h {
+            let start = row * stride;
+            plane[start..start + off_x].fill(val);
+            plane[start + off_x + inner_w..start + stride].fill(val);
+        }
     }
 
-    /// Copy a single plane from an AVFrame (which may have row padding in
-    /// `linesize`) into our contiguous canvas at a given column/row offset.
+    /// Copy one plane from an AVFrame (which may have row padding in
+    /// `linesize`) into the contiguous canvas at a column/row offset, writing
+    /// each row REVERSED — the horizontal mirror is fused into the paste so
+    /// the decoded frame is never mutated and no `av_frame_make_writable`
+    /// copy is needed.
     ///
     /// # Safety
-    /// `src_data` must point to `src_h` rows of `src_stride` bytes, where each
-    /// row's first `copy_w` bytes are valid. The canvas must be large enough for
-    /// the target region.
+    /// `src_data` must point to `copy_h` rows of `src_stride` bytes, where each
+    /// row's first `copy_w` bytes are valid. The canvas must be large enough
+    /// for the target region.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn copy_plane(
+    unsafe fn copy_plane_mirrored(
         canvas: &mut [u8],
-        canvas_base: usize, // offset of this plane's start in canvas
+        canvas_base: usize,
         canvas_stride: usize,
         dst_col: usize,
         dst_row: usize,
@@ -424,17 +441,51 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
 
         for row in 0..copy_h {
             unsafe {
-                let src = src_data.add(row * src_stride);
-                let dst = canvas
-                    .as_mut_ptr()
-                    .add(canvas_base + (dst_row + row) * canvas_stride + dst_col);
-                std::ptr::copy_nonoverlapping(src, dst, copy_w);
+                let src = std::slice::from_raw_parts(src_data.add(row * src_stride), copy_w);
+                let dst = std::slice::from_raw_parts_mut(
+                    canvas
+                        .as_mut_ptr()
+                        .add(canvas_base + (dst_row + row) * canvas_stride + dst_col),
+                    copy_w,
+                );
+                for (d, s) in dst.iter_mut().zip(src.iter().rev()) {
+                    *d = *s;
+                }
             }
         }
         true
     }
 
+    /// Clamp `cols` columns of a canvas plane to a neutral chroma value for
+    /// `rows` rows starting at (col, row). The Android NV12 helper corrupts
+    /// the source's rightmost chroma column; after the mirrored paste that
+    /// lands on the left edge of the output.
+    fn clamp_canvas_columns(
+        canvas: &mut [u8],
+        canvas_base: usize,
+        canvas_stride: usize,
+        col: usize,
+        row: usize,
+        cols: usize,
+        rows: usize,
+        val: u8,
+    ) {
+        for r in row..row + rows {
+            let start = canvas_base + r * canvas_stride + col;
+            if start + cols <= canvas.len() {
+                canvas[start..start + cols].fill(val);
+            }
+        }
+    }
+
     for frame_data in rx.iter() {
+        // Camera frames are replaceable state: if decoding fell behind,
+        // discard queued older frames so the preview shows the newest
+        // capture instead of playing back a backlog.
+        let mut frame_data = frame_data;
+        while let Ok(newer) = rx.try_recv() {
+            frame_data = newer;
+        }
         packets_received += 1;
         packets_since_last_frame += 1;
         if packets_received <= 5 || packets_since_last_frame > 120 {
@@ -522,182 +573,10 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                 }
                 let raw_src_fmt = (*frame).format; // typically AV_PIX_FMT_YUV420P, NV12, or YUVJ420P
 
-                // The decoder returns refcounted frames whose data buffers are
-                // shared with its internal reference-frame pool. Mutating them in
-                // place corrupts the reference frames used for future P/B-frame
-                // reconstruction (progressive garbage). av_frame_make_writable
-                // copies the buffers if refcount > 1, giving us a private writable
-                // frame. Must be called before any in-place mirror below.
-                let mw_ret = ffi::av_frame_make_writable(frame);
-                if mw_ret < 0 {
-                    log::warn!("[camera] av_frame_make_writable failed: {}", mw_ret);
-                    ffi::av_frame_unref(frame);
-                    continue;
-                }
-
-                // ── sanitize right-edge chroma ────────────────────────────
-                // The Android yuvToNv12 helper bleeds 1 byte past each UV row
-                // (reads width bytes from a width-1 buffer), corrupting Cr for
-                // the rightmost pixel pair of every row → full-height green
-                // column on the right edge of the source.  After mirror it
-                // appears on the left.  Overwrite the rightmost chroma column
-                // with neutral Cb=Cr=128 before anything else touches the frame.
-                {
-                    let yuv420p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
-                    let yuvj420p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
-
-                    // Set `col` bytes of each row in `plane` (index `pi`) to `val`.
-                    // `rows` is the number of rows, `cols` the number of bytes per row.
-                    let fill_right_col = |pi: usize, rows: i32, cols: i32, val: u8| {
-                        let data = (*frame).data[pi];
-                        let stride = (*frame).linesize[pi] as isize;
-                        if data.is_null() || cols < 1 || rows < 1 || stride < cols as isize {
-                            return;
-                        }
-                        for row in 0..(rows as isize) {
-                            *data.offset(row * stride + (cols as isize) - 1) = val;
-                        }
-                    };
-
-                    if raw_src_fmt == yuv420p_i || raw_src_fmt == yuvj420p_i {
-                        // Clamp rightmost U column
-                        fill_right_col(1, h / 2, w / 2, 128);
-                        // Clamp rightmost V column
-                        fill_right_col(2, h / 2, w / 2, 128);
-                    }
-                    // NV12/NV21: interleaved UV in plane 1, 2-byte pairs.
-                    // The corrupted pair is at the right edge; set both U,V to 128.
-                    if raw_src_fmt == ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32
-                        || raw_src_fmt == ffi::AVPixelFormat::AV_PIX_FMT_NV21 as i32
-                    {
-                        let data = (*frame).data[1];
-                        let stride = (*frame).linesize[1] as isize;
-                        if !data.is_null() && w >= 2 && h >= 2 && stride >= w as isize {
-                            for row in 0..((h / 2) as isize) {
-                                let pair = data.offset(row * stride + (w as isize) - 2);
-                                *pair.add(0) = 128; // U (or V for NV21)
-                                *pair.add(1) = 128; // V (or U for NV21)
-                            }
-                        }
-                    }
-
-                    // Log right-edge chroma samples on first frames for diagnosis.
-                    if frames_decoded < 3
-                        && w >= 2
-                        && !(*frame).data[1].is_null()
-                        && !(*frame).data[2].is_null()
-                        && (raw_src_fmt == yuv420p_i || raw_src_fmt == yuvj420p_i)
-                    {
-                        let u_row0 = *(*frame).data[1].add((w / 2) as usize - 1);
-                        let v_row0 = *(*frame).data[2].add((w / 2) as usize - 1);
-                        log::debug!(
-                            "[camera] right-edge chroma before mirror (frame {}): U[0,{}]={} V[0,{}]={} (expect ~128)",
-                            frames_decoded,
-                            w / 2 - 1,
-                            u_row0,
-                            w / 2 - 1,
-                            v_row0
-                        );
-                    }
-                }
-
-                // ── mirror ────────────────────────────────────────────────
-
-                {
-                    let yuv420p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
-                    let yuvj420p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P as i32;
-                    let yuv422p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUV422P as i32;
-                    let yuvj422p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ422P as i32;
-                    let yuv444p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUV444P as i32;
-                    let yuvj444p_i = ffi::AVPixelFormat::AV_PIX_FMT_YUVJ444P as i32;
-                    let nv12_i = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
-                    let nv21_i = ffi::AVPixelFormat::AV_PIX_FMT_NV21 as i32;
-
-                    // Reverse `len` bytes in place at `ptr`.
-                    let mirror_bytes = |ptr: *mut u8, len: usize| {
-                        if ptr.is_null() || len < 2 {
-                            return;
-                        }
-                        let (mut i, mut j) = (0usize, len - 1);
-                        while i < j {
-                            let a = ptr.add(i);
-                            let b = ptr.add(j);
-                            std::ptr::swap(a, b);
-                            i += 1;
-                            j -= 1;
-                        }
-                    };
-                    // Reverse a row of 2-byte UV pairs (NV12/NV21) in place.
-                    let mirror_uv_pairs = |ptr: *mut u8, pairs: usize| {
-                        if ptr.is_null() || pairs < 2 {
-                            return;
-                        }
-                        let (mut i, mut j) = (0usize, pairs - 1);
-                        while i < j {
-                            let a = ptr.add(i * 2);
-                            let b = ptr.add(j * 2);
-                            let (u0, v0) = (*a.add(0), *a.add(1));
-                            *a.add(0) = *b.add(0);
-                            *a.add(1) = *b.add(1);
-                            *b.add(0) = u0;
-                            *b.add(1) = v0;
-                            i += 1;
-                            j -= 1;
-                        }
-                    };
-
-                    let mirror_plane = |plane_idx: usize, width_samples: i32, height_lines: i32| {
-                        let data = (*frame).data[plane_idx];
-                        let stride = (*frame).linesize[plane_idx] as isize;
-                        if data.is_null()
-                            || width_samples <= 0
-                            || height_lines <= 0
-                            || stride < width_samples as isize
-                        {
-                            return;
-                        }
-                        for row in 0..(height_lines as isize) {
-                            let row_ptr = data.offset(row * stride);
-                            mirror_bytes(row_ptr, width_samples as usize);
-                        }
-                    };
-                    let mirror_nv_plane =
-                        |plane_idx: usize, pairs_per_row: i32, height_lines: i32| {
-                            let data = (*frame).data[plane_idx];
-                            let stride = (*frame).linesize[plane_idx] as isize;
-                            if data.is_null()
-                                || pairs_per_row <= 0
-                                || height_lines <= 0
-                                || stride < (pairs_per_row as isize) * 2
-                            {
-                                return;
-                            }
-                            for row in 0..(height_lines as isize) {
-                                let row_ptr = data.offset(row * stride);
-                                mirror_uv_pairs(row_ptr, pairs_per_row as usize);
-                            }
-                        };
-
-                    if raw_src_fmt == yuv420p_i || raw_src_fmt == yuvj420p_i {
-                        mirror_plane(0, w, h);
-                        mirror_plane(1, w / 2, h / 2);
-                        mirror_plane(2, w / 2, h / 2);
-                    } else if raw_src_fmt == yuv422p_i || raw_src_fmt == yuvj422p_i {
-                        mirror_plane(0, w, h);
-                        mirror_plane(1, w / 2, h);
-                        mirror_plane(2, w / 2, h);
-                    } else if raw_src_fmt == yuv444p_i || raw_src_fmt == yuvj444p_i {
-                        mirror_plane(0, w, h);
-                        mirror_plane(1, w, h);
-                        mirror_plane(2, w, h);
-                    } else if raw_src_fmt == nv12_i || raw_src_fmt == nv21_i {
-                        mirror_plane(0, w, h);
-                        mirror_nv_plane(1, w / 2, h / 2);
-                    }
-                    // unknown format → skip mirror, image will be unmirrored but
-                    // otherwise correct (better than corrupted output).
-                }
-
+                // The decoded frame stays read-only: the horizontal mirror is
+                // fused into the canvas paste below, so the refcounted decoder
+                // buffers are never mutated and no av_frame_make_writable copy
+                // (~1.4MiB at 720p) is needed per frame.
                 // ── format / letterbox ─────────────────────────────────────
 
                 // Treat YUVJ420P (deprecated, full-range JPEG YUV) as YUV420P + src_range=1.
@@ -752,9 +631,40 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                     sws_signature = Some(new_sig);
                 }
 
-                // ── fill canvas black ──────────────────────────────────────
-
-                fill_canvas_black(&mut canvas, y_plane_size, uv_plane_size);
+                // ── fill letterbox margins ─────────────────────────────────
+                // Only the margins need neutral black — the paste region is
+                // fully overwritten below, so a full-canvas frame skips the
+                // ~1.4MiB memset entirely.
+                fill_plane_margins(
+                    &mut canvas[..y_plane_size],
+                    y_canvas_stride,
+                    out_h_u,
+                    off_x as usize,
+                    off_y as usize,
+                    inner_w as usize,
+                    inner_h as usize,
+                    16,
+                );
+                fill_plane_margins(
+                    &mut canvas[u_plane_off..v_plane_off],
+                    uv_canvas_stride,
+                    out_h_u / 2,
+                    off_x as usize / 2,
+                    off_y as usize / 2,
+                    inner_w as usize / 2,
+                    inner_h as usize / 2,
+                    128,
+                );
+                fill_plane_margins(
+                    &mut canvas[v_plane_off..],
+                    uv_canvas_stride,
+                    out_h_u / 2,
+                    off_x as usize / 2,
+                    off_y as usize / 2,
+                    inner_w as usize / 2,
+                    inner_h as usize / 2,
+                    128,
+                );
 
                 // ── scale + paste ──────────────────────────────────────────
 
@@ -763,8 +673,9 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                 let is_identity = w == inner_w && h == inner_h && src_fmt == yuv420p;
 
                 if is_identity {
-                    // Copy Y plane from mirrored frame into canvas at (off_x, off_y).
-                    let copied = copy_plane(
+                    // Mirror-fused copy of Y, U, V planes from the read-only
+                    // decoded frame into the canvas at (off_x, off_y).
+                    let copied = copy_plane_mirrored(
                         &mut canvas,
                         0, // Y plane starts at offset 0
                         y_canvas_stride,
@@ -776,7 +687,7 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         h as usize,
                     )
                     // Copy U plane at (off_x/2, off_y/2) — chroma is subsampled 2×.
-                    && copy_plane(
+                    && copy_plane_mirrored(
                         &mut canvas,
                         u_plane_off,
                         uv_canvas_stride,
@@ -788,7 +699,7 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         (h / 2) as usize,
                     )
                     // Copy V plane.
-                    && copy_plane(
+                    && copy_plane_mirrored(
                         &mut canvas,
                         v_plane_off,
                         uv_canvas_stride,
@@ -874,10 +785,13 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         (*scale_frame).linesize.as_ptr(),
                     );
 
-                    // Paste scale_frame planes into canvas at letterbox offset.
+                    // Paste scale_frame planes into canvas at the letterbox
+                    // offset, mirroring each row — the scale output is ours,
+                    // but fusing the mirror here keeps the paste a single
+                    // pass either way.
                     let s_w = inner_w as usize;
                     let s_h = inner_h as usize;
-                    let copied = copy_plane(
+                    let copied = copy_plane_mirrored(
                         &mut canvas,
                         0,
                         y_canvas_stride,
@@ -887,7 +801,7 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         (*scale_frame).linesize[0],
                         s_w,
                         s_h,
-                    ) && copy_plane(
+                    ) && copy_plane_mirrored(
                         &mut canvas,
                         u_plane_off,
                         uv_canvas_stride,
@@ -897,7 +811,7 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         (*scale_frame).linesize[1],
                         s_w / 2,
                         s_h / 2,
-                    ) && copy_plane(
+                    ) && copy_plane_mirrored(
                         &mut canvas,
                         v_plane_off,
                         uv_canvas_stride,
@@ -917,6 +831,23 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         ffi::av_frame_unref(frame);
                         continue;
                     }
+                }
+
+                // The Android NV12 helper corrupts the rightmost chroma
+                // column of the source; after the mirrored paste that column
+                // lands at the left edge of the pasted region. Scaling can
+                // smear it across a couple of output columns, so clamp two.
+                for plane_base in [u_plane_off, v_plane_off] {
+                    clamp_canvas_columns(
+                        &mut canvas,
+                        plane_base,
+                        uv_canvas_stride,
+                        (off_x / 2) as usize,
+                        (off_y / 2) as usize,
+                        2,
+                        (inner_h / 2) as usize,
+                        128,
+                    );
                 }
 
                 // ── write to V4L2 ──────────────────────────────────────────

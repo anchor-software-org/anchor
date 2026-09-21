@@ -96,14 +96,20 @@ impl FrameBroadcaster {
 
     /// Publish an encoded access unit with its capture-loop identifier.
     pub fn publish_frame(&self, source_frame_id: u64, data: Vec<u8>) -> bool {
+        let mut senders = self.senders.lock().unwrap();
+        let mut traced_senders = self.traced_senders.lock().unwrap();
+        // Skip the Arc allocs and timestamp read entirely when nobody is
+        // listening — idle capture with no connected device is the common
+        // case outside active sessions.
+        if senders.is_empty() && traced_senders.is_empty() {
+            return true;
+        }
         let data = Arc::new(data);
         let frame = Arc::new(BroadcastFrame {
             source_frame_id,
             published_ns: crate::anchorwayland::frame_trace::mono_ns(),
             data: Arc::clone(&data),
         });
-        let mut senders = self.senders.lock().unwrap();
-        let mut traced_senders = self.traced_senders.lock().unwrap();
         let legacy_frame = data;
         let mut all_delivered = true;
         let mut legacy_drop = false;
@@ -111,14 +117,14 @@ impl FrameBroadcaster {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
                 log::debug!("FrameBroadcaster: dropped frame for slow device {}", id);
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "broadcaster_drop",
-                    serde_json::json!({
+                    {
                         "device_id": id,
                         "source_frame_id": frame.source_frame_id,
                         "encoded_bytes": frame.len(),
                         "reason": "subscriber_queue_full",
-                    }),
+                    }
                 );
                 all_delivered = false;
                 // The SDK screen path intentionally drops replaceable frames
@@ -131,13 +137,13 @@ impl FrameBroadcaster {
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 log::info!("FrameBroadcaster: device {} disconnected, removing", id);
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "broadcaster_disconnect",
-                    serde_json::json!({
+                    {
                         "device_id": id,
                         "source_frame_id": frame.source_frame_id,
                         "reason": "subscriber_disconnected",
-                    }),
+                    }
                 );
                 false
             }
@@ -147,14 +153,14 @@ impl FrameBroadcaster {
             Err(mpsc::TrySendError::Full(_)) => {
                 log::debug!("FrameBroadcaster: dropped traced frame for slow device {}", id);
                 all_delivered = false;
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "broadcaster_drop",
-                    serde_json::json!({
+                    {
                         "device_id": id,
                         "source_frame_id": frame.source_frame_id,
                         "encoded_bytes": frame.len(),
                         "reason": "subscriber_queue_full",
-                    }),
+                    }
                 );
                 true
             }
@@ -164,13 +170,13 @@ impl FrameBroadcaster {
             }
         });
         if all_delivered {
-            crate::anchorwayland::frame_trace::event(
+            crate::anchorwayland::frame_trace::event!(
                 "broadcaster_accept",
-                serde_json::json!({
+                {
                     "source_frame_id": frame.source_frame_id,
                     "encoded_bytes": frame.len(),
                     "subscriber_count": senders.len() + traced_senders.len(),
-                }),
+                }
             );
         }
         if legacy_drop {

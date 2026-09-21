@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use anchor_sdk::{Capability, DatagramFlow, camera, video_frame};
 
@@ -117,7 +116,7 @@ impl SdkCameraBinding {
                             return;
                         }
                     };
-                let mut assembler = CameraFrameAssembler::default();
+                let mut assembler = video_frame::Reassembler::default();
                 let mut frames = 0_u64;
                 runtime.block_on(async move {
                     loop {
@@ -130,9 +129,12 @@ impl SdkCameraBinding {
                                 break;
                             }
                         };
-                        let Some(frame) =
-                            assembler.add(&datagram, capability_session_id, expected_flow_id)
-                        else {
+                        let Some(frame) = assembler.add_datagram(
+                            &datagram,
+                            video_frame::FRAME_KIND_CAMERA,
+                            capability_session_id,
+                            expected_flow_id,
+                        ) else {
                             continue;
                         };
                         frames += 1;
@@ -148,87 +150,6 @@ impl SdkCameraBinding {
                 });
             })
             .expect("SDK camera frame thread must start");
-    }
-}
-
-#[derive(Default)]
-struct CameraFrameAssembler {
-    partial: HashMap<u64, PartialCameraFrame>,
-}
-
-struct PartialCameraFrame {
-    created: Instant,
-    fragment_count: u16,
-    fragments: Vec<Option<Vec<u8>>>,
-    received: usize,
-    total_bytes: usize,
-}
-
-impl CameraFrameAssembler {
-    fn add(
-        &mut self,
-        datagram: &[u8],
-        capability_session_id: u64,
-        flow_id: u64,
-    ) -> Option<Vec<u8>> {
-        let (header, payload) = match video_frame::FrameHeader::decode(datagram) {
-            Ok(header) => header,
-            Err(_) => return None,
-        };
-        if header.kind != video_frame::FRAME_KIND_CAMERA
-            || header.capability_session_id != capability_session_id
-            || header.flow_id != flow_id
-            || header.fragment_count == 0
-            || header.fragment_index >= header.fragment_count
-        {
-            return None;
-        }
-        // Keep this map bounded and discard half-assembled frames quickly;
-        // datagrams are intentionally lossy and must never grow memory.
-        let now = Instant::now();
-        self.partial
-            .retain(|_, frame| now.duration_since(frame.created) <= Duration::from_millis(500));
-        if self.partial.len() >= 32
-            && !self.partial.contains_key(&header.sequence)
-            && let Some(oldest) = self
-                .partial
-                .iter()
-                .min_by_key(|(_, frame)| frame.created)
-                .map(|(sequence, _)| *sequence)
-        {
-            self.partial.remove(&oldest);
-        }
-        let entry = self.partial.entry(header.sequence).or_insert_with(|| PartialCameraFrame {
-            created: now,
-            fragment_count: header.fragment_count,
-            fragments: vec![None; usize::from(header.fragment_count)],
-            received: 0,
-            total_bytes: 0,
-        });
-        if entry.fragment_count != header.fragment_count {
-            self.partial.remove(&header.sequence);
-            return None;
-        }
-        let payload = payload.to_vec();
-        let index = usize::from(header.fragment_index);
-        if entry.fragments[index].is_none() {
-            entry.total_bytes += payload.len();
-            if entry.total_bytes > video_frame::MAX_FRAME_BYTES {
-                self.partial.remove(&header.sequence);
-                return None;
-            }
-            entry.fragments[index] = Some(payload);
-            entry.received += 1;
-        }
-        if entry.received != usize::from(entry.fragment_count) {
-            return None;
-        }
-        let entry = self.partial.remove(&header.sequence)?;
-        let mut frame = Vec::with_capacity(entry.total_bytes);
-        for fragment in entry.fragments {
-            frame.extend(fragment?);
-        }
-        Some(frame)
     }
 }
 
@@ -291,24 +212,25 @@ mod tests {
     }
 
     #[test]
-    fn camera_frame_assembler_reassembles_out_of_order_and_filters_flow() {
+    fn camera_flow_reassembles_out_of_order_and_filters_flow() {
         let payload = (0..(video_frame::FRAME_PAYLOAD_BYTES * 2 + 17))
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
         let packets =
             video_frame::fragment_frame(video_frame::FRAME_KIND_CAMERA, 9, 4, 77, 123, 1, &payload)
                 .unwrap();
-        let mut assembler = CameraFrameAssembler::default();
-        assert!(assembler.add(&packets[0], 9, 999).is_none());
-        assert!(assembler.add(&packets[2], 9, 4).is_none());
-        assert!(assembler.add(&packets[2], 9, 4).is_none());
-        assert!(assembler.add(&packets[1], 9, 4).is_none());
-        let rebuilt = assembler.add(&packets[0], 9, 4).unwrap();
+        let mut assembler = video_frame::Reassembler::default();
+        let kind = video_frame::FRAME_KIND_CAMERA;
+        assert!(assembler.add_datagram(&packets[0], kind, 9, 999).is_none());
+        assert!(assembler.add_datagram(&packets[2], kind, 9, 4).is_none());
+        assert!(assembler.add_datagram(&packets[2], kind, 9, 4).is_none());
+        assert!(assembler.add_datagram(&packets[1], kind, 9, 4).is_none());
+        let rebuilt = assembler.add_datagram(&packets[0], kind, 9, 4).unwrap();
         assert_eq!(rebuilt, payload);
     }
 
     #[test]
-    fn camera_frame_assembler_rejects_wrong_kind_and_oversized_partial() {
+    fn camera_flow_rejects_wrong_kind() {
         let packet = video_frame::FrameHeader {
             kind: video_frame::FRAME_KIND_SCREEN,
             flags: 0,
@@ -322,7 +244,8 @@ mod tests {
         }
         .encode(&[1, 2, 3])
         .unwrap();
-        let mut assembler = CameraFrameAssembler::default();
-        assert!(assembler.add(&packet, 1, 2).is_none());
+        let packet = bytes::Bytes::from(packet);
+        let mut assembler = video_frame::Reassembler::default();
+        assert!(assembler.add_datagram(&packet, video_frame::FRAME_KIND_CAMERA, 1, 2).is_none());
     }
 }
