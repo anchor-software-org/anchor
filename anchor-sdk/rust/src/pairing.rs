@@ -205,3 +205,85 @@ fn to_array<const N: usize>(
         .try_into()
         .map_err(|_| invalid_hello(field, value.len(), expected))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn valid_hello() -> v1::PairingHello {
+        v1::PairingHello {
+            invitation_id: vec![1; 16],
+            node_id: Some(v1::NodeId {
+                value: vec![2; NODE_ID_BYTES],
+            }),
+            display: Some(v1::PeerDisplayInfo {
+                display_name: "Phone".into(),
+                device_kind: 2,
+            }),
+            transcript_hash: vec![3; SHA256_BYTES],
+        }
+    }
+
+    struct StoreResult(Result<(), ()>);
+
+    impl PairedPeerStore for StoreResult {
+        type Error = ();
+
+        fn save(&mut self, _: &PairedPeer) -> Result<(), Self::Error> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn failed_approval_keeps_the_request_awaiting_user_decision() {
+        let mut controller = PairingController::default();
+        controller
+            .receive_hello(&valid_hello(), [4; SHA256_BYTES])
+            .unwrap();
+        let mut store = StoreResult(Err(()));
+
+        assert_eq!(
+            controller.approve(&mut store),
+            Err(PairingStateError::StoreFailed)
+        );
+        assert!(matches!(controller.state(), PairingState::AwaitingUser(_)));
+    }
+
+    #[test]
+    fn resolution_is_allowed_once_per_pairing_request() {
+        let mut controller = PairingController::default();
+        controller
+            .receive_hello(&valid_hello(), [4; SHA256_BYTES])
+            .unwrap();
+        let mut store = StoreResult(Ok(()));
+
+        assert!(controller.approve(&mut store).is_ok());
+        assert_eq!(
+            controller.approve(&mut store),
+            Err(PairingStateError::NotAwaitingUser)
+        );
+        assert_eq!(controller.reject(), Err(PairingStateError::NotAwaitingUser));
+    }
+
+    proptest! {
+        #[test]
+        fn pairing_hello_rejects_every_noncanonical_node_id_length(
+            length in prop::sample::select(vec![0_usize, 1, NODE_ID_BYTES - 1, NODE_ID_BYTES + 1, 64]),
+        ) {
+            let mut hello = valid_hello();
+            hello.node_id = Some(v1::NodeId { value: vec![0; length] });
+            let mut controller = PairingController::default();
+
+            prop_assert_eq!(
+                controller.receive_hello(&hello, [4; SHA256_BYTES]),
+                Err(PairingStateError::InvalidHello(ProtocolViolation::InvalidLength {
+                    field: "node_id",
+                    expected: NODE_ID_BYTES,
+                    actual: length,
+                })),
+            );
+            prop_assert_eq!(controller.state(), &PairingState::Idle);
+        }
+    }
+}

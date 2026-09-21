@@ -7,7 +7,7 @@
 //! request is surfaced as an event and is never approved implicitly.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
@@ -180,6 +180,13 @@ pub struct Capability {
     supports_datagrams: bool,
 }
 
+#[derive(Clone)]
+struct CapabilityState {
+    allowed_type_urls: Arc<Vec<String>>,
+    supports_datagrams: bool,
+    open: bool,
+}
+
 /// A capability-bound reliable QUIC stream.
 ///
 /// The SDK owns the raw Quinn handles and the required `StreamOpen` protocol
@@ -256,6 +263,9 @@ impl Capability {
         type_url: &str,
         payload: impl Into<Vec<u8>>,
     ) -> Result<(), SessionError> {
+        self.session
+            .ensure_capability_open(self.session_id, type_url, false)
+            .await?;
         if !self
             .allowed_type_urls
             .iter()
@@ -281,6 +291,9 @@ impl Capability {
         &self,
         payload_type_url: &str,
     ) -> Result<DatagramFlow, SessionError> {
+        self.session
+            .ensure_capability_open(self.session_id, payload_type_url, true)
+            .await?;
         if !self.supports_datagrams {
             return Err(SessionError::UnexpectedRecord(
                 "capability does not advertise datagrams",
@@ -307,20 +320,17 @@ impl Capability {
                 }),
             )
             .await?;
-        loop {
-            match self.session.read_event().await? {
-                SessionEvent::DatagramFlowOpened {
-                    response_to,
-                    flow_id: opened,
-                } if response_to == request_id && opened == flow_id => {
-                    return Ok(DatagramFlow {
-                        session: self.session.clone(),
-                        flow_id,
-                    });
-                }
-                event => self.session.0.queued_events.lock().await.push_back(event),
-            }
-        }
+        self.session
+            .wait_for_event(|event| {
+                matches!(event, SessionEvent::DatagramFlowOpened {
+                response_to, flow_id: opened
+            } if *response_to == request_id && *opened == flow_id)
+            })
+            .await?;
+        Ok(DatagramFlow {
+            session: self.session.clone(),
+            flow_id,
+        })
     }
 
     /// Opens a reliable bidirectional stream bound to this capability. The
@@ -330,6 +340,9 @@ impl Capability {
         &self,
         payload_type_url: &str,
     ) -> Result<ReliableStream, SessionError> {
+        self.session
+            .ensure_capability_open(self.session_id, payload_type_url, false)
+            .await?;
         if !self
             .allowed_type_urls
             .iter()
@@ -352,27 +365,24 @@ impl Capability {
                 }),
             )
             .await?;
-        loop {
-            match self.session.read_event().await? {
-                SessionEvent::StreamOpened {
-                    response_to,
-                    quic_stream_id,
-                } if response_to == request_id && quic_stream_id == stream_id => {
-                    return Ok(ReliableStream {
-                        stream_id,
-                        send: ReliableSendStream {
-                            stream_id,
-                            inner: send,
-                        },
-                        recv: ReliableRecvStream {
-                            stream_id,
-                            inner: recv,
-                        },
-                    });
-                }
-                event => self.session.0.queued_events.lock().await.push_back(event),
-            }
-        }
+        self.session
+            .wait_for_event(|event| {
+                matches!(event, SessionEvent::StreamOpened {
+                response_to, quic_stream_id
+            } if *response_to == request_id && *quic_stream_id == stream_id)
+            })
+            .await?;
+        Ok(ReliableStream {
+            stream_id,
+            send: ReliableSendStream {
+                stream_id,
+                inner: send,
+            },
+            recv: ReliableRecvStream {
+                stream_id,
+                inner: recv,
+            },
+        })
     }
 }
 
@@ -480,7 +490,9 @@ struct SessionInner {
     datagram_send: std::sync::Mutex<()>,
     control_send: Mutex<quinn::SendStream>,
     control_recv: Mutex<ControlReader>,
+    event_wait: Mutex<()>,
     queued_events: Mutex<VecDeque<SessionEvent>>,
+    capabilities: Mutex<HashMap<u64, CapabilityState>>,
     next_request_id: AtomicU64,
     next_capability_id: AtomicU64,
     next_flow_id: AtomicU64,
@@ -706,7 +718,98 @@ impl Session {
     async fn read_event(&self) -> Result<SessionEvent, SessionError> {
         let mut reader = self.0.control_recv.lock().await;
         let envelope = reader.read_record().await?;
-        decode_event(envelope)
+        let event = decode_event(envelope)?;
+        self.validate_incoming_event(&event).await?;
+        Ok(event)
+    }
+
+    async fn wait_for_event<F>(&self, matches: F) -> Result<SessionEvent, SessionError>
+    where
+        F: Fn(&SessionEvent) -> bool,
+    {
+        let _wait = self.0.event_wait.lock().await;
+        loop {
+            let queued = {
+                let mut events = self.0.queued_events.lock().await;
+                events
+                    .iter()
+                    .position(&matches)
+                    .and_then(|index| events.remove(index))
+            };
+            if let Some(event) = queued {
+                return Ok(event);
+            }
+            let event = self.read_event().await?;
+            if matches(&event) {
+                return Ok(event);
+            }
+            self.0.queued_events.lock().await.push_back(event);
+        }
+    }
+
+    async fn ensure_capability_open(
+        &self,
+        capability_session_id: u64,
+        type_url: &str,
+        requires_datagrams: bool,
+    ) -> Result<(), SessionError> {
+        let capabilities = self.0.capabilities.lock().await;
+        let state = capabilities
+            .get(&capability_session_id)
+            .filter(|state| state.open)
+            .ok_or(SessionError::UnexpectedRecord(
+                "capability session is not open",
+            ))?;
+        if !state
+            .allowed_type_urls
+            .iter()
+            .any(|allowed| allowed == type_url)
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "record type URL was not advertised",
+            ));
+        }
+        if requires_datagrams && !state.supports_datagrams {
+            return Err(SessionError::UnexpectedRecord(
+                "capability does not advertise datagrams",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_incoming_event(&self, event: &SessionEvent) -> Result<(), SessionError> {
+        match event {
+            SessionEvent::CapabilityRecord {
+                capability_session_id,
+                type_url,
+                ..
+            } => {
+                self.ensure_capability_open(*capability_session_id, type_url, false)
+                    .await?;
+                return Ok(());
+            }
+            SessionEvent::CapabilityClosed {
+                capability_session_id,
+                ..
+            } => {
+                let mut capabilities = self.0.capabilities.lock().await;
+                let state = capabilities
+                    .get_mut(capability_session_id)
+                    .ok_or(SessionError::UnexpectedRecord("unknown capability session"))?;
+                state.open = false;
+                return Ok(());
+            }
+            SessionEvent::DatagramFlowOpenRequested {
+                capability_session_id,
+                payload_type_url,
+                ..
+            } => {
+                self.ensure_capability_open(*capability_session_id, payload_type_url, true)
+                    .await?;
+                return Ok(());
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Opens a peer-advertised capability and waits for its positive reply.
@@ -744,22 +847,28 @@ impl Session {
         )
         .await?;
 
-        loop {
-            match self.read_event().await? {
-                SessionEvent::CapabilityOpened {
-                    response_to,
-                    capability_session_id: opened,
-                } if response_to == request_id && opened == capability_session_id => {
-                    return Ok(Capability {
-                        session: self.clone(),
-                        session_id: capability_session_id,
-                        allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
-                        supports_datagrams: advertisement.supports_datagrams,
-                    });
-                }
-                event => self.0.queued_events.lock().await.push_back(event),
-            }
-        }
+        self.wait_for_event(|event| {
+            matches!(event, SessionEvent::CapabilityOpened {
+            response_to, capability_session_id: opened
+        } if *response_to == request_id && *opened == capability_session_id)
+        })
+        .await?;
+        let state = CapabilityState {
+            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
+            supports_datagrams: advertisement.supports_datagrams,
+            open: true,
+        };
+        self.0
+            .capabilities
+            .lock()
+            .await
+            .insert(capability_session_id, state.clone());
+        Ok(Capability {
+            session: self.clone(),
+            session_id: capability_session_id,
+            allowed_type_urls: state.allowed_type_urls,
+            supports_datagrams: state.supports_datagrams,
+        })
     }
 
     /// Sends a typed control record for a capability after the host has
@@ -803,13 +912,23 @@ impl Session {
                 name: capability_name.to_owned(),
                 major: capability_major,
             })?;
+        let state = CapabilityState {
+            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
+            supports_datagrams: advertisement.supports_datagrams,
+            open: true,
+        };
+        self.0
+            .capabilities
+            .lock()
+            .await
+            .insert(capability_session_id, state.clone());
         self.send_capability_opened(request_id, capability_session_id)
             .await?;
         Ok(Capability {
             session: self.clone(),
             session_id: capability_session_id,
-            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
-            supports_datagrams: advertisement.supports_datagrams,
+            allowed_type_urls: state.allowed_type_urls,
+            supports_datagrams: state.supports_datagrams,
         })
     }
 
@@ -825,14 +944,23 @@ impl Session {
         .await
     }
 
-    /// Accept a peer-requested capability stream. The SDK confirms the stream
-    /// binding and verifies that the accepted QUIC stream ID matches the
-    /// negotiated ID before returning application byte handles.
+    /// Accept a peer-requested capability stream. The SDK rejects IDs that
+    /// cannot name a peer-initiated bidirectional stream, then verifies that
+    /// the accepted QUIC stream ID matches the negotiated ID before returning
+    /// application byte handles.
     pub async fn accept_stream(
         &self,
         request_id: u64,
         expected_stream_id: u64,
     ) -> Result<ReliableStream, SessionError> {
+        if expected_stream_id == 0
+            || expected_stream_id > (1_u64 << 62) - 1
+            || expected_stream_id & 0b11 != 0
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "StreamOpen did not name a client-initiated bidirectional stream",
+            ));
+        }
         self.send_stream_opened(request_id, expected_stream_id)
             .await?;
         let (send, recv) = self.0.connection.accept_bi().await?;
@@ -984,12 +1112,7 @@ impl Session {
         let peer_hello = reader.read_record().await?;
         let peer = peer_from_hello(peer_hello)?;
         let ready = reader.read_record().await?;
-        if !matches!(
-            ready.body,
-            Some(v1::control_envelope::Body::SessionReady(_))
-        ) {
-            return Err(SessionError::UnexpectedRecord("expected SessionReady"));
-        }
+        validate_session_ready(ready)?;
         let next_capability_id = match role {
             SessionRole::Initiator => 1,
         };
@@ -998,7 +1121,9 @@ impl Session {
             datagram_send: std::sync::Mutex::new(()),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
+            event_wait: Mutex::new(()),
             queued_events: Mutex::new(VecDeque::new()),
+            capabilities: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             next_capability_id: AtomicU64::new(next_capability_id),
             next_flow_id: AtomicU64::new(next_capability_id),
@@ -1027,18 +1152,15 @@ impl Session {
         };
         write_records(&mut send, &[(&local.hello(), true), (&ready, false)]).await?;
         let ready = reader.read_record().await?;
-        if !matches!(
-            ready.body,
-            Some(v1::control_envelope::Body::SessionReady(_))
-        ) {
-            return Err(SessionError::UnexpectedRecord("expected SessionReady"));
-        }
+        validate_session_ready(ready)?;
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
+            event_wait: Mutex::new(()),
             queued_events: Mutex::new(VecDeque::new()),
+            capabilities: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             next_capability_id: AtomicU64::new(2),
             next_flow_id: AtomicU64::new(2),
@@ -1188,7 +1310,7 @@ impl ControlReader {
     async fn read_record(&mut self) -> Result<v1::ControlEnvelope, SessionError> {
         if self.first {
             let mut prefix = [0_u8; FIRST_RECORD_HEADER_BYTES];
-            self.recv.read_exact(&mut prefix).await?;
+            read_control_exact(&mut self.recv, &mut prefix).await?;
             if prefix[..CONTROL_MAGIC.len()] != CONTROL_MAGIC {
                 return Err(ProtocolViolation::InvalidControlMagic.into());
             }
@@ -1213,7 +1335,7 @@ impl ControlReader {
             return Err(ProtocolViolation::ControlRecordTooLarge.into());
         }
         let mut payload = vec![0_u8; length];
-        self.recv.read_exact(&mut payload).await?;
+        read_control_exact(&mut self.recv, &mut payload).await?;
         let envelope = v1::ControlEnvelope::decode(payload.as_slice())
             .map_err(|_| ProtocolViolation::MalformedControlRecord)?;
         validate_control_envelope(&envelope)?;
@@ -1221,10 +1343,27 @@ impl ControlReader {
     }
 }
 
+async fn read_control_exact(
+    recv: &mut quinn::RecvStream,
+    bytes: &mut [u8],
+) -> Result<(), SessionError> {
+    match recv.read_exact(bytes).await {
+        Err(quinn::ReadExactError::FinishedEarly(_)) => Err(SessionError::ControlStreamEnded),
+        Err(error) => Err(SessionError::ReadExact(error)),
+        Ok(()) => Ok(()),
+    }
+}
+
 async fn read_varint(recv: &mut quinn::RecvStream) -> Result<u64, SessionError> {
     let mut value = 0_u64;
     for index in 0..10 {
-        let byte = recv.read_u8().await?;
+        let byte = match recv.read_u8().await {
+            Ok(byte) => byte,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(SessionError::ControlStreamEnded);
+            }
+            Err(error) => return Err(SessionError::Io(error)),
+        };
         if index == 9 && byte > 1 {
             return Err(ProtocolViolation::ControlRecordTooLarge.into());
         }
@@ -1281,6 +1420,25 @@ fn peer_from_hello(envelope: v1::ControlEnvelope) -> Result<SessionPeer, Session
         device_kind: display.device_kind,
         endpoints: hello.endpoints,
     })
+}
+
+fn validate_session_ready(envelope: v1::ControlEnvelope) -> Result<(), SessionError> {
+    let Some(v1::control_envelope::Body::SessionReady(ready)) = envelope.body else {
+        return Err(SessionError::UnexpectedRecord("expected SessionReady"));
+    };
+    let version = ready
+        .protocol_version
+        .ok_or(SessionError::UnexpectedRecord(
+            "SessionReady missing version",
+        ))?;
+    if version.major != u32::from(PROTOCOL_MAJOR) || version.minor > u32::from(PROTOCOL_MINOR) {
+        return Err(ProtocolViolation::UnsupportedControlVersion {
+            major: version.major as u8,
+            minor: version.minor as u8,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn decode_event(envelope: v1::ControlEnvelope) -> Result<SessionEvent, SessionError> {

@@ -87,6 +87,9 @@ impl FrameHeader {
         if datagram.len() < FRAME_HEADER_BYTES {
             return Err(FrameError::Truncated);
         }
+        if datagram.len() > FRAME_DATAGRAM_BYTES {
+            return Err(FrameError::TooLarge(FRAME_PAYLOAD_BYTES));
+        }
         if datagram[..4] != FRAME_MAGIC {
             return Err(FrameError::InvalidMagic);
         }
@@ -211,6 +214,103 @@ pub fn encode_stream_packet(packet: &[u8]) -> Result<Vec<u8>, FrameError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn wire_packet(
+        kind: u8,
+        flags: u16,
+        capability_session_id: u64,
+        flow_id: u64,
+        sequence: u64,
+        fragment_index: u16,
+        fragment_count: u16,
+        presentation_time_us: u64,
+        codec_config_id: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
+        bytes.extend_from_slice(b"ANFR");
+        bytes.push(1);
+        bytes.push(kind);
+        bytes.extend_from_slice(&flags.to_le_bytes());
+        bytes.extend_from_slice(&capability_session_id.to_le_bytes());
+        bytes.extend_from_slice(&flow_id.to_le_bytes());
+        bytes.extend_from_slice(&sequence.to_le_bytes());
+        bytes.extend_from_slice(&fragment_index.to_le_bytes());
+        bytes.extend_from_slice(&fragment_count.to_le_bytes());
+        bytes.extend_from_slice(&presentation_time_us.to_le_bytes());
+        bytes.extend_from_slice(&codec_config_id.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn valid_packet() -> Vec<u8> {
+        FrameHeader {
+            kind: FRAME_KIND_SCREEN,
+            flags: 0,
+            capability_session_id: 1,
+            flow_id: 2,
+            sequence: 3,
+            fragment_index: 0,
+            fragment_count: 1,
+            presentation_time_us: 4,
+            codec_config_id: 5,
+        }
+        .encode(&[0xca, 0xfe])
+        .unwrap()
+    }
+
+    #[test]
+    fn decode_rejects_invalid_magic() {
+        let mut packet = valid_packet();
+        packet[..4].copy_from_slice(b"NOPE");
+        assert_eq!(FrameHeader::decode(&packet), Err(FrameError::InvalidMagic),);
+    }
+
+    #[test]
+    fn decode_rejects_supported_version() {
+        let mut packet = valid_packet();
+        packet[4] = 2;
+        assert_eq!(
+            FrameHeader::decode(&packet),
+            Err(FrameError::UnsupportedVersion(2)),
+        );
+    }
+
+    #[test]
+    fn decode_rejects_fragment_index_equal_to_count() {
+        let mut packet = valid_packet();
+        packet[32..34].copy_from_slice(&3u16.to_le_bytes());
+        packet[34..36].copy_from_slice(&3u16.to_le_bytes());
+
+        assert_eq!(
+            FrameHeader::decode(&packet),
+            Err(FrameError::InvalidFragments),
+        );
+    }
+
+    #[test]
+    fn decode_rejects_a_payload_larger_than_the_declared_datagram_limit() {
+        let header = FrameHeader {
+            kind: FRAME_KIND_SCREEN,
+            flags: 0,
+            capability_session_id: 1,
+            flow_id: 2,
+            sequence: 3,
+            fragment_index: 0,
+            fragment_count: 1,
+            presentation_time_us: 4,
+            codec_config_id: 5,
+        };
+        let packet = header.encode(&vec![0; FRAME_PAYLOAD_BYTES]).unwrap();
+        let mut oversized = packet;
+        oversized.push(0);
+
+        assert_eq!(
+            FrameHeader::decode(&oversized),
+            Err(FrameError::TooLarge(FRAME_PAYLOAD_BYTES)),
+        );
+    }
 
     #[test]
     fn header_round_trip_preserves_all_fields() {
@@ -229,6 +329,146 @@ mod tests {
         let (decoded, payload) = FrameHeader::decode(&encoded).unwrap();
         assert_eq!(decoded, header);
         assert_eq!(payload, &[1, 2, 3]);
+    }
+
+    proptest! {
+        #[test]
+        fn header_round_trip_preserves_any_valid_fields(
+            kind in prop_oneof![
+                 Just(FRAME_KIND_SCREEN),
+                 Just(FRAME_KIND_CAMERA),
+             ],
+             flags in any::<u16>(),
+             capability_session_id in any::<u64>(),
+             flow_id in any::<u64>(),
+             sequence in any::<u64>(),
+             fragment_count in 1u16..=u16::MAX,
+             raw_fragment_index in any::<u16>(),
+             presentation_time_us in any::<u64>(),
+             codec_config_id in any::<u64>(),
+             payload in prop::collection::vec(any::<u8>(), 0..=FRAME_PAYLOAD_BYTES),
+        ){
+            let header = FrameHeader {
+                kind,
+                flags,
+                capability_session_id,
+                flow_id,
+                sequence,
+                fragment_index: raw_fragment_index % fragment_count,
+                fragment_count,
+                presentation_time_us,
+                codec_config_id,
+            };
+
+            let encoded = header.encode(&payload).expect("generated header is valid");
+            let (decoded, decoded_payload) = FrameHeader::decode(&encoded).expect("encoded header must decode");
+
+            prop_assert_eq!(decoded, header);
+            prop_assert_eq!(decoded_payload, payload.as_slice());
+            prop_assert!(encoded.len() <= FRAME_DATAGRAM_BYTES);
+
+        }
+
+        #[test]
+        fn decode_rejects_every_truncated_header(
+            length in 0usize..FRAME_HEADER_BYTES,
+        ) {
+            let packet = valid_packet();
+            prop_assert_eq!(
+                FrameHeader::decode(&packet[..length]),
+                Err(FrameError::Truncated),
+            )
+        }
+
+        #[test]
+        fn decode_matches_independent_anfr_wire_format(
+                 kind in prop_oneof![
+                     Just(FRAME_KIND_SCREEN),
+                     Just(FRAME_KIND_CAMERA),
+                 ],
+                 flags in any::<u16>(),
+                 capability_session_id in any::<u64>(),
+                 flow_id in any::<u64>(),
+                 sequence in any::<u64>(),
+                 fragment_count in 1u16..=u16::MAX,
+                 raw_fragment_index in any::<u16>(),
+                 presentation_time_us in any::<u64>(),
+                 codec_config_id in any::<u64>(),
+                 payload in prop::collection::vec(any::<u8>(), 0..=FRAME_PAYLOAD_BYTES),
+             ) {
+                 let fragment_index = raw_fragment_index % fragment_count;
+
+                 let packet = wire_packet(
+                     kind,
+                     flags,
+                     capability_session_id,
+                     flow_id,
+                     sequence,
+                     fragment_index,
+                     fragment_count,
+                     presentation_time_us,
+                     codec_config_id,
+                     &payload,
+                 );
+
+                 let (header, decoded_payload) = FrameHeader::decode(&packet).unwrap();
+
+                 prop_assert_eq!(header.kind, kind);
+                 prop_assert_eq!(header.flags, flags);
+                 prop_assert_eq!(header.capability_session_id, capability_session_id);
+                 prop_assert_eq!(header.flow_id, flow_id);
+                 prop_assert_eq!(header.sequence, sequence);
+                 prop_assert_eq!(header.fragment_index, fragment_index);
+                 prop_assert_eq!(header.fragment_count, fragment_count);
+                 prop_assert_eq!(header.presentation_time_us, presentation_time_us);
+                 prop_assert_eq!(header.codec_config_id, codec_config_id);
+                 prop_assert_eq!(decoded_payload, payload.as_slice());
+             }
+
+        #[test]
+        fn fragmentation_matches_independent_payload_chunks(
+            kind in prop_oneof![Just(FRAME_KIND_SCREEN), Just(FRAME_KIND_CAMERA)],
+            flags in any::<u16>(),
+            capability_session_id in any::<u64>(),
+            flow_id in any::<u64>(),
+            sequence in any::<u64>(),
+            presentation_time_us in any::<u64>(),
+            codec_config_id in any::<u64>(),
+            payload in prop::collection::vec(
+                any::<u8>(),
+                1..=(FRAME_PAYLOAD_BYTES * 4 + 1),
+            ),
+        ) {
+            let packets = fragment_frame_with_flags(
+                kind,
+                flags,
+                capability_session_id,
+                flow_id,
+                sequence,
+                presentation_time_us,
+                codec_config_id,
+                &payload,
+            )
+            .unwrap();
+            let expected_chunks = payload.chunks(FRAME_PAYLOAD_BYTES).collect::<Vec<_>>();
+            let expected_fragment_count = expected_chunks.len() as u16;
+
+            prop_assert_eq!(packets.len(), expected_chunks.len());
+            for (index, (packet, expected_payload)) in packets.iter().zip(expected_chunks).enumerate() {
+                let (header, decoded_payload) = FrameHeader::decode(packet).unwrap();
+                prop_assert!(packet.len() <= FRAME_DATAGRAM_BYTES);
+                prop_assert_eq!(header.kind, kind);
+                prop_assert_eq!(header.flags, flags);
+                prop_assert_eq!(header.capability_session_id, capability_session_id);
+                prop_assert_eq!(header.flow_id, flow_id);
+                prop_assert_eq!(header.sequence, sequence);
+                prop_assert_eq!(header.fragment_index, index as u16);
+                prop_assert_eq!(header.fragment_count, expected_fragment_count);
+                prop_assert_eq!(header.presentation_time_us, presentation_time_us);
+                prop_assert_eq!(header.codec_config_id, codec_config_id);
+                prop_assert_eq!(decoded_payload, expected_payload);
+            }
+        }
     }
 
     #[test]

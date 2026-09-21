@@ -69,6 +69,7 @@ object VideoFrameProtocol {
 
     fun decode(datagram: ByteArray): Packet? {
         if (datagram.size < HEADER_BYTES) return null
+        if (datagram.size > DATAGRAM_BYTES) return null
         if (!datagram.copyOfRange(0, 4).contentEquals(MAGIC) || datagram[4].toInt() != 1) return null
         val buffer = ByteBuffer.wrap(datagram).order(ByteOrder.LITTLE_ENDIAN)
         buffer.position(5)

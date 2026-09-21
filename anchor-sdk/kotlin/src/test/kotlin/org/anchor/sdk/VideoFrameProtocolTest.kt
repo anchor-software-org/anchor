@@ -51,4 +51,20 @@ class VideoFrameProtocolTest {
         packet[35] = 0
         assertNull(VideoFrameProtocol.decode(packet))
     }
+
+    @Test
+    fun decoderRejectsPayloadLargerThanDeclaredDatagramLimit() {
+        val packet = VideoFrameProtocol.fragment(
+            kind = VideoFrameProtocol.KIND_SCREEN,
+            flags = 0,
+            capabilitySessionId = 1,
+            flowId = 2,
+            sequence = 3,
+            presentationTimeUs = 4,
+            codecConfigId = 5,
+            payload = ByteArray(VideoFrameProtocol.PAYLOAD_BYTES),
+        ).single()
+
+        assertNull(VideoFrameProtocol.decode(packet + byteArrayOf(0)))
+    }
 }
