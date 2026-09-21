@@ -445,13 +445,17 @@ pub struct DatagramTransportStats {
 // `datagram_send_buffer_space()` API only subtracts one such item.
 const DATAGRAM_QUEUE_HEADROOM_BYTES: usize = 16 * 1024;
 const DATAGRAM_QUEUE_ITEM_BYTES: usize = 32;
-/// Staleness bound for the unreliable media queue: a burst may never leave
-/// more than this many bytes waiting behind congestion, so scene changes
-/// cannot stack a second of stale frames ahead of the live one. Quinn's
-/// buffer itself is sized for the largest legal access unit
-/// (`DATAGRAM_SEND_BUFFER_BYTES`); this admission cap preserves the old
-/// 256 KiB latency policy while still letting an oversized keyframe through
-/// whenever the queue has drained below the bound.
+/// Staleness bound for the unreliable media queue, expressed as a drain time:
+/// a burst may never leave more than ~40 ms of backlog waiting behind
+/// congestion, so scene changes cannot stack stale frames ahead of the live
+/// one. A fixed byte bound would admit ~4 ms of backlog on a fast LAN but
+/// ~105 ms on a 20 Mbps uplink; scaling by the congestion controller's own
+/// pacing estimate (cwnd/RTT) keeps the *time* bound constant across paths.
+/// The byte bound is clamped between a small floor — so an idle queue always
+/// admits the next frame — and the previous fixed cap. Quinn's buffer itself
+/// is sized for the largest legal access unit (`DATAGRAM_SEND_BUFFER_BYTES`).
+const DATAGRAM_STALE_QUEUE_MAX: std::time::Duration = std::time::Duration::from_millis(40);
+const DATAGRAM_STALE_QUEUE_MIN_BYTES: usize = 32 * 1024;
 const DATAGRAM_STALE_QUEUE_BYTES: usize = 256 * 1024;
 
 impl DatagramFlow {
@@ -1155,8 +1159,16 @@ impl Session {
     /// pass as soon as congestion drains the backlog under the bound, which
     /// is also what keeps a huge keyframe from starving forever.
     fn datagram_admission_denied(&self, available: usize, required: usize) -> bool {
+        if required > available {
+            return true;
+        }
         let queued = crate::quinn_transport::DATAGRAM_SEND_BUFFER_BYTES.saturating_sub(available);
-        required > available || queued > DATAGRAM_STALE_QUEUE_BYTES
+        let stats = self.0.connection.stats();
+        // cwnd/RTT approximates the pacing rate congestion control is
+        // enforcing right now; backlog beyond ~40 ms of drain time is stale.
+        let rate_bps = stats.path.cwnd as f64 / stats.path.rtt.as_secs_f64().max(1e-6);
+        let bound = (rate_bps * DATAGRAM_STALE_QUEUE_MAX.as_secs_f64()) as usize;
+        queued > bound.clamp(DATAGRAM_STALE_QUEUE_MIN_BYTES, DATAGRAM_STALE_QUEUE_BYTES)
     }
 
     /// Owned-packet variant of `send_datagrams`: identical admission logic,
