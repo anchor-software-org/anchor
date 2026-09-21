@@ -11,6 +11,16 @@ object VideoFrameProtocol {
     const val PAYLOAD_BYTES = DATAGRAM_BYTES - HEADER_BYTES
     const val KIND_SCREEN = 1
     const val KIND_CAMERA = 2
+    /**
+     * XOR-parity redundancy record covering one group of data fragments. The
+     * `flags` field carries the XOR of the covered payload lengths,
+     * `fragmentIndex` carries the parity group index, and `fragmentCount` the
+     * access unit's real fragment count. Peers that predate this kind drop it
+     * during decode-kind filtering, so senders may emit parity unconditionally.
+     */
+    const val KIND_PARITY = 3
+    /** Consecutive data fragments covered by one parity datagram. */
+    const val PARITY_GROUP_FRAGMENTS = 16
     const val FLAG_KEYFRAME = 1
     const val FLAG_CODEC_CONFIG = 1 shl 1
     const val MAX_FRAME_BYTES = 8 * 1024 * 1024
@@ -67,6 +77,68 @@ object VideoFrameProtocol {
         }
     }
 
+    /**
+     * Fragment one access unit and append one XOR-parity datagram per group of
+     * [PARITY_GROUP_FRAGMENTS] fragments. Each parity payload is the bytewise
+     * XOR of the group's payloads zero-padded to [PAYLOAD_BYTES]; its `flags`
+     * field is the XOR of the covered payload lengths so a receiver can
+     * rebuild a singly-lost fragment byte-exact, including a short final
+     * fragment. Parity packets are emitted after the data burst. Only useful
+     * on lossy datagram flows — skip it on reliable streams.
+     */
+    fun fragmentWithParity(
+        kind: Int,
+        flags: Int,
+        capabilitySessionId: Long,
+        flowId: Long,
+        sequence: Long,
+        presentationTimeUs: Long,
+        codecConfigId: Long,
+        payload: ByteArray,
+    ): List<ByteArray> {
+        val packets = fragment(
+            kind, flags, capabilitySessionId, flowId, sequence,
+            presentationTimeUs, codecConfigId, payload,
+        )
+        val count = packets.size
+        val parity = ArrayList<ByteArray>(count / PARITY_GROUP_FRAGMENTS + 1)
+        var groupIndex = 0
+        var start = 0
+        while (start < count) {
+            val end = minOf(start + PARITY_GROUP_FRAGMENTS, count)
+            val acc = ByteArray(PAYLOAD_BYTES)
+            var lengthXor = 0
+            for (i in start until end) {
+                val packet = packets[i]
+                val payloadLength = packet.size - HEADER_BYTES
+                lengthXor = lengthXor xor payloadLength
+                var j = 0
+                while (j < payloadLength) {
+                    acc[j] = (acc[j].toInt() xor packet[HEADER_BYTES + j].toInt()).toByte()
+                    j++
+                }
+            }
+            parity += ByteBuffer.allocate(HEADER_BYTES + PAYLOAD_BYTES)
+                .order(ByteOrder.LITTLE_ENDIAN)
+                .put(MAGIC)
+                .put(1)
+                .put(KIND_PARITY.toByte())
+                .putShort(lengthXor.toShort())
+                .putLong(capabilitySessionId)
+                .putLong(flowId)
+                .putLong(sequence)
+                .putShort(groupIndex.toShort())
+                .putShort(count.toShort())
+                .putLong(presentationTimeUs)
+                .putLong(codecConfigId)
+                .put(acc)
+                .array()
+            groupIndex++
+            start = end
+        }
+        return packets + parity
+    }
+
     fun decode(datagram: ByteArray): Packet? {
         if (datagram.size < HEADER_BYTES) return null
         if (datagram.size > DATAGRAM_BYTES) return null
@@ -74,7 +146,7 @@ object VideoFrameProtocol {
         val buffer = ByteBuffer.wrap(datagram).order(ByteOrder.LITTLE_ENDIAN)
         buffer.position(5)
         val kind = buffer.get().toInt() and 0xff
-        if (kind != KIND_SCREEN && kind != KIND_CAMERA) return null
+        if (kind != KIND_SCREEN && kind != KIND_CAMERA && kind != KIND_PARITY) return null
         val flags = buffer.short.toInt() and 0xffff
         val capabilitySessionId = buffer.long
         val flowId = buffer.long
