@@ -858,6 +858,12 @@ class CameraPlugin(
                 if (android.os.Build.VERSION.SDK_INT >= 30) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 }
+                // Realtime scheduling hint plus the operating rate matching the
+                // stream fps — some vendor encoders tighten their internal
+                // pipeline when both are set. Codecs that ignore them are
+                // unaffected; both keys predate minSdk 30.
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, _streamFps.value)
                 // Do not request KEY_PREPEND_HEADER_TO_SYNC_FRAMES here. Several
                 // MediaCodec implementations (including the Android emulator's
                 // c2.android.avc.encoder) reject that optional key with BAD_VALUE.
