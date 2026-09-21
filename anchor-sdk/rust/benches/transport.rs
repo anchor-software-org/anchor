@@ -2,7 +2,7 @@
 //! exercising the datagram send path, the connection-level dispatcher, and
 //! per-flow routing — not just the codec helpers.
 use anchor_sdk::{SessionIdentity, quinn_transport, session::Session, v1, video_frame};
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use quinn::Endpoint;
 use rcgen::generate_simple_self_signed;
 use rustls::{
@@ -241,6 +241,62 @@ fn datagram_benches(c: &mut Criterion) {
             },
         );
     }
+
+    // Sustained throughput: a burst of frames pipelined through the routed
+    // path — sends retry on the stale-queue bound instead of waiting per
+    // frame, so the measurement covers admission + wire + dispatch +
+    // reassembly running concurrently, not serialized RTTs.
+    const BURST_FRAMES: usize = 16;
+    let burst_frame_bytes = 128 * 1024;
+    group.throughput(Throughput::Bytes((BURST_FRAMES * burst_frame_bytes) as u64));
+    group.bench_function("burst_throughput_16x128KiB", |b| {
+        let payload = vec![0xCDu8; burst_frame_bytes];
+        let mut reassembler = video_frame::Reassembler::default();
+        b.iter(|| {
+            rt.block_on(async {
+                for sequence in 0..BURST_FRAMES as u64 {
+                    let packets = video_frame::fragment_frame(
+                        video_frame::FRAME_KIND_CAMERA,
+                        pair.capability_session_id,
+                        pair.client_flow.flow_id(),
+                        sequence,
+                        0,
+                        0,
+                        &payload,
+                    )
+                    .unwrap();
+                    while pair
+                        .client_flow
+                        .send_many(black_box(packets.clone()))
+                        .is_err()
+                    {
+                        tokio::time::sleep(Duration::from_micros(200)).await;
+                    }
+                }
+                let mut frames_done = 0usize;
+                while frames_done < BURST_FRAMES {
+                    let datagram = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        pair.client_flow.recv(),
+                    )
+                    .await
+                    .expect("burst echo stalled — datagram lost")
+                    .unwrap();
+                    if reassembler
+                        .add_datagram(
+                            &datagram,
+                            video_frame::FRAME_KIND_CAMERA,
+                            pair.capability_session_id,
+                            pair.client_flow.flow_id(),
+                        )
+                        .is_some()
+                    {
+                        frames_done += 1;
+                    }
+                }
+            })
+        })
+    });
     group.finish();
 }
 
