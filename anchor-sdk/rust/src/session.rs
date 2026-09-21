@@ -820,8 +820,7 @@ impl Session {
                 ..
             } => {
                 self.ensure_capability_open(*capability_session_id, type_url, false)
-                    .await?;
-                return Ok(());
+                    .await
             }
             SessionEvent::CapabilityClosed {
                 capability_session_id,
@@ -832,7 +831,7 @@ impl Session {
                     .get_mut(capability_session_id)
                     .ok_or(SessionError::UnexpectedRecord("unknown capability session"))?;
                 state.open = false;
-                return Ok(());
+                Ok(())
             }
             SessionEvent::DatagramFlowOpenRequested {
                 capability_session_id,
@@ -840,8 +839,7 @@ impl Session {
                 ..
             } => {
                 self.ensure_capability_open(*capability_session_id, payload_type_url, true)
-                    .await?;
-                return Ok(());
+                    .await
             }
             _ => Ok(()),
         }

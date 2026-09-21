@@ -34,6 +34,25 @@ fn bench_fragment(c: &mut Criterion) {
                 .unwrap()
             })
         });
+        group.bench_with_input(
+            BenchmarkId::new("arena_plus_parity", size),
+            &frame,
+            |b, frame| {
+                b.iter(|| {
+                    video_frame::fragment_frame_with_parity(
+                        video_frame::FRAME_KIND_SCREEN,
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        0,
+                        frame,
+                    )
+                    .unwrap()
+                })
+            },
+        );
         // Reference: the previous per-fragment `Vec<u8>` allocation scheme,
         // reproduced here so both strategies are measured in the same run.
         group.bench_with_input(
