@@ -331,6 +331,9 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
     let mut sws_ctx: *mut ffi::SwsContext = std::ptr::null_mut();
     let mut sws_signature: Option<(i32, i32, i32)> = None; // log dedup: (src_w, src_h, src_fmt)
     let mut sws_ctx_sig: Option<(i32, i32, i32)> = None; // tracks geometry/fmt used to create sws_ctx
+    // (inner_w, inner_h) currently allocated in scale_frame — avoids a
+    // ~1.4MiB av_frame_get_buffer malloc+free per frame in the scaling path.
+    let mut scale_frame_dims: (i32, i32) = (0, 0);
 
     // Output (V4L2) dimensions are FIXED — 1280x720. We scale any incoming
     // resolution to this. V4L2 format is only set once at startup, so readers
@@ -764,15 +767,22 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         );
                     }
 
-                    ffi::av_frame_unref(scale_frame);
-                    (*scale_frame).format = dst_fmt as i32;
-                    (*scale_frame).width = inner_w;
-                    (*scale_frame).height = inner_h;
-                    let ret = ffi::av_frame_get_buffer(scale_frame, 0);
-                    if ret < 0 {
-                        log::warn!("[camera] av_frame_get_buffer (scale): {}", ret);
-                        ffi::av_frame_unref(frame);
-                        continue;
+                    // scale_frame is a pure sws_scale scratch buffer: keep its
+                    // allocation across frames and only reallocate when the
+                    // scaled geometry changes. av_frame_unref would release
+                    // the buffers every frame — a ~1.4MiB malloc/free churn.
+                    if (inner_w, inner_h) != scale_frame_dims {
+                        ffi::av_frame_unref(scale_frame);
+                        (*scale_frame).format = dst_fmt as i32;
+                        (*scale_frame).width = inner_w;
+                        (*scale_frame).height = inner_h;
+                        let ret = ffi::av_frame_get_buffer(scale_frame, 0);
+                        if ret < 0 {
+                            log::warn!("[camera] av_frame_get_buffer (scale): {}", ret);
+                            ffi::av_frame_unref(frame);
+                            continue;
+                        }
+                        scale_frame_dims = (inner_w, inner_h);
                     }
 
                     ffi::sws_scale(
@@ -823,7 +833,9 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
                         s_h / 2,
                     );
 
-                    ffi::av_frame_unref(scale_frame);
+                    // Keep scale_frame's buffers for the next frame (cached by
+                    // scale_frame_dims above); av_frame_free at loop exit still
+                    // releases everything.
                     if !copied {
                         log::warn!(
                             "[camera] dropping frame with an invalid scaled YUV420P plane layout"
