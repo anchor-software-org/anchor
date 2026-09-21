@@ -143,8 +143,7 @@ fn bench_reassemble(c: &mut Criterion) {
             &packets,
             |b, packets| {
                 b.iter(|| {
-                    let mut fragments: Vec<Option<Vec<u8>>> =
-                        vec![None; packets.len()];
+                    let mut fragments: Vec<Option<Vec<u8>>> = vec![None; packets.len()];
                     for packet in packets.iter() {
                         let (header, payload) = FrameHeader::decode(packet).unwrap();
                         let index = usize::from(header.fragment_index);

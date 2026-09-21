@@ -54,10 +54,7 @@ struct BenchPair {
     _client_endpoint: Endpoint,
 }
 
-fn endpoint(
-    config: Option<quinn::ServerConfig>,
-    address: &str,
-) -> Endpoint {
+fn endpoint(config: Option<quinn::ServerConfig>, address: &str) -> Endpoint {
     let socket = quinn_transport::bind_udp_socket(address.parse().unwrap()).unwrap();
     Endpoint::new(
         quinn::EndpointConfig::default(),
@@ -106,12 +103,17 @@ async fn make_pair(rt_handle: &tokio::runtime::Handle) -> BenchPair {
             .await
             .unwrap();
         let anchor_sdk::SessionEvent::DatagramFlowOpenRequested {
-            request_id, flow_id, ..
+            request_id,
+            flow_id,
+            ..
         } = session.next_event().await.unwrap()
         else {
             panic!("expected datagram flow open request");
         };
-        let flow = session.accept_datagram_flow(request_id, flow_id).await.unwrap();
+        let flow = session
+            .accept_datagram_flow(request_id, flow_id)
+            .await
+            .unwrap();
         // Echo loop: keeps the connection alive and returns every datagram.
         // A full-frame burst arrives faster than the wire drains, so sends can
         // hit the stale-queue bound — retry like a paced production sender
@@ -275,13 +277,11 @@ fn datagram_benches(c: &mut Criterion) {
                 }
                 let mut frames_done = 0usize;
                 while frames_done < BURST_FRAMES {
-                    let datagram = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        pair.client_flow.recv(),
-                    )
-                    .await
-                    .expect("burst echo stalled — datagram lost")
-                    .unwrap();
+                    let datagram =
+                        tokio::time::timeout(Duration::from_secs(10), pair.client_flow.recv())
+                            .await
+                            .expect("burst echo stalled — datagram lost")
+                            .unwrap();
                     if reassembler
                         .add_datagram(
                             &datagram,

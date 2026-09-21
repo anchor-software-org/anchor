@@ -506,7 +506,12 @@ impl DatagramFlow {
     }
 
     pub async fn close(&self) -> Result<(), SessionError> {
-        self.session.0.datagram_routes.lock().unwrap().remove(&self.flow_id);
+        self.session
+            .0
+            .datagram_routes
+            .lock()
+            .unwrap()
+            .remove(&self.flow_id);
         self.session.send_datagram_flow_closed(self.flow_id).await
     }
 }
@@ -1104,7 +1109,11 @@ impl Session {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(flow_id, tx);
-        if !self.0.datagram_dispatch_started.swap(true, Ordering::AcqRel) {
+        if !self
+            .0
+            .datagram_dispatch_started
+            .swap(true, Ordering::AcqRel)
+        {
             tokio::spawn(dispatch_datagrams(self.clone()));
         }
         rx
@@ -1428,9 +1437,7 @@ async fn dispatch_datagrams(session: Session) {
         let Some(sender) = sender else {
             continue;
         };
-        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) =
-            sender.try_send(datagram)
-        {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = sender.try_send(datagram) {
             session
                 .0
                 .datagram_routes
