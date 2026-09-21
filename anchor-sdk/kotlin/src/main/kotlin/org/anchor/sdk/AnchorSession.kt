@@ -7,6 +7,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.yield
 import org.anchor.sdk.v1.CapabilityOpened
 import org.anchor.sdk.v1.ControlEnvelope
 import org.anchor.sdk.v1.EndpointAdvertisement
@@ -20,6 +21,9 @@ private const val PROTOCOL_MAJOR = 1
 private const val PROTOCOL_MINOR = 0
 private const val NODE_ID_BYTES = 32
 private const val MAX_CONTROL_RECORD_BYTES = 1024 * 1024
+// One max-size frame is ~8007 fragments; 8192 absorbs a full burst while
+// bounding how much stale media can accumulate behind a stalled consumer.
+private const val MAX_QUEUED_DATAGRAMS = 8192
 private val CONTROL_MAGIC = byteArrayOf('A'.code.toByte(), 'N'.code.toByte(), 'C'.code.toByte(), 'R'.code.toByte())
 
 data class SessionIdentity(
@@ -94,6 +98,7 @@ class AnchorSession private constructor(
     private val eventQueueAccounting = QueueAccounting()
     private val streamQueueAccounting = QueueAccounting()
     private val datagramQueueAccounting = QueueAccounting()
+    private var droppedDatagrams = 0L
     private val pollMutex = Mutex()
     // A session has one control stream, but capability operations and the
     // SDK event router may wait on it concurrently. Serialize reads and queue
@@ -250,12 +255,17 @@ class AnchorSession private constructor(
 
     internal suspend fun readStream(streamId: Long): AnchorStreamData {
         var closeObserved = false
+        var idlePolls = 0
         while (true) {
             if (invalidStreams.contains(streamId)) {
                 throw AnchorSessionException("stream received data after FIN")
             }
             takeQueuedStream(streamId)?.let { return it }
-            pollMutex.withLock { dispatch(transport.poll()) }
+            val polled = pollMutex.withLock {
+                val events = transport.poll()
+                dispatch(events)
+                events.size
+            }
             takeQueuedStream(streamId)?.let { return it }
             if (closedReason != null) {
                 // MsQuic can report connection shutdown before its final
@@ -264,18 +274,38 @@ class AnchorSession private constructor(
                 if (closeObserved) throw AnchorSessionException("QUIC transport closed")
                 closeObserved = true
             }
-            delay(2)
+            if (polled > 0) {
+                idlePolls = 0
+            } else if (++idlePolls < 32) {
+                yield()
+            } else {
+                delay(1)
+            }
         }
     }
 
     internal suspend fun readDatagram(): ByteArray {
+        var idlePolls = 0
         while (true) {
             takeQueuedDatagram()?.let { return it }
             if (closedReason != null) throw AnchorSessionException("QUIC transport closed")
-            pollMutex.withLock { dispatch(transport.poll()) }
+            val polled = pollMutex.withLock {
+                val events = transport.poll()
+                dispatch(events)
+                events.size
+            }
             takeQueuedDatagram()?.let { return it }
             if (closedReason != null) throw AnchorSessionException("QUIC transport closed")
-            delay(2)
+            // Media datagrams arrive in bursts microseconds apart — spin
+            // briefly so an in-flight burst is not delayed by a sleep, then
+            // nap while the transport is truly idle.
+            if (polled > 0) {
+                idlePolls = 0
+            } else if (++idlePolls < 32) {
+                yield()
+            } else {
+                delay(1)
+            }
         }
     }
 
@@ -297,6 +327,16 @@ class AnchorSession private constructor(
                     }
                 }
                 is QuicEvent.Datagram -> synchronized(queueLock) {
+                    // Media datagrams are replaceable: an over-full queue means
+                    // the consumer is behind, so drop the oldest rather than
+                    // deliver stale video or grow memory without bound. Mirrors
+                    // the Rust dispatcher's bounded per-flow route channel.
+                    while (queuedDatagrams.size >= MAX_QUEUED_DATAGRAMS) {
+                        queuedDatagrams.removeFirstOrNull()?.let { dropped ->
+                            datagramQueueAccounting.dequeue(dropped.size)
+                            droppedDatagrams++
+                        }
+                    }
                     queuedDatagrams.addLast(event.bytes)
                     datagramQueueAccounting.enqueue(event.bytes.size)
                 }
@@ -406,6 +446,7 @@ class AnchorSession private constructor(
             datagramQueueBytes = datagramQueueAccounting.currentBytes,
             datagramQueueHighWaterItems = datagramQueueAccounting.highWaterItems,
             datagramQueueHighWaterBytes = datagramQueueAccounting.highWaterBytes,
+            droppedDatagrams = droppedDatagrams,
             enqueuedItems = streamQueueAccounting.enqueuedItems + datagramQueueAccounting.enqueuedItems + eventQueueAccounting.enqueuedItems,
             enqueuedBytes = streamQueueAccounting.enqueuedBytes + datagramQueueAccounting.enqueuedBytes,
             dequeuedItems = streamQueueAccounting.dequeuedItems + datagramQueueAccounting.dequeuedItems + eventQueueAccounting.dequeuedItems,

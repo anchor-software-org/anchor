@@ -52,6 +52,8 @@ data class AnchorSessionQueueMetrics(
     val datagramQueueBytes: Long,
     val datagramQueueHighWaterItems: Long,
     val datagramQueueHighWaterBytes: Long,
+    /** Datagrams discarded because the queue hit its bounded capacity. */
+    val droppedDatagrams: Long = 0,
     val enqueuedItems: Long,
     val enqueuedBytes: Long,
     val dequeuedItems: Long,
