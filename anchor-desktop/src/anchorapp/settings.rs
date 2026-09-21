@@ -157,9 +157,11 @@ pub struct EncodingSettings {
     pub hw_pool_size: u32,
 
     /// VAAPI encoder async depth — how many frames the encoder can buffer
-    /// internally before draining. Higher = better GPU pipeline utilization.
-    /// 0 = default (encoder decides), 1 = synchronous, 2-4 = pipelined.
-    /// Range: 0-8. Recommended: 2-4 for streaming.
+    /// internally before draining. Higher = better GPU pipeline utilization,
+    /// lower = less encoder queueing latency. 0 = encoder decides (ffmpeg's
+    /// VAAPI default is 4, worth up to ~4 frame periods of pipeline delay),
+    /// 1 = synchronous, 2-4 = pipelined.
+    /// Range: 0-8. Recommended: 1 for low-latency streaming.
     pub async_depth: u32,
 
     /// H.264 profile. Controls feature set and decoder compatibility.
@@ -247,7 +249,7 @@ impl Default for EncodingSettings {
             x264_preset: "ultrafast".into(),
             x264_tune: "zerolatency".into(),
             hw_pool_size: 20,
-            async_depth: 0,
+            async_depth: 1,
             profile: "auto".into(),
             level: "auto".into(),
             scale_mode: "hq".into(),
