@@ -6,6 +6,7 @@
 //! providers still own their application policy; an incoming capability-open
 //! request is surfaced as an event and is never approved implicitly.
 
+use rustc_hash::FxHashMap;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -520,7 +521,7 @@ struct SessionInner {
     // `read_datagram` and routes each packet to its flow's channel by the
     // ANFR flow ID. Without it, two concurrent `DatagramFlow::recv` callers
     // would steal each other's datagrams and drop them as wrong-flow.
-    datagram_routes: std::sync::Mutex<HashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>,
+    datagram_routes: std::sync::Mutex<FxHashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>,
     datagram_dispatch_started: std::sync::atomic::AtomicBool,
     control_send: Mutex<quinn::SendStream>,
     control_recv: Mutex<ControlReader>,
@@ -1093,7 +1094,12 @@ impl Session {
     /// queue drops the datagram, preserving QUIC's lossy semantics for media
     /// without letting a stalled consumer grow unbounded.
     fn route_datagram_flow(&self, flow_id: u64) -> tokio::sync::mpsc::Receiver<Bytes> {
-        const DATAGRAM_ROUTE_CAPACITY: usize = 512;
+        // Room for one whole maximum-size access unit (~8007 fragments at
+        // MAX_FRAME_BYTES) plus slack: anything smaller can be dropped
+        // mid-frame only by a genuinely stalled consumer. The channel grows
+        // by allocation chunks, so the bound costs nothing while queues stay
+        // short.
+        const DATAGRAM_ROUTE_CAPACITY: usize = 8192;
         let (tx, rx) = tokio::sync::mpsc::channel(DATAGRAM_ROUTE_CAPACITY);
         self.0
             .datagram_routes
@@ -1210,7 +1216,7 @@ impl Session {
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
-            datagram_routes: std::sync::Mutex::new(HashMap::new()),
+            datagram_routes: std::sync::Mutex::new(FxHashMap::default()),
             datagram_dispatch_started: std::sync::atomic::AtomicBool::new(false),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
@@ -1249,7 +1255,7 @@ impl Session {
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
-            datagram_routes: std::sync::Mutex::new(HashMap::new()),
+            datagram_routes: std::sync::Mutex::new(FxHashMap::default()),
             datagram_dispatch_started: std::sync::atomic::AtomicBool::new(false),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
