@@ -75,6 +75,7 @@ pub struct SdkScreenSender {
     next_frame_at: Arc<Mutex<Instant>>,
     pacing_percent: usize,
     pacing_bps: usize,
+    fec_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +99,11 @@ impl SdkScreenSender {
             .clamp(50, 100);
         let pacing_bps =
             configured_bitrate.saturating_mul(pacing_percent).saturating_div(100).max(1);
+        // XOR-parity FEC on the lossy datagram path; ~6% extra datagrams let a
+        // receiver rebuild a singly-lost fragment instead of corrupting the
+        // whole access unit. Old receivers drop parity by kind, so this is
+        // wire-safe — `ANCHOR_FEC=0` disables it for A/B measurement.
+        let fec_enabled = std::env::var("ANCHOR_FEC").map_or(true, |value| value != "0");
         thread::Builder::new()
             .name("anchor-sdk-screen-writer".into())
             .spawn(move || {
@@ -156,6 +162,7 @@ impl SdkScreenSender {
             next_frame_at: Arc::new(Mutex::new(Instant::now())),
             pacing_percent,
             pacing_bps,
+            fec_enabled,
         }
     }
 
@@ -284,16 +291,33 @@ impl SdkScreenSender {
         if keyframe {
             self.stream_waiting_for_keyframe.store(false, Ordering::Release);
         }
-        let packets = match video_frame::fragment_frame_with_flags(
-            video_frame::FRAME_KIND_SCREEN,
-            flags,
-            self.capability_session_id,
-            flow_id,
-            sequence,
-            timestamp,
-            0,
-            frame,
-        ) {
+        let fragment_result = if self.fec_enabled && matches!(target, FrameTarget::Datagram(_)) {
+            // Datagrams are lossy — append XOR parity so receivers can rebuild
+            // a singly-lost fragment instead of corrupting the whole access
+            // unit and stalling until the next keyframe.
+            video_frame::fragment_frame_with_parity(
+                video_frame::FRAME_KIND_SCREEN,
+                flags,
+                self.capability_session_id,
+                flow_id,
+                sequence,
+                timestamp,
+                0,
+                frame,
+            )
+        } else {
+            video_frame::fragment_frame_with_flags(
+                video_frame::FRAME_KIND_SCREEN,
+                flags,
+                self.capability_session_id,
+                flow_id,
+                sequence,
+                timestamp,
+                0,
+                frame,
+            )
+        };
+        let packets = match fragment_result {
             Ok(packets) => packets,
             Err(error) => {
                 log::warn!("SDK screen frame rejected: {error}");
