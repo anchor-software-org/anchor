@@ -1000,7 +1000,9 @@ class CameraPlugin(
             (if (codecConfig) VideoFrameProtocol.FLAG_CODEC_CONFIG else 0)
         val sequence = sdkFrameSequence.getAndIncrement()
         try {
-            VideoFrameProtocol.fragment(
+            // Datagrams are lossy: append XOR parity so the peer can rebuild a
+            // singly-lost fragment instead of corrupting the access unit.
+            VideoFrameProtocol.fragmentWithParity(
                 kind = VideoFrameProtocol.KIND_CAMERA,
                 flags = flags,
                 capabilitySessionId = capability.sessionId,

@@ -43,7 +43,18 @@ internal class ScreenFrameAssembler(
         var completedAtNs = 0L
     }
 
+    /** One XOR-parity record: XOR of a fragment group's payloads and of their lengths. */
+    private class ParityRecord(
+        val createdAtNs: Long,
+        val lengthXor: Int,
+        val payload: ByteArray,
+    )
+
     private val pending = TreeMap<Long, Partial>()
+    // Parity records keyed frame sequence -> group index. Datagrams are
+    // unordered, so parity can arrive before the matching Partial exists.
+    private val pendingParities = HashMap<Long, MutableMap<Int, ParityRecord>>()
+    private var parityCount = 0
     private var lastDeliveredSequence = -1L
     private var waitingForIdr = true
     private var keyframeRequestPending = false
@@ -59,11 +70,30 @@ internal class ScreenFrameAssembler(
             return emptyList()
         }
         val header = packet.header
-        if (header.kind != VideoFrameProtocol.KIND_SCREEN ||
-            header.flowId != expectedFlowId ||
+        if (header.flowId != expectedFlowId ||
             header.capabilitySessionId != expectedCapabilityId ||
             header.fragmentCount > MAX_FRAGMENTS
         ) {
+            emit(
+                Outcome.REJECTED,
+                sequence = header.sequence,
+                fragmentIndex = header.fragmentIndex,
+                fragmentCount = header.fragmentCount,
+                reason = "header_mismatch",
+            )
+            return emptyList()
+        }
+        if (header.kind == VideoFrameProtocol.KIND_PARITY) {
+            // Parity for an already-delivered frame is useless; otherwise stash
+            // it and see whether this frame is exactly one fragment short.
+            if (header.sequence > lastDeliveredSequence) {
+                val nowNs = clock()
+                expire(nowNs)
+                storeParity(header, packet.payload, nowNs)
+            }
+            return tryParityRecovery(header.sequence)
+        }
+        if (header.kind != VideoFrameProtocol.KIND_SCREEN) {
             emit(
                 Outcome.REJECTED,
                 sequence = header.sequence,
@@ -131,6 +161,9 @@ internal class ScreenFrameAssembler(
                 }
             }
         }
+        if (partial.completed == null) {
+            return tryParityRecovery(header.sequence)
+        }
         return poll()
     }
 
@@ -182,6 +215,7 @@ internal class ScreenFrameAssembler(
                     if (entry.key <= lastDeliveredSequence) {
                         retainedBytes -= entry.value.bytes
                         iterator.remove()
+                        pendingParities.remove(entry.key)?.let { parityCount -= it.size }
                     }
                 }
                 continue
@@ -205,13 +239,77 @@ internal class ScreenFrameAssembler(
         return output
     }
 
+    /** Store one parity datagram; short payloads can never reconstruct. */
+    private fun storeParity(header: VideoFrameProtocol.Header, payload: ByteArray, nowNs: Long) {
+        if (payload.size != VideoFrameProtocol.PAYLOAD_BYTES || parityCount >= MAX_PARITY_RECORDS) {
+            return
+        }
+        val groups = pendingParities.getOrPut(header.sequence) { HashMap() }
+        if (groups.put(header.fragmentIndex, ParityRecord(nowNs, header.flags, payload)) == null) {
+            parityCount++
+        }
+    }
+
+    /**
+     * Rebuild a frame that is missing exactly one fragment covered by a stored
+     * parity group. Single-parity XOR recovers at most one loss per group;
+     * wider holes leave the frame partial until its assembly timeout.
+     */
+    private fun tryParityRecovery(sequence: Long): List<CompletedFrame> {
+        val partial = pending[sequence] ?: return emptyList()
+        if (partial.completed != null ||
+            partial.count != partial.header.fragmentCount - 1
+        ) {
+            return emptyList()
+        }
+        val missing = partial.fragments.indexOfFirst { it == null }
+        if (missing < 0) return emptyList()
+        val group = missing / VideoFrameProtocol.PARITY_GROUP_FRAGMENTS
+        val parity = pendingParities[sequence]?.get(group) ?: return emptyList()
+        val start = group * VideoFrameProtocol.PARITY_GROUP_FRAGMENTS
+        val end = minOf(start + VideoFrameProtocol.PARITY_GROUP_FRAGMENTS, partial.fragments.size)
+        val acc = parity.payload.copyOf()
+        var lengthXor = parity.lengthXor
+        for (i in start until end) {
+            val fragment = partial.fragments[i] ?: continue
+            lengthXor = lengthXor xor fragment.size
+            for (j in fragment.indices) {
+                acc[j] = (acc[j].toInt() xor fragment[j].toInt()).toByte()
+            }
+        }
+        if (lengthXor <= 0 || lengthXor > VideoFrameProtocol.PAYLOAD_BYTES) return emptyList()
+        val recovered = acc.copyOf(lengthXor)
+        partial.fragments[missing] = recovered
+        partial.bytes += recovered.size
+        partial.count++
+        retainedBytes += recovered.size
+        partial.completedAtNs = clock()
+        partial.completed = ByteArray(partial.bytes).also { output ->
+            var offset = 0
+            partial.fragments.forEach { fragment ->
+                checkNotNull(fragment).copyInto(output, offset)
+                offset += fragment.size
+            }
+        }
+        return poll()
+    }
+
     private fun expire(nowNs: Long) {
         val timedOut = pending.entries.firstOrNull { nowNs - it.value.firstSeenNs >= ASSEMBLY_TIMEOUT_NS }
         if (timedOut != null) recover(Outcome.TIMEOUT, timedOut.key, "fragment_assembly_timeout")
+        val groups = pendingParities.values.iterator()
+        while (groups.hasNext()) {
+            val records = groups.next()
+            parityCount -= records.values.count { nowNs - it.createdAtNs > ASSEMBLY_TIMEOUT_NS }
+            records.entries.removeAll { nowNs - it.value.createdAtNs > ASSEMBLY_TIMEOUT_NS }
+            if (records.isEmpty()) groups.remove()
+        }
     }
 
     private fun recover(outcome: Outcome, sequence: Long?, reason: String) {
         pending.clear()
+        pendingParities.clear()
+        parityCount = 0
         retainedBytes = 0
         gapSinceNs = null
         val wasWaiting = waitingForIdr
@@ -256,6 +354,7 @@ internal class ScreenFrameAssembler(
     private companion object {
         const val MAX_FRAGMENTS = 4096
         const val MAX_PENDING_FRAMES = 8
+        const val MAX_PARITY_RECORDS = 8192
         const val MAX_RETAINED_BYTES = VideoFrameProtocol.MAX_FRAME_BYTES
         const val REORDER_TIMEOUT_NS = 50_000_000L
         const val ASSEMBLY_TIMEOUT_NS = 250_000_000L
