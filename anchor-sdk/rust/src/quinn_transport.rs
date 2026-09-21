@@ -21,9 +21,7 @@ pub(crate) const DATAGRAM_SEND_BUFFER_BYTES: usize = 10 * 1024 * 1024;
 /// to rmem_max/wmem_max, so asking for 8 MiB is safe. Applies to outbound
 /// endpoints too — a client that only ever *receives* a large screen frame
 /// bursts just as hard on its recv buffer.
-pub fn bind_udp_socket(
-    address: std::net::SocketAddr,
-) -> std::io::Result<std::net::UdpSocket> {
+pub fn bind_udp_socket(address: std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(address),
         socket2::Type::DGRAM,

@@ -124,8 +124,10 @@ impl FrameHeader {
             return Err(FrameError::UnsupportedVersion(datagram[4]));
         }
         let kind = datagram[5];
-        if !matches!(kind, FRAME_KIND_SCREEN | FRAME_KIND_CAMERA | FRAME_KIND_PARITY)
-        {
+        if !matches!(
+            kind,
+            FRAME_KIND_SCREEN | FRAME_KIND_CAMERA | FRAME_KIND_PARITY
+        ) {
             return Err(FrameError::InvalidKind(kind));
         }
         let flags = u16::from_le_bytes([datagram[6], datagram[7]]);
@@ -215,8 +217,7 @@ pub fn fragment_frame_with_flags(
     // Pack every fragment into a single arena, then hand out zero-copy slice
     // handles. Quinn keeps each `Bytes` alive until the datagram is flushed,
     // so the arena is freed only after the last fragment leaves the queue.
-    let mut arena =
-        Vec::with_capacity(frame.len() + usize::from(count) * FRAME_HEADER_BYTES);
+    let mut arena = Vec::with_capacity(frame.len() + usize::from(count) * FRAME_HEADER_BYTES);
     let mut packets = Vec::with_capacity(usize::from(count));
     for (index, payload) in frame.chunks(FRAME_PAYLOAD_BYTES).enumerate() {
         let start = arena.len();
@@ -442,17 +443,23 @@ impl Reassembler {
         {
             self.partial.remove(&oldest);
         }
-        let entry = self.partial.entry(header.sequence).or_insert_with(|| PartialFrame {
-            created: now,
-            fragment_count: header.fragment_count,
-            // A frame can never legitimately exceed MAX_FRAME_BYTES, so a
-            // claimed fragment count above the maximum possible can never
-            // complete — cap the slot vector rather than trusting the wire.
-            fragments: vec![None; usize::from(header.fragment_count)
-                .min(MAX_FRAME_BYTES.div_ceil(FRAME_PAYLOAD_BYTES))],
-            received: 0,
-            total_bytes: 0,
-        });
+        let entry = self
+            .partial
+            .entry(header.sequence)
+            .or_insert_with(|| PartialFrame {
+                created: now,
+                fragment_count: header.fragment_count,
+                // A frame can never legitimately exceed MAX_FRAME_BYTES, so a
+                // claimed fragment count above the maximum possible can never
+                // complete — cap the slot vector rather than trusting the wire.
+                fragments: vec![
+                    None;
+                    usize::from(header.fragment_count)
+                        .min(MAX_FRAME_BYTES.div_ceil(FRAME_PAYLOAD_BYTES))
+                ],
+                received: 0,
+                total_bytes: 0,
+            });
         if entry.fragment_count != header.fragment_count {
             self.partial.remove(&header.sequence);
             return None;
@@ -880,7 +887,10 @@ mod tests {
                 packet.len()
             );
             // The payload chunk must be the same arena storage, not a copy.
-            assert!(std::ptr::eq(chunks[index * 2 + 1].as_ptr(), packet.as_ptr()));
+            assert!(std::ptr::eq(
+                chunks[index * 2 + 1].as_ptr(),
+                packet.as_ptr()
+            ));
         }
         let mut stream = Vec::new();
         for chunk in &chunks {
@@ -890,10 +900,8 @@ mod tests {
         let mut reassembled = Vec::new();
         while offset < stream.len() {
             let end = offset + STREAM_PACKET_LENGTH_BYTES;
-            let length =
-                u32::from_le_bytes(stream[offset..end].try_into().unwrap()) as usize;
-            let (header, payload) =
-                FrameHeader::decode(&stream[end..end + length]).unwrap();
+            let length = u32::from_le_bytes(stream[offset..end].try_into().unwrap()) as usize;
+            let (header, payload) = FrameHeader::decode(&stream[end..end + length]).unwrap();
             assert_eq!(header.sequence, 77);
             reassembled.extend_from_slice(payload);
             offset = end + length;
@@ -906,14 +914,29 @@ mod tests {
         let payload: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 2 + 17)
             .map(|index| (index % 251) as u8)
             .collect();
-        let packets =
-            fragment_frame(FRAME_KIND_CAMERA, 9, 4, 77, 123, 1, &payload).unwrap();
+        let packets = fragment_frame(FRAME_KIND_CAMERA, 9, 4, 77, 123, 1, &payload).unwrap();
         let mut reassembler = Reassembler::default();
         // Wrong flow id, duplicate fragment, then out-of-order completion.
-        assert!(reassembler.add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 999).is_none());
-        assert!(reassembler.add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4).is_none());
-        assert!(reassembler.add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4).is_none());
-        assert!(reassembler.add_datagram(&packets[1], FRAME_KIND_CAMERA, 9, 4).is_none());
+        assert!(
+            reassembler
+                .add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 999)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[1], FRAME_KIND_CAMERA, 9, 4)
+                .is_none()
+        );
         let rebuilt = reassembler
             .add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 4)
             .unwrap();
@@ -924,8 +947,16 @@ mod tests {
     fn reassembler_drops_foreign_kinds_and_sessions() {
         let packets = fragment_frame(FRAME_KIND_SCREEN, 1, 2, 3, 0, 0, &[1, 2, 3]).unwrap();
         let mut reassembler = Reassembler::default();
-        assert!(reassembler.add_datagram(&packets[0], FRAME_KIND_CAMERA, 1, 2).is_none());
-        assert!(reassembler.add_datagram(&packets[0], FRAME_KIND_SCREEN, 2, 2).is_none());
+        assert!(
+            reassembler
+                .add_datagram(&packets[0], FRAME_KIND_CAMERA, 1, 2)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[0], FRAME_KIND_SCREEN, 2, 2)
+                .is_none()
+        );
         // A malformed datagram never reaches the map at all.
         assert!(
             reassembler
@@ -988,9 +1019,11 @@ mod tests {
         // Parity lands first (unordered datagrams), fragment 2 is lost.
         let mut rebuilt = None;
         for packet in packets.iter().skip(20) {
-            assert!(reassembler
-                .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
-                .is_none());
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
+                    .is_none()
+            );
         }
         for (index, packet) in packets.iter().enumerate().take(20) {
             if index == 2 {
@@ -1035,9 +1068,11 @@ mod tests {
             if index == 3 || index == 4 {
                 continue;
             }
-            assert!(reassembler
-                .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
-                .is_none());
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
+                    .is_none()
+            );
         }
     }
 
@@ -1065,9 +1100,11 @@ mod tests {
             fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
         let mut reassembler = Reassembler::default();
         for packet in packets.iter().skip(20) {
-            assert!(reassembler
-                .add_datagram(packet, FRAME_KIND_SCREEN, 1, 99)
-                .is_none());
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 99)
+                    .is_none()
+            );
         }
         assert!(reassembler.pending_parities.is_empty());
     }

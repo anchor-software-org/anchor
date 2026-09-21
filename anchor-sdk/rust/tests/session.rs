@@ -1336,12 +1336,19 @@ async fn datagram_flows_receive_only_their_own_flows_packets() {
         let mut flows = Vec::new();
         for _ in 0..2 {
             let SessionEvent::DatagramFlowOpenRequested {
-                request_id, flow_id, ..
+                request_id,
+                flow_id,
+                ..
             } = session.next_event().await.unwrap()
             else {
                 panic!("expected datagram flow open request");
             };
-            flows.push(session.accept_datagram_flow(request_id, flow_id).await.unwrap());
+            flows.push(
+                session
+                    .accept_datagram_flow(request_id, flow_id)
+                    .await
+                    .unwrap(),
+            );
         }
         assert_ne!(flows[0].flow_id(), flows[1].flow_id());
 
@@ -1351,13 +1358,14 @@ async fn datagram_flows_receive_only_their_own_flows_packets() {
             .await
             .expect("flow packets must reach their own receiver")
             .expect("flow receiver must deliver a packet");
-        let (header, payload) =
-            anchor_sdk::video_frame::FrameHeader::decode(&delivered).unwrap();
+        let (header, payload) = anchor_sdk::video_frame::FrameHeader::decode(&delivered).unwrap();
         assert_eq!(header.flow_id, flows[1].flow_id());
         assert_eq!(payload, b"flow-b");
 
         assert!(
-            timeout(Duration::from_millis(150), flows[0].recv()).await.is_err(),
+            timeout(Duration::from_millis(150), flows[0].recv())
+                .await
+                .is_err(),
             "a flow must never observe another flow's datagrams",
         );
         session.close(0, b"test complete");
@@ -1409,8 +1417,7 @@ async fn datagram_flows_receive_only_their_own_flows_packets() {
 #[tokio::test]
 async fn parity_recovers_a_fragment_lost_over_real_quic_datagrams() {
     use anchor_sdk::video_frame::{
-        FrameHeader, Reassembler, fragment_frame_with_parity, FRAME_KIND_CAMERA,
-        FRAME_KIND_PARITY,
+        FRAME_KIND_CAMERA, FRAME_KIND_PARITY, FrameHeader, Reassembler, fragment_frame_with_parity,
     };
 
     let (server_config, client_config) = configs();
@@ -1445,12 +1452,17 @@ async fn parity_recovers_a_fragment_lost_over_real_quic_datagrams() {
             .await
             .unwrap();
         let SessionEvent::DatagramFlowOpenRequested {
-            request_id, flow_id, ..
+            request_id,
+            flow_id,
+            ..
         } = session.next_event().await.unwrap()
         else {
             panic!("expected datagram flow open request");
         };
-        let flow = session.accept_datagram_flow(request_id, flow_id).await.unwrap();
+        let flow = session
+            .accept_datagram_flow(request_id, flow_id)
+            .await
+            .unwrap();
 
         // Reassemble whatever datagrams arrive; one data fragment was
         // withheld by the sender, so only parity can complete the frame.
