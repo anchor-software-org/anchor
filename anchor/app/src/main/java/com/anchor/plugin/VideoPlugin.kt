@@ -473,6 +473,7 @@ class VideoPlugin(
                             "sdk_datagram_queue_bytes" to native.sdkDatagramQueueBytes,
                             "sdk_datagram_queue_high_water_items" to native.sdkDatagramQueueHighWaterItems,
                             "sdk_datagram_queue_high_water_bytes" to native.sdkDatagramQueueHighWaterBytes,
+                            "sdk_dropped_datagrams" to native.sdkDroppedDatagrams,
                         )
                     }
                     for (packet in packets) {
@@ -523,6 +524,7 @@ class VideoPlugin(
             sdkDatagramQueueBytes = sdk.datagramQueueBytes,
             sdkDatagramQueueHighWaterItems = sdk.datagramQueueHighWaterItems,
             sdkDatagramQueueHighWaterBytes = sdk.datagramQueueHighWaterBytes,
+            sdkDroppedDatagrams = sdk.droppedDatagrams,
         )
     }
 
@@ -548,6 +550,7 @@ class VideoPlugin(
         val sdkDatagramQueueBytes: Long,
         val sdkDatagramQueueHighWaterItems: Long,
         val sdkDatagramQueueHighWaterBytes: Long,
+        val sdkDroppedDatagrams: Long,
     )
 
     private fun sendSdk(typeUrl: String, payload: ByteArray): Boolean {
