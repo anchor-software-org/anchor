@@ -38,6 +38,7 @@ private const val FRAME_QUEUE_CAPACITY = 3
 private const val MAX_INIT_FAILURES = 3
 private const val CODEC_METADATA_LIMIT = 64
 private const val START_CONFIRMATION_TIMEOUT_MS = 15_000L
+private const val KEYFRAME_REQUEST_MIN_INTERVAL_NS = 300_000_000L
 
 class VideoPlugin(
     private val broker: MessageBroker
@@ -417,13 +418,35 @@ class VideoPlugin(
                 if (datagramFlow != null) {
                     Log.i(TAG, "SDK screen datagram flow opened (flow=${datagramFlow.flowId})")
                     trace.event("datagram_flow_open", "flow_id" to datagramFlow.flowId)
+                    var lastKeyframeRequestNs = 0L
+                    var lastIngressMetricsNs = 0L
                     while (true) {
                         val datagram = datagramFlow.receive()
                         val completed =
                             assembler.add(datagram, datagramFlow.flowId, capability.sessionId)
                         if (assembler.takeKeyframeRequest()) {
-                            requestKeyframe()
-                            trace.event("keyframe_request_needed", "flow_id" to datagramFlow.flowId)
+                            // While awaiting an IDR every incoming datagram
+                            // re-arms the assembler's request flag — debounce
+                            // so a gap costs one IDR, not an IDR per fragment.
+                            val nowNs = System.nanoTime()
+                            if (nowNs - lastKeyframeRequestNs >= KEYFRAME_REQUEST_MIN_INTERVAL_NS) {
+                                lastKeyframeRequestNs = nowNs
+                                requestKeyframe()
+                                trace.event("keyframe_request_needed", "flow_id" to datagramFlow.flowId)
+                            }
+                        }
+                        val nowNs = System.nanoTime()
+                        if (nowNs - lastIngressMetricsNs >= 1_000_000_000L) {
+                            lastIngressMetricsNs = nowNs
+                            val session = sdkSession ?: break
+                            val native = sessionIngressMetrics(session)
+                            trace.event(
+                                "ingress_metrics",
+                                "sdk_datagram_queue_items" to native.sdkDatagramQueueItems,
+                                "sdk_datagram_queue_bytes" to native.sdkDatagramQueueBytes,
+                                "sdk_datagram_queue_high_water_items" to native.sdkDatagramQueueHighWaterItems,
+                                "sdk_dropped_datagrams" to native.sdkDroppedDatagrams,
+                            )
                         }
                         for (assembled in completed) {
                             feedFrame(assembled)
@@ -435,6 +458,7 @@ class VideoPlugin(
                 trace.event("stream_open", "stream_id" to stream.streamId)
                 val packetReader = ScreenStreamPacketReader()
                 var lastIngressMetricsNs = 0L
+                var lastKeyframeRequestNs = 0L
                 while (true) {
                     val chunk = stream.receive()
                     val packets = packetReader.add(chunk.bytes)
@@ -479,8 +503,12 @@ class VideoPlugin(
                     for (packet in packets) {
                         val completed = assembler.add(packet, stream.streamId, capability.sessionId)
                         if (assembler.takeKeyframeRequest()) {
-                            requestKeyframe()
-                            trace.event("keyframe_request_needed", "stream_id" to stream.streamId)
+                            val nowNs2 = System.nanoTime()
+                            if (nowNs2 - lastKeyframeRequestNs >= KEYFRAME_REQUEST_MIN_INTERVAL_NS) {
+                                lastKeyframeRequestNs = nowNs2
+                                requestKeyframe()
+                                trace.event("keyframe_request_needed", "stream_id" to stream.streamId)
+                            }
                         }
                         for (assembled in completed) {
                             feedFrame(assembled)
