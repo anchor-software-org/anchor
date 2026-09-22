@@ -28,13 +28,14 @@ pub fn advertisement() -> CapabilityAdvertisement {
             STATUS_TYPE_URL.into(),
             FRAME_TYPE_URL.into(),
         ],
-        // Screen video CAN ride lossy datagrams (parity rebuilds a singly-lost
-        // fragment, and skipping head-of-line blocking saves ~1 RTT per drop),
-        // but the pacer + drop-recovery interaction on that path is still
-        // being validated on real networks. Default to the reliable stream;
-        // ANCHOR_SCREEN_DATAGRAMS=1 opts back into the datagram flow.
+        // Screen video rides lossy datagrams: parity rebuilds singly-lost
+        // fragments, and skipping head-of-line blocking saves ~1 RTT per
+        // dropped packet. Reference-chain integrity on this path is enforced
+        // by mark_frame_gap (any dropped/coalesced AU suppresses P-frames
+        // until an IDR). ANCHOR_SCREEN_DATAGRAMS=0 forces the reliable stream
+        // as a debug escape hatch.
         supports_datagrams: std::env::var("ANCHOR_SCREEN_DATAGRAMS")
-            .is_ok_and(|value| value == "1"),
+            .map_or(true, |value| value != "0"),
     }
 }
 pub fn endpoint_advertisement() -> EndpointAdvertisement {
