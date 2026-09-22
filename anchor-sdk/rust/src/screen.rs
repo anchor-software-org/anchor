@@ -28,10 +28,13 @@ pub fn advertisement() -> CapabilityAdvertisement {
             STATUS_TYPE_URL.into(),
             FRAME_TYPE_URL.into(),
         ],
-        // Screen video tolerates datagram loss: parity lets receivers rebuild
-        // a singly-lost fragment, and skipping head-of-line blocking removes
-        // the ~1 RTT stall a dropped stream packet would otherwise cost.
-        supports_datagrams: true,
+        // Screen video CAN ride lossy datagrams (parity rebuilds a singly-lost
+        // fragment, and skipping head-of-line blocking saves ~1 RTT per drop),
+        // but the pacer + drop-recovery interaction on that path is still
+        // being validated on real networks. Default to the reliable stream;
+        // ANCHOR_SCREEN_DATAGRAMS=1 opts back into the datagram flow.
+        supports_datagrams: std::env::var("ANCHOR_SCREEN_DATAGRAMS")
+            .is_ok_and(|value| value == "1"),
     }
 }
 pub fn endpoint_advertisement() -> EndpointAdvertisement {
