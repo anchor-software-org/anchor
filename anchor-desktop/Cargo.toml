@@ -76,9 +76,10 @@ debug = false
 overflow-checks = false
 # The frame pipeline (fragmentation, codec plumbing, per-packet allocation)
 # is hot enough that release builds should optimize aggressively rather than
-# keep debug-build-like codegen settings.
+# keep debug-build-like codegen settings. codegen-units stays at the default:
+# benching CGU=1 vs 16 showed noise-level deltas while serializing LLVM
+# codegen and roughly tripling release build time.
 lto = "thin"
-codegen-units = 1
 opt-level = 3
 
 [profile.profiling]
