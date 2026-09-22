@@ -61,14 +61,6 @@ jobs:
           cache: pnpm
           cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
 
-      - name: Install frontend dependencies
-        working-directory: anchor-desktop/frontend
-        run: pnpm install --frozen-lockfile
-
-      - name: Build frontend assets
-        working-directory: anchor-desktop/frontend
-        run: pnpm run build
-
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -77,8 +69,8 @@ jobs:
             anchor-desktop
 
       - name: Build Tauri release
-        working-directory: anchor-desktop
-        run: cargo build --release --locked --bin anchor
+        working-directory: .
+        run: bash scripts/ci/desktop-binary.sh
 
       - name: Upload desktop binary
         uses: actions/upload-artifact@v4
@@ -95,8 +87,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # versionName/protocol are derived from git in build.gradle.kts;
-          # full history keeps those reads well-defined.
+          # full history keeps those reads well-defined. Submodules carry
+          # MsQuic/QuicTLS, which ci/android.sh builds into the APK.
           fetch-depth: 0
+          submodules: recursive
 
       - uses: actions/setup-java@v4
         with:
@@ -112,8 +106,8 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build debug APK
-        working-directory: anchor
-        run: ./gradlew :anchorSdk:testDebugUnitTest :app:testDebugUnitTest :app:assembleDebug --no-daemon
+        working-directory: .
+        run: bash scripts/ci/android.sh
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4

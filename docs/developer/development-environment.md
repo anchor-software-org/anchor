@@ -130,6 +130,50 @@ pnpm --dir frontend build
 The Sideboat baselines also need a host `ffmpeg`; `--headed` needs `ffplay`.
 VA-API benchmarks additionally need a usable DRM render device and driver.
 
+## Run CI locally
+
+Every GitHub Actions job calls a script under `scripts/ci/`, so the same steps
+run on a workstation. The workflows only provision tools, run the script, and
+upload artifacts.
+
+Inside either devenv shell:
+
+```sh
+ci <job> [job...]
+ci all
+```
+
+`ci` dispatches each job into the devenv that provides its tools, so it works
+from either shell (or a plain shell, as `scripts/ci.sh <job>`, if `devenv` is
+on `PATH`).
+
+| Job | Mirrors | Environment used |
+| --- | --- | --- |
+| `check` | fmt + clippy + test (`ci-rust.yml`) | `anchor-desktop` devenv |
+| `sdk` | SDK source conformance (`ci-rust.yml`) | root devenv |
+| `android` | Android APK (`verification-artifacts.yml`) | root devenv + Android SDK |
+| `desktop` | Desktop binary (`verification-artifacts.yml`) | `anchor-desktop` devenv |
+| `appimage` | Build AppImage (`appimage.yml`) | Ubuntu 22.04 builder container |
+
+Notes:
+
+- `all` runs `check sdk android desktop`; `appimage` is opt-in because it does
+  a full release build in the container.
+- `check` links the pinned prebuilt FFmpeg like PR CI. `VENDOR_FFMPEG=1 ci
+  check` builds FFmpeg from source instead (release parity).
+- `android` builds MsQuic for the packaged ABIs when missing
+  (`CI_MSQUIC_ABIS` to widen beyond `arm64-v8a`) and verifies the `.so` files
+  land in the APK — without them the app crashes on first connect.
+- `desktop` verifies the release binary is an ELF with a fully resolvable
+  `ldd` closure; `appimage` extracts the image and verifies the binary's
+  library closure and that bundled `adb` runs.
+- The `appimage` job only covers the host architecture — there is no local
+  aarch64 equivalent of the ARM runner.
+- Artifact uploads stay in the workflows. Locally, `ci` links every produced
+  artifact (APK, release binary, AppImage) into `target/ci-artifacts/` —
+  gitignored — and prints the listing at the end of the run. The real files
+  stay in their usual build directories.
+
 ## Update pinned inputs
 
 After changing either `devenv.nix`, update the lock in the same directory:
