@@ -168,16 +168,20 @@ pub fn encode_first_control_record(
     envelope: &v1::ControlEnvelope,
 ) -> Result<Vec<u8>, ProtocolViolation> {
     validate_control_envelope(envelope)?;
-    let payload = envelope.encode_to_vec();
-    if payload.len() > MAX_CONTROL_RECORD_BYTES {
+    let payload_len = envelope.encoded_len();
+    if payload_len > MAX_CONTROL_RECORD_BYTES {
         return Err(ProtocolViolation::ControlRecordTooLarge);
     }
-    let mut frame = Vec::with_capacity(CONTROL_MAGIC.len() + 2 + 10 + payload.len());
+    let mut frame = Vec::with_capacity(CONTROL_MAGIC.len() + 2 + 10 + payload_len);
     frame.extend_from_slice(&CONTROL_MAGIC);
     frame.push(PROTOCOL_MAJOR);
     frame.push(PROTOCOL_MINOR);
-    encode_varint(payload.len() as u64, &mut frame);
-    frame.extend_from_slice(&payload);
+    // encode_length_delimited writes the same LEB128 length prefix as
+    // encode_varint followed by the payload, without a separate encode_to_vec
+    // allocation and copy.
+    envelope
+        .encode_length_delimited(&mut frame)
+        .map_err(|_| ProtocolViolation::MalformedControlRecord)?;
     Ok(frame)
 }
 
@@ -232,14 +236,6 @@ fn validate_length(
             actual: value.len(),
         })
     }
-}
-
-fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 0x80 {
-        output.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
 }
 
 fn decode_varint(input: &[u8]) -> Result<(u64, usize), ProtocolViolation> {

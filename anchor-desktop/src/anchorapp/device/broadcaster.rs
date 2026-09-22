@@ -33,6 +33,12 @@ pub struct FrameBroadcaster {
     traced_senders: Mutex<HashMap<String, SyncSender<Arc<BroadcastFrame>>>>,
     /// Set by a transport when a receiver needs an IDR.
     pub needs_keyframe: AtomicBool,
+    /// Set when the last publish had to drop on a full subscriber queue,
+    /// cleared by drain threads once the queue empties. The capture loop
+    /// reads this to skip ENCODING while downstream is saturated — a frame
+    /// the encoder never saw cannot break the decoder's reference chain,
+    /// so skipping costs a frame of framerate instead of a recovery IDR.
+    congested: AtomicBool,
 }
 
 impl Default for FrameBroadcaster {
@@ -47,6 +53,7 @@ impl FrameBroadcaster {
             senders: Mutex::new(HashMap::new()),
             traced_senders: Mutex::new(HashMap::new()),
             needs_keyframe: AtomicBool::new(false),
+            congested: AtomicBool::new(false),
         }
     }
 
@@ -73,19 +80,22 @@ impl FrameBroadcaster {
     pub fn unsubscribe(&self, device_id: &str) {
         self.senders.lock().unwrap().remove(device_id);
         self.traced_senders.lock().unwrap().remove(device_id);
+        // A departed drain thread can no longer clear congestion itself.
+        self.congested.store(false, Ordering::Relaxed);
     }
 
-    /// Returns true if any subscriber's channel is full (encoder should skip this frame).
+    /// True while the last publish dropped on a full subscriber queue. The
+    /// capture loop should skip encoding rather than produce an access unit
+    /// that will be dropped post-encode (which would force a recovery IDR).
     pub fn has_backpressure(&self) -> bool {
-        let senders = self.senders.lock().unwrap();
-        // No subscribers = no backpressure
-        if senders.is_empty() {
-            return false;
-        }
-        // Check if any channel has zero capacity remaining
-        // SyncSender doesn't expose capacity, so we just check if a zero-size try would fail
-        // by looking at the last publish result via needs_keyframe flag
-        false // Conservative: don't skip frames, let publish handle drops
+        self.congested.load(Ordering::Relaxed)
+    }
+
+    /// Called by a drain thread after it empties its subscription queue —
+    /// the next publish has room again, so the capture loop may resume
+    /// encoding. Also safe to call on unsubscribe/teardown.
+    pub fn clear_backpressure(&self) {
+        self.congested.store(false, Ordering::Relaxed);
     }
 
     /// Called by Wayland encoder every frame. Sends Arc<frame> to all subscribers.
@@ -96,48 +106,47 @@ impl FrameBroadcaster {
 
     /// Publish an encoded access unit with its capture-loop identifier.
     pub fn publish_frame(&self, source_frame_id: u64, data: Vec<u8>) -> bool {
+        let mut senders = self.senders.lock().unwrap();
+        let mut traced_senders = self.traced_senders.lock().unwrap();
+        // Skip the Arc allocs and timestamp read entirely when nobody is
+        // listening — idle capture with no connected device is the common
+        // case outside active sessions.
+        if senders.is_empty() && traced_senders.is_empty() {
+            return true;
+        }
         let data = Arc::new(data);
         let frame = Arc::new(BroadcastFrame {
             source_frame_id,
             published_ns: crate::anchorwayland::frame_trace::mono_ns(),
             data: Arc::clone(&data),
         });
-        let mut senders = self.senders.lock().unwrap();
-        let mut traced_senders = self.traced_senders.lock().unwrap();
         let legacy_frame = data;
         let mut all_delivered = true;
-        let mut legacy_drop = false;
         senders.retain(|id, tx| match tx.try_send(Arc::clone(&legacy_frame)) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
                 log::debug!("FrameBroadcaster: dropped frame for slow device {}", id);
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "broadcaster_drop",
-                    serde_json::json!({
+                    {
                         "device_id": id,
                         "source_frame_id": frame.source_frame_id,
                         "encoded_bytes": frame.len(),
                         "reason": "subscriber_queue_full",
-                    }),
+                    }
                 );
                 all_delivered = false;
-                // The SDK screen path intentionally drops replaceable frames
-                // and has its own transport-aware recovery. Keep IDR recovery
-                // enabled for other subscribers.
-                if !id.starts_with("sdk-") {
-                    legacy_drop = true;
-                }
                 true
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 log::info!("FrameBroadcaster: device {} disconnected, removing", id);
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "broadcaster_disconnect",
-                    serde_json::json!({
+                    {
                         "device_id": id,
                         "source_frame_id": frame.source_frame_id,
                         "reason": "subscriber_disconnected",
-                    }),
+                    }
                 );
                 false
             }
@@ -147,14 +156,14 @@ impl FrameBroadcaster {
             Err(mpsc::TrySendError::Full(_)) => {
                 log::debug!("FrameBroadcaster: dropped traced frame for slow device {}", id);
                 all_delivered = false;
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "broadcaster_drop",
-                    serde_json::json!({
+                    {
                         "device_id": id,
                         "source_frame_id": frame.source_frame_id,
                         "encoded_bytes": frame.len(),
                         "reason": "subscriber_queue_full",
-                    }),
+                    }
                 );
                 true
             }
@@ -164,17 +173,22 @@ impl FrameBroadcaster {
             }
         });
         if all_delivered {
-            crate::anchorwayland::frame_trace::event(
+            crate::anchorwayland::frame_trace::event!(
                 "broadcaster_accept",
-                serde_json::json!({
+                {
                     "source_frame_id": frame.source_frame_id,
                     "encoded_bytes": frame.len(),
                     "subscriber_count": senders.len() + traced_senders.len(),
-                }),
+                }
             );
         }
-        if legacy_drop {
+        // Any dropped access unit breaks the H.264 reference chain — the
+        // decoder's next P-frame would reference a frame it never received.
+        // This applies to SDK subscribers too: a publish-side drop never
+        // reaches their transport recovery, so the encoder must emit an IDR.
+        if !all_delivered {
             self.needs_keyframe.store(true, Ordering::Relaxed);
+            self.congested.store(true, Ordering::Relaxed);
         }
         all_delivered
     }
@@ -264,12 +278,14 @@ mod tests {
     }
 
     #[test]
-    fn sdk_screen_queue_drop_does_not_force_keyframe() {
+    fn sdk_screen_queue_drop_forces_keyframe() {
+        // A publish-side drop breaks the decoder's reference chain and never
+        // reaches transport recovery — the encoder must emit an IDR.
         let bc = FrameBroadcaster::new();
         let _rx = bc.subscribe("sdk-screen:device-1".to_string(), 1);
         bc.publish(vec![1]);
         assert!(!bc.publish(vec![2]));
-        assert!(!bc.take_keyframe_request());
+        assert!(bc.take_keyframe_request());
     }
 
     #[test]

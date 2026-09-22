@@ -9,6 +9,7 @@ use crate::anchorwayland::vaapi_encoder::{VaapiDeviceCtx, VaapiEncoder};
 use crate::anchorwayland::wayland_objects::DrmBufParams;
 use serde_json::json;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -113,6 +114,10 @@ struct CaptureState {
     next_encode_deadline: Option<Instant>,
     backend: Box<dyn CaptureBackend>,
     last_encoded_frame_time: Option<Instant>,
+    /// When the last recovery IDR was forced. Rate-limits keyframe honoring
+    /// so sustained backpressure can't turn into an IDR-per-frame storm —
+    /// each 300KB+ keyframe competes with the media that is already behind.
+    last_forced_idr: Option<Instant>,
     frame_drops: u64,
     total_frame_drops: u64,
     trace_ring: Arc<TraceRing>,
@@ -348,6 +353,7 @@ impl Plugin for AnchorPluginWayland {
                     next_encode_deadline: None,
                     backend,
                     last_encoded_frame_time: None,
+                    last_forced_idr: None,
                     frame_drops: 0,
                     total_frame_drops: 0,
                     trace_ring: Arc::new(TraceRing::new()),
@@ -448,7 +454,13 @@ impl Plugin for AnchorPluginWayland {
                             // Encoder re-created on next frame via process_frame.
                         }
                         CaptureAction::RequestKeyframe => {
-                            request_idr(&mut state, w, h, fourcc, &tx);
+                            // The receiver re-requests while awaiting IDR, so
+                            // honor at most one per interval; the next request
+                            // arrives before the limit could stall recovery.
+                            if idr_request_due(&state, Instant::now()) {
+                                state.last_forced_idr = Some(Instant::now());
+                                request_idr(&mut state, w, h, fourcc, &tx);
+                            }
                         }
                         CaptureAction::ResyncToPhone => {
                             let s = if state.streaming { "streaming" } else { "starting" };
@@ -619,10 +631,30 @@ fn process_frame(
         // Fall through — encoder now exists (if init succeeded), encode this frame.
     }
 
+    // ── Congestion backpressure ──────────────────────────────────────────────
+    // A subscriber queue was full on the last publish. Skip ENCODING entirely
+    // rather than producing an access unit that gets dropped post-encode: a
+    // frame the encoder never saw cannot break the decoder's reference chain,
+    // so congestion costs framerate instead of a ~350KB recovery IDR (which
+    // then stalls the pacer and causes the next drop — the IDR treadmill).
+    // Pending keyframe requests stay queued and are honored once a drain
+    // thread clears the flag.
+    if broadcaster.as_ref().is_some_and(|bc| bc.has_backpressure()) {
+        state.frame_drops += 1;
+        state.total_frame_drops += 1;
+        return false;
+    }
+
     // ── Handle IDR requests from broadcaster ─────────────────────────────────
-    if state.h264_encoder.is_some()
-        && broadcaster.as_ref().is_some_and(|bc| bc.take_keyframe_request())
-    {
+    // Peek rather than take: if honoring is still rate-limited, the flag stays
+    // set so a later frame forces the IDR once the interval elapses.
+    let keyframe_pending =
+        broadcaster.as_ref().is_some_and(|bc| bc.needs_keyframe.load(Ordering::Relaxed));
+    if state.h264_encoder.is_some() && keyframe_pending && idr_request_due(state, Instant::now()) {
+        if let Some(bc) = broadcaster {
+            bc.take_keyframe_request();
+        }
+        state.last_forced_idr = Some(Instant::now());
         state.frame_drops += 1;
         state.total_frame_drops += 1;
         log::debug!("Frame drop #{} — forcing IDR on next frame", state.total_frame_drops);
@@ -877,6 +909,14 @@ fn start_streaming(
             );
         }
     }
+}
+
+/// Minimum spacing between honored IDR requests. Matches the receiver's
+/// re-request cadence so a fresh request always lands before recovery stalls.
+const MIN_IDR_INTERVAL: Duration = Duration::from_millis(250);
+
+fn idr_request_due(state: &CaptureState, now: Instant) -> bool {
+    state.last_forced_idr.is_none_or(|at| now.duration_since(at) >= MIN_IDR_INTERVAL)
 }
 
 /// Force the next encoded frame to be an IDR keyframe so a decoder that lost
@@ -1153,7 +1193,7 @@ fn encode_streaming_frame(
                     cpu_convert_us,
                     cpu_codec_us,
                 );
-                concat_packets(&packets, concat_us)
+                concat_packets(packets, concat_us)
             }
         }
     } else if encoder.selected_encoder == "h264_vaapi" {
@@ -1169,7 +1209,7 @@ fn encode_streaming_frame(
             cpu_convert_us,
             cpu_codec_us,
         );
-        concat_packets(&packets, concat_us)
+        concat_packets(packets, concat_us)
     } else if encoder.vpp_available {
         match encoder.encode_dmabuf_vpp(
             buf_params.fd.as_raw_fd(),
@@ -1178,7 +1218,7 @@ fn encode_streaming_frame(
             u64::from(buf_params.modifier),
             compositor_fourcc,
         ) {
-            Ok(pkts) => concat_packets(&pkts, concat_us),
+            Ok(pkts) => concat_packets(pkts, concat_us),
             Err(e) => {
                 // A failed DMA-BUF import is normally a capability mismatch (for
                 // example AVERROR(ENOSYS)), not a transient per-frame error.  Keep
@@ -1198,7 +1238,7 @@ fn encode_streaming_frame(
                     cpu_convert_us,
                     cpu_codec_us,
                 );
-                concat_packets(&packets, concat_us)
+                concat_packets(packets, concat_us)
             }
         }
     } else {
@@ -1214,7 +1254,7 @@ fn encode_streaming_frame(
             cpu_convert_us,
             cpu_codec_us,
         );
-        concat_packets(&packets, concat_us)
+        concat_packets(packets, concat_us)
     };
 
     *encode_us = t.elapsed().as_micros();
@@ -1244,7 +1284,7 @@ fn encode_cpu_streaming_frame(
             timing.cpu_copy_us = cpu.copy_us;
             timing.cpu_convert_us = cpu.convert_us;
             timing.cpu_codec_us = cpu.codec_us;
-            if let Some(data) = concat_packets(&packets, &mut timing.concat_us) {
+            if let Some(data) = concat_packets(packets, &mut timing.concat_us) {
                 timing.encoded_size = data.len();
                 if let Some(bc) = broadcaster {
                     let publish = Instant::now();
@@ -1258,14 +1298,19 @@ fn encode_cpu_streaming_frame(
     timing.encode_us = start.elapsed().as_micros();
 }
 
-fn concat_packets(packets: &[Vec<u8>], concat_us: &mut u128) -> Option<Vec<u8>> {
+fn concat_packets(mut packets: Vec<Vec<u8>>, concat_us: &mut u128) -> Option<Vec<u8>> {
     if packets.is_empty() {
         return None;
+    }
+    // Encoders usually emit one AVPacket per access unit — move it instead
+    // of copying the whole frame into a fresh buffer.
+    if packets.len() == 1 {
+        return Some(packets.pop().unwrap());
     }
     let t = Instant::now();
     let total: usize = packets.iter().map(|p| p.len()).sum();
     let mut buf = Vec::with_capacity(total);
-    for pkt in packets {
+    for pkt in &packets {
         buf.extend_from_slice(pkt);
     }
     *concat_us += t.elapsed().as_micros();
@@ -1531,6 +1576,7 @@ mod tests {
             next_encode_deadline: None,
             backend: Box::new(MockBackend::new(vec![])),
             last_encoded_frame_time: None,
+            last_forced_idr: None,
             frame_drops: 0,
             total_frame_drops: 0,
             trace_ring: Arc::new(TraceRing::new()),

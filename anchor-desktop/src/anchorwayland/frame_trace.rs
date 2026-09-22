@@ -46,9 +46,23 @@ pub fn announce_run() {
     );
 }
 
+/// Emit an opt-in JSON event without paying for it when tracing is off.
+/// The field object is only evaluated when `ANCHOR_SIDEBOAT_TRACE` is set, so
+/// a disabled run costs one branch instead of building a `serde_json::Value`
+/// (with its map and string allocations) on every pipeline transition.
+macro_rules! event {
+    ($kind:expr, $($fields:tt)*) => {
+        if $crate::anchorwayland::frame_trace::enabled() {
+            $crate::anchorwayland::frame_trace::emit($kind, serde_json::json!($($fields)*));
+        }
+    };
+}
+pub(crate) use event;
+
 /// Emit an opt-in JSON event. Callers provide an object containing stage data;
 /// the common run/build/time fields are added here so every event is joinable.
-pub fn event(kind: &str, mut fields: serde_json::Value) {
+/// Prefer the `event!` macro so the value is not built when tracing is off.
+pub fn emit(kind: &str, mut fields: serde_json::Value) {
     if !enabled() {
         return;
     }
@@ -239,7 +253,7 @@ impl TraceRing {
         let mut e = self.entries.lock().unwrap();
         e[Self::slot(frame_id)] =
             FrameTrace { frame_id, t_capture_start_ns: mono_ns(), ..Default::default() };
-        event("capture_start", serde_json::json!({ "source_frame_id": frame_id }));
+        event!("capture_start", { "source_frame_id": frame_id });
     }
 
     /// Mark capture ready (frame mapped / available).
@@ -248,7 +262,7 @@ impl TraceRing {
         let slot = &mut e[Self::slot(frame_id)];
         if slot.frame_id == frame_id {
             slot.t_capture_ready_ns = mono_ns();
-            event("capture_ready", serde_json::json!({ "source_frame_id": frame_id }));
+            event!("capture_ready", { "source_frame_id": frame_id });
         }
     }
 
@@ -257,7 +271,7 @@ impl TraceRing {
         let slot = &mut e[Self::slot(frame_id)];
         if slot.frame_id == frame_id {
             slot.t_encode_start_ns = mono_ns();
-            event("encode_start", serde_json::json!({ "source_frame_id": frame_id }));
+            event!("encode_start", { "source_frame_id": frame_id });
         }
     }
 
@@ -267,9 +281,9 @@ impl TraceRing {
         if slot.frame_id == frame_id {
             slot.t_encode_done_ns = mono_ns();
             slot.encoded_bytes = bytes as u32;
-            event(
+            event!(
                 "encode_done",
-                serde_json::json!({ "source_frame_id": frame_id, "encoded_bytes": bytes }),
+                { "source_frame_id": frame_id, "encoded_bytes": bytes }
             );
         }
     }
@@ -280,7 +294,7 @@ impl TraceRing {
         let slot = &mut e[Self::slot(frame_id)];
         if slot.frame_id == frame_id {
             slot.t_queue_ns = mono_ns();
-            event("capture_loop_done", serde_json::json!({ "source_frame_id": frame_id }));
+            event!("capture_loop_done", { "source_frame_id": frame_id });
         }
     }
 

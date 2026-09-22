@@ -39,17 +39,33 @@ enum ScreenMessage {
 }
 
 #[derive(Clone)]
+enum FrameTarget {
+    Datagram(DatagramFlow),
+    Stream(ReliableFrameStream),
+}
+
+impl FrameTarget {
+    fn flow_id(&self) -> u64 {
+        match self {
+            FrameTarget::Datagram(flow) => flow.flow_id(),
+            FrameTarget::Stream(stream) => stream.stream_id,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SdkScreenSender {
     tx: SyncSender<ScreenMessage>,
-    frame_flow: Arc<Mutex<Option<DatagramFlow>>>,
-    frame_stream: Arc<Mutex<Option<ReliableFrameStream>>>,
+    /// The two transports are mutually exclusive — one lock instead of two
+    /// keeps the per-frame `send_frame` entry cheap.
+    frame_target: Arc<Mutex<Option<FrameTarget>>>,
     keyframe_request: Arc<Mutex<Option<Arc<FrameBroadcaster>>>>,
     last_keyframe_request: Arc<Mutex<Option<Instant>>>,
     /// Reliable H.264 streams cannot safely skip a predictive access unit:
     /// every following P-frame references it. Once the replaceable-frame
     /// queue coalesces anything, hold P-frames until the next IDR arrives.
     /// This keeps the receiver from displaying a stale/broken reference chain.
-    stream_waiting_for_keyframe: Arc<AtomicBool>,
+    waiting_for_keyframe: Arc<AtomicBool>,
     capability_session_id: u64,
     frame_sequence: Arc<AtomicU64>,
     /// Monotonic admission schedule for screen access units.  Quinn paces
@@ -59,6 +75,7 @@ pub struct SdkScreenSender {
     next_frame_at: Arc<Mutex<Instant>>,
     pacing_percent: usize,
     pacing_bps: usize,
+    fec_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -82,6 +99,11 @@ impl SdkScreenSender {
             .clamp(50, 100);
         let pacing_bps =
             configured_bitrate.saturating_mul(pacing_percent).saturating_div(100).max(1);
+        // XOR-parity FEC on the lossy datagram path; ~6% extra datagrams let a
+        // receiver rebuild a singly-lost fragment instead of corrupting the
+        // whole access unit. Old receivers drop parity by kind, so this is
+        // wire-safe — `ANCHOR_FEC=0` disables it for A/B measurement.
+        let fec_enabled = std::env::var("ANCHOR_FEC").map_or(true, |value| value != "0");
         thread::Builder::new()
             .name("anchor-sdk-screen-writer".into())
             .spawn(move || {
@@ -131,16 +153,16 @@ impl SdkScreenSender {
             .expect("SDK screen writer thread must start");
         Self {
             tx,
-            frame_flow: Arc::new(Mutex::new(None)),
-            frame_stream: Arc::new(Mutex::new(None)),
+            frame_target: Arc::new(Mutex::new(None)),
             keyframe_request: Arc::new(Mutex::new(None)),
             last_keyframe_request: Arc::new(Mutex::new(None)),
-            stream_waiting_for_keyframe: Arc::new(AtomicBool::new(false)),
+            waiting_for_keyframe: Arc::new(AtomicBool::new(false)),
             capability_session_id,
             frame_sequence: Arc::new(AtomicU64::new(0)),
             next_frame_at: Arc::new(Mutex::new(Instant::now())),
             pacing_percent,
             pacing_bps,
+            fec_enabled,
         }
     }
 
@@ -155,8 +177,7 @@ impl SdkScreenSender {
     pub fn attach_frame_flow(&self, flow: DatagramFlow) {
         crate::anchorwayland::frame_trace::announce_run();
         log::info!("Sideboat screen transport active: datagram flow={}", flow.flow_id());
-        *self.frame_flow.lock().unwrap() = Some(flow);
-        *self.frame_stream.lock().unwrap() = None;
+        *self.frame_target.lock().unwrap() = Some(FrameTarget::Datagram(flow));
     }
 
     /// Attach the reliable ordered stream used by screen video. The stream is
@@ -170,12 +191,11 @@ impl SdkScreenSender {
     ) {
         crate::anchorwayland::frame_trace::announce_run();
         log::info!("Sideboat screen transport active: reliable QUIC stream={stream_id}");
-        *self.frame_flow.lock().unwrap() = None;
-        *self.frame_stream.lock().unwrap() = Some(ReliableFrameStream {
+        *self.frame_target.lock().unwrap() = Some(FrameTarget::Stream(ReliableFrameStream {
             stream_id,
             handle,
             send: Arc::new(tokio::sync::Mutex::new(send)),
-        });
+        }));
     }
 
     /// Connect transport-level frame drops to the encoder's existing IDR
@@ -206,95 +226,110 @@ impl SdkScreenSender {
         }
     }
 
-    /// Mark a producer-side coalescing gap on the reliable stream. The next
+    /// Mark a producer-side coalescing gap on either transport. The next
     /// access unit must be an IDR before any predictive unit is useful again.
-    pub fn mark_stream_gap(&self) {
-        if self.frame_stream.lock().unwrap().is_some() {
-            self.stream_waiting_for_keyframe.store(true, Ordering::Release);
+    pub fn mark_frame_gap(&self) {
+        if self.frame_target.lock().unwrap().is_some() {
+            self.waiting_for_keyframe.store(true, Ordering::Release);
             self.request_keyframe_recovery();
         }
     }
 
     /// Fragment and send one encoded H.264 access unit.
     pub fn send_frame(&self, frame: &BroadcastFrame) -> bool {
-        let flow = self.frame_flow.lock().unwrap().clone();
-        let stream = self.frame_stream.lock().unwrap().clone();
-        if flow.is_none() && stream.is_none() {
+        let target = self.frame_target.lock().unwrap().clone();
+        let Some(target) = target else {
             return false;
-        }
-        let flow_id = flow
-            .as_ref()
-            .map(DatagramFlow::flow_id)
-            .or_else(|| stream.as_ref().map(|stream| stream.stream_id))
-            .unwrap_or_default();
+        };
+        let flow_id = target.flow_id();
         let sequence = self.frame_sequence.fetch_add(1, Ordering::Relaxed);
         let source_frame_id = frame.source_frame_id;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_micros() as u64)
             .unwrap_or_default();
-        crate::anchorwayland::frame_trace::event(
+        crate::anchorwayland::frame_trace::event!(
             "sender_start",
-            serde_json::json!({
+            {
                 "source_frame_id": source_frame_id,
                 "sender_sequence": sequence,
                 "capability_session_id": self.capability_session_id,
                 "flow_id": flow_id,
                 "presentation_time_us": timestamp,
                 "encoded_bytes": frame.len(),
-                "transport": if stream.is_some() { "reliable_stream" } else { "datagram" },
+                "transport": match target {
+                    FrameTarget::Stream(_) => "reliable_stream",
+                    FrameTarget::Datagram(_) => "datagram",
+                },
                 "broadcaster_age_us": crate::anchorwayland::frame_trace::mono_ns()
                     .saturating_sub(frame.published_ns) / 1_000,
-            }),
+            }
         );
         let flags = if contains_h264_idr(frame) { video_frame::FLAG_KEYFRAME } else { 0 };
         let keyframe = flags & video_frame::FLAG_KEYFRAME != 0;
-        if stream.is_some()
-            && should_drop_stream_predictive_frame(
-                self.stream_waiting_for_keyframe.load(Ordering::Acquire),
-                keyframe,
-            )
+        if should_drop_predictive_frame(self.waiting_for_keyframe.load(Ordering::Acquire), keyframe)
         {
-            // Do not put a P-frame after a coalescing gap on an ordered H.264
-            // stream. It references an access unit that was never delivered.
-            crate::anchorwayland::frame_trace::event(
+            // Do not put a P-frame after a coalescing gap on either
+            // transport. It references an access unit that was never
+            // delivered; on datagrams it would also waste the loss budget.
+            crate::anchorwayland::frame_trace::event!(
                 "sender_outcome",
-                serde_json::json!({
+                {
                     "source_frame_id": source_frame_id,
                     "sender_sequence": sequence,
-                    "transport": "reliable_stream",
+                    "transport": match target {
+                        FrameTarget::Stream(_) => "reliable_stream",
+                        FrameTarget::Datagram(_) => "datagram",
+                    },
                     "outcome": "dropped",
                     "reason": "awaiting_keyframe_after_coalescing",
                     "encoded_bytes": frame.len(),
-                }),
+                }
             );
             return false;
         }
         if keyframe {
-            self.stream_waiting_for_keyframe.store(false, Ordering::Release);
+            self.waiting_for_keyframe.store(false, Ordering::Release);
         }
-        let packets = match video_frame::fragment_frame_with_flags(
-            video_frame::FRAME_KIND_SCREEN,
-            flags,
-            self.capability_session_id,
-            flow_id,
-            sequence,
-            timestamp,
-            0,
-            frame,
-        ) {
+        let fragment_result = if self.fec_enabled && matches!(target, FrameTarget::Datagram(_)) {
+            // Datagrams are lossy — append XOR parity so receivers can rebuild
+            // a singly-lost fragment instead of corrupting the whole access
+            // unit and stalling until the next keyframe.
+            video_frame::fragment_frame_with_parity(
+                video_frame::FRAME_KIND_SCREEN,
+                flags,
+                self.capability_session_id,
+                flow_id,
+                sequence,
+                timestamp,
+                0,
+                frame,
+            )
+        } else {
+            video_frame::fragment_frame_with_flags(
+                video_frame::FRAME_KIND_SCREEN,
+                flags,
+                self.capability_session_id,
+                flow_id,
+                sequence,
+                timestamp,
+                0,
+                frame,
+            )
+        };
+        let packets = match fragment_result {
             Ok(packets) => packets,
             Err(error) => {
                 log::warn!("SDK screen frame rejected: {error}");
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "sender_outcome",
-                    serde_json::json!({
+                    {
                         "source_frame_id": source_frame_id,
                         "sender_sequence": sequence,
                         "outcome": "rejected",
                         "reason": error.to_string(),
                         "encoded_bytes": frame.len(),
-                    }),
+                    }
                 );
                 return false;
             }
@@ -309,7 +344,7 @@ impl SdkScreenSender {
                 h264_nal_types(frame),
             );
         }
-        let pacing_wait_us = if flow.is_some() {
+        let pacing_wait_us = if matches!(target, FrameTarget::Datagram(_)) {
             let pacing_started = Instant::now();
             let wire_bytes =
                 packets.iter().map(|packet| packet.len().saturating_add(32)).sum::<usize>();
@@ -320,11 +355,36 @@ impl SdkScreenSender {
             if *next < now {
                 *next = now;
             }
-            let wait = *next - now;
+            // The subscription queue behind this thread holds ~2 frames
+            // (~33ms at 60fps). A wait beyond that — e.g. the ~80ms a
+            // 350KB recovery IDR accrues at a bitrate-matched pacing rate —
+            // fills the queue mid-sleep: publisher drops a fresh access
+            // unit, which forces another IDR, which accrues more debt.
+            // Bound the wait so smoothing can never starve the drain;
+            // sustained overflow is guarded by the send-buffer admission
+            // check below, not by sleeping here.
+            const MAX_PACING_WAIT: Duration = Duration::from_millis(8);
+            let wait = next.saturating_duration_since(now).min(MAX_PACING_WAIT);
             if !wait.is_zero() {
-                thread::sleep(wait);
+                // nanosleep overshoots by tens of microseconds on Linux;
+                // sleep the bulk, then spin the tail so datagrams leave the
+                // queue on schedule instead of a scheduler tick late.
+                const SPIN_TAIL: Duration = Duration::from_micros(250);
+                if wait > SPIN_TAIL {
+                    thread::sleep(wait - SPIN_TAIL);
+                }
+                let deadline = now + wait;
+                while Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
             }
-            *next = next.checked_add(pacing_duration).unwrap_or_else(Instant::now);
+            // Debt beyond the cap is discarded — the schedule stays within
+            // MAX_PACING_WAIT of now instead of stalling the drain while a
+            // large frame's budget amortizes.
+            *next = next
+                .checked_add(pacing_duration)
+                .map(|t| t.min(Instant::now() + MAX_PACING_WAIT))
+                .unwrap_or_else(Instant::now);
             pacing_started.elapsed().as_micros()
         } else {
             0
@@ -335,26 +395,24 @@ impl SdkScreenSender {
         // mode writes the same packets sequentially and relies on QUIC flow
         // control for backpressure.
         let admission_started = Instant::now();
-        let delivered = if let Some(stream) = stream {
-            let mut bytes = Vec::new();
-            for packet in &packets {
-                match video_frame::encode_stream_packet(packet) {
-                    Ok(framed) => bytes.extend_from_slice(&framed),
-                    Err(error) => {
-                        log::warn!("SDK screen stream frame rejected: {error}");
-                        return false;
-                    }
+        let delivered = if let FrameTarget::Stream(stream) = &target {
+            let mut chunks = match video_frame::stream_chunks(&packets) {
+                Ok(chunks) => chunks,
+                Err(error) => {
+                    log::warn!("SDK screen stream frame rejected: {error}");
+                    return false;
                 }
-            }
+            };
+            let wire_bytes = chunks.iter().map(Bytes::len).sum::<usize>();
             let stream_started = Instant::now();
             let result = stream.handle.block_on(async {
                 let mut send = stream.send.lock().await;
-                send.write_all(&bytes).await
+                send.write_all_chunks(&mut chunks).await
             });
             let stream_send_us = stream_started.elapsed().as_micros();
             if let Err(error) = result {
                 if should_schedule_keyframe_recovery(keyframe) {
-                    self.stream_waiting_for_keyframe.store(true, Ordering::Release);
+                    self.waiting_for_keyframe.store(true, Ordering::Release);
                     self.request_keyframe_recovery();
                 }
                 log::warn!(
@@ -383,28 +441,30 @@ impl SdkScreenSender {
                         "SDK screen reliable stream backpressure: stream={} write_us={} bytes={}",
                         stream.stream_id,
                         stream_send_us,
-                        bytes.len()
+                        wire_bytes
                     );
                 }
-                crate::anchorwayland::frame_trace::event(
+                crate::anchorwayland::frame_trace::event!(
                     "sender_outcome",
-                    serde_json::json!({
+                    {
                         "source_frame_id": source_frame_id,
                         "sender_sequence": sequence,
                         "transport": "reliable_stream",
                         "outcome": "accepted",
                         "encoded_bytes": frame.len(),
-                        "wire_bytes": bytes.len(),
+                        "wire_bytes": wire_bytes,
                         "fragments": packet_count,
                         "keyframe": keyframe,
                         "send_us": stream_send_us,
-                    }),
+                    }
                 );
                 true
             }
         } else {
-            let flow = flow.as_ref().expect("datagram flow checked above");
-            match flow.send_many(packets.into_iter().map(Bytes::from)) {
+            let FrameTarget::Datagram(flow) = &target else {
+                unreachable!("target is Datagram or Stream")
+            };
+            match flow.send_many(packets) {
                 Ok(()) => true,
                 Err(error) => {
                     let admission_us = admission_started.elapsed().as_micros();
@@ -443,9 +503,9 @@ impl SdkScreenSender {
                         available,
                         required,
                     );
-                    crate::anchorwayland::frame_trace::event(
+                    crate::anchorwayland::frame_trace::event!(
                         "sender_outcome",
-                        serde_json::json!({
+                        {
                             "source_frame_id": source_frame_id,
                             "sender_sequence": sequence,
                             "transport": "datagram",
@@ -454,7 +514,7 @@ impl SdkScreenSender {
                             "encoded_bytes": frame.len(),
                             "fragments": packet_count,
                             "keyframe": keyframe,
-                        }),
+                        }
                     );
                     false
                 }
@@ -463,7 +523,7 @@ impl SdkScreenSender {
         let admission_us = admission_started.elapsed().as_micros();
         if delivered
             && sampled
-            && let Some(flow) = flow
+            && let FrameTarget::Datagram(flow) = &target
         {
             let stats = flow.transport_stats();
             log::info!(
@@ -482,9 +542,9 @@ impl SdkScreenSender {
                 stats.lost_packets,
                 stats.congestion_events,
             );
-            crate::anchorwayland::frame_trace::event(
+            crate::anchorwayland::frame_trace::event!(
                 "sender_outcome",
-                serde_json::json!({
+                {
                     "source_frame_id": source_frame_id,
                     "sender_sequence": sequence,
                     "transport": "datagram",
@@ -494,7 +554,7 @@ impl SdkScreenSender {
                     "keyframe": keyframe,
                     "pacing_wait_us": pacing_wait_us,
                     "admission_us": admission_us,
-                }),
+                }
             );
         }
         delivered
@@ -505,7 +565,7 @@ fn should_schedule_keyframe_recovery(keyframe: bool) -> bool {
     !keyframe
 }
 
-fn should_drop_stream_predictive_frame(waiting_for_keyframe: bool, keyframe: bool) -> bool {
+fn should_drop_predictive_frame(waiting_for_keyframe: bool, keyframe: bool) -> bool {
     waiting_for_keyframe && !keyframe
 }
 
@@ -578,17 +638,16 @@ fn contains_annex_b_idr(data: &[u8]) -> bool {
 }
 
 fn find_annex_b_start(data: &[u8], from: usize) -> Option<usize> {
-    let mut index = from;
-    while index + 3 <= data.len() {
-        if data[index..].starts_with(&[0, 0, 1]) {
-            return Some(index);
-        }
-        if index + 4 <= data.len() && data[index..].starts_with(&[0, 0, 0, 1]) {
-            return Some(index);
-        }
-        index += 1;
+    // Search for the 3-byte start code with a SIMD substring scan. The
+    // 4-byte form `00 00 00 01` contains `00 00 01` at offset +1, so a hit
+    // preceded by another zero belongs to a 4-byte code. H.264 emulation
+    // prevention guarantees `00 00 01` cannot appear inside a NAL payload,
+    // so every hit is a genuine start code.
+    let offset = memchr::memmem::find(data.get(from..)?, &[0, 0, 1])? + from;
+    if offset > from && data[offset - 1] == 0 {
+        return Some(offset - 1);
     }
-    None
+    Some(offset)
 }
 
 fn contains_length_prefixed_idr(data: &[u8]) -> bool {
@@ -723,15 +782,23 @@ impl SdkScreenBinding {
                         frame = newer;
                         coalesced = true;
                     }
+                    // Queue is empty now — the capture loop may resume
+                    // encoding if it was holding off for backpressure.
+                    broadcaster.clear_backpressure();
                     if coalesced {
-                        crate::anchorwayland::frame_trace::event(
+                        crate::anchorwayland::frame_trace::event!(
                             "broadcaster_coalesce",
-                            serde_json::json!({
+                            {
                                 "source_frame_id": frame.source_frame_id,
                                 "transport": "datagram",
                                 "reason": "replaceable_queue_newer_frame",
-                            }),
+                            }
                         );
+                        // Coalesced access units are real losses for the
+                        // decoder: this frame's P-slices reference AUs that
+                        // were never sent. Suppress predictive frames until
+                        // one recovery IDR heals the chain.
+                        sender.mark_frame_gap();
                     }
                     if !sender.send_frame(&frame) {
                         log::debug!("SDK screen frame dropped for {device_id}");
@@ -773,21 +840,22 @@ impl SdkScreenBinding {
                         frame = newer;
                         coalesced = true;
                     }
+                    broadcaster.clear_backpressure();
                     // This is an ordered, reliable QUIC stream. A sequence
                     // gap is intentional producer-side coalescing, not
                     // transport loss. It still breaks H.264's predictive
                     // reference chain, so hold P-frames until one requested
                     // recovery IDR is available.
                     if coalesced {
-                        crate::anchorwayland::frame_trace::event(
+                        crate::anchorwayland::frame_trace::event!(
                             "broadcaster_coalesce",
-                            serde_json::json!({
+                            {
                                 "source_frame_id": frame.source_frame_id,
                                 "transport": "reliable_stream",
                                 "reason": "replaceable_queue_newer_frame",
-                            }),
+                            }
                         );
-                        sender.mark_stream_gap();
+                        sender.mark_frame_gap();
                     }
                     if !sender.send_frame(&frame) {
                         log::debug!("SDK screen reliable-stream frame dropped for {device_id}");
@@ -878,8 +946,8 @@ mod tests {
 
     #[test]
     fn reliable_stream_holds_predictive_frames_after_a_gap() {
-        assert!(should_drop_stream_predictive_frame(true, false));
-        assert!(!should_drop_stream_predictive_frame(true, true));
-        assert!(!should_drop_stream_predictive_frame(false, false));
+        assert!(should_drop_predictive_frame(true, false));
+        assert!(!should_drop_predictive_frame(true, true));
+        assert!(!should_drop_predictive_frame(false, false));
     }
 }
