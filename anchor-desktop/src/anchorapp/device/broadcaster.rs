@@ -33,6 +33,12 @@ pub struct FrameBroadcaster {
     traced_senders: Mutex<HashMap<String, SyncSender<Arc<BroadcastFrame>>>>,
     /// Set by a transport when a receiver needs an IDR.
     pub needs_keyframe: AtomicBool,
+    /// Set when the last publish had to drop on a full subscriber queue,
+    /// cleared by drain threads once the queue empties. The capture loop
+    /// reads this to skip ENCODING while downstream is saturated — a frame
+    /// the encoder never saw cannot break the decoder's reference chain,
+    /// so skipping costs a frame of framerate instead of a recovery IDR.
+    congested: AtomicBool,
 }
 
 impl Default for FrameBroadcaster {
@@ -47,6 +53,7 @@ impl FrameBroadcaster {
             senders: Mutex::new(HashMap::new()),
             traced_senders: Mutex::new(HashMap::new()),
             needs_keyframe: AtomicBool::new(false),
+            congested: AtomicBool::new(false),
         }
     }
 
@@ -73,19 +80,22 @@ impl FrameBroadcaster {
     pub fn unsubscribe(&self, device_id: &str) {
         self.senders.lock().unwrap().remove(device_id);
         self.traced_senders.lock().unwrap().remove(device_id);
+        // A departed drain thread can no longer clear congestion itself.
+        self.congested.store(false, Ordering::Relaxed);
     }
 
-    /// Returns true if any subscriber's channel is full (encoder should skip this frame).
+    /// True while the last publish dropped on a full subscriber queue. The
+    /// capture loop should skip encoding rather than produce an access unit
+    /// that will be dropped post-encode (which would force a recovery IDR).
     pub fn has_backpressure(&self) -> bool {
-        let senders = self.senders.lock().unwrap();
-        // No subscribers = no backpressure
-        if senders.is_empty() {
-            return false;
-        }
-        // Check if any channel has zero capacity remaining
-        // SyncSender doesn't expose capacity, so we just check if a zero-size try would fail
-        // by looking at the last publish result via needs_keyframe flag
-        false // Conservative: don't skip frames, let publish handle drops
+        self.congested.load(Ordering::Relaxed)
+    }
+
+    /// Called by a drain thread after it empties its subscription queue —
+    /// the next publish has room again, so the capture loop may resume
+    /// encoding. Also safe to call on unsubscribe/teardown.
+    pub fn clear_backpressure(&self) {
+        self.congested.store(false, Ordering::Relaxed);
     }
 
     /// Called by Wayland encoder every frame. Sends Arc<frame> to all subscribers.
@@ -178,6 +188,7 @@ impl FrameBroadcaster {
         // reaches their transport recovery, so the encoder must emit an IDR.
         if !all_delivered {
             self.needs_keyframe.store(true, Ordering::Relaxed);
+            self.congested.store(true, Ordering::Relaxed);
         }
         all_delivered
     }

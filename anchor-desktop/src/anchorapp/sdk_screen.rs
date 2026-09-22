@@ -355,8 +355,16 @@ impl SdkScreenSender {
             if *next < now {
                 *next = now;
             }
-            let deadline = *next;
-            let wait = deadline - now;
+            // The subscription queue behind this thread holds ~2 frames
+            // (~33ms at 60fps). A wait beyond that — e.g. the ~80ms a
+            // 350KB recovery IDR accrues at a bitrate-matched pacing rate —
+            // fills the queue mid-sleep: publisher drops a fresh access
+            // unit, which forces another IDR, which accrues more debt.
+            // Bound the wait so smoothing can never starve the drain;
+            // sustained overflow is guarded by the send-buffer admission
+            // check below, not by sleeping here.
+            const MAX_PACING_WAIT: Duration = Duration::from_millis(8);
+            let wait = next.saturating_duration_since(now).min(MAX_PACING_WAIT);
             if !wait.is_zero() {
                 // nanosleep overshoots by tens of microseconds on Linux;
                 // sleep the bulk, then spin the tail so datagrams leave the
@@ -365,11 +373,18 @@ impl SdkScreenSender {
                 if wait > SPIN_TAIL {
                     thread::sleep(wait - SPIN_TAIL);
                 }
+                let deadline = now + wait;
                 while Instant::now() < deadline {
                     std::hint::spin_loop();
                 }
             }
-            *next = next.checked_add(pacing_duration).unwrap_or_else(Instant::now);
+            // Debt beyond the cap is discarded — the schedule stays within
+            // MAX_PACING_WAIT of now instead of stalling the drain while a
+            // large frame's budget amortizes.
+            *next = next
+                .checked_add(pacing_duration)
+                .map(|t| t.min(Instant::now() + MAX_PACING_WAIT))
+                .unwrap_or_else(Instant::now);
             pacing_started.elapsed().as_micros()
         } else {
             0
@@ -767,6 +782,9 @@ impl SdkScreenBinding {
                         frame = newer;
                         coalesced = true;
                     }
+                    // Queue is empty now — the capture loop may resume
+                    // encoding if it was holding off for backpressure.
+                    broadcaster.clear_backpressure();
                     if coalesced {
                         crate::anchorwayland::frame_trace::event!(
                             "broadcaster_coalesce",
@@ -822,6 +840,7 @@ impl SdkScreenBinding {
                         frame = newer;
                         coalesced = true;
                     }
+                    broadcaster.clear_backpressure();
                     // This is an ordered, reliable QUIC stream. A sequence
                     // gap is intentional producer-side coalescing, not
                     // transport loss. It still breaks H.264's predictive
