@@ -95,10 +95,6 @@ jobs:
           cache: pnpm
           cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
 
-      - name: Install frontend dependencies
-        working-directory: anchor-desktop/frontend
-        run: pnpm install --frozen-lockfile
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -114,122 +110,15 @@ jobs:
       - name: Install BLAS/LAPACK for linking
         run: sudo apt-get install -y libblas3 liblapack3
 
-      - name: Build frontend assets
-        working-directory: anchor-desktop/frontend
-        run: pnpm run build
-
-      - name: Build Tauri release binary
-        working-directory: anchor-desktop
-        run: cargo build --release --locked --bin anchor
-
-      - name: Cache AppImage tool
-        id: appimage-tools-cache
-        uses: actions/cache@v4
-        with:
-          path: /tmp/appimage-tools
-          key: appimage-tools-appimagetool-continuous-${{ matrix.arch }}
-
-      - name: Download appimagetool
-        if: steps.appimage-tools-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p /tmp/appimage-tools
-          curl -sL "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage" -o /tmp/appimage-tools/appimagetool
-
-      - name: Ensure AppImage tool is executable
-        run: chmod +x /tmp/appimage-tools/appimagetool
-
-      - name: Prepare AppDir
-        run: |
-          APPDIR=anchor-desktop/target/appimage/AppDir
-          mkdir -p $APPDIR/usr/{bin,lib,share/icons/hicolor/256x256/apps,share/applications}
-
-          # Copy binary
-          cp anchor-desktop/target/release/anchor $APPDIR/usr/bin/anchor
-
-          # FFmpeg is static, but its GPL H.264 encoder is the system libx264.
-          # Bundle the exact SONAME used at link time so an image built on
-          # Ubuntu also runs on rolling distributions with a newer x264 ABI.
-          X264_PATH=$(ldd $APPDIR/usr/bin/anchor | awk '$1 ~ /^libx264\.so/ { print $3; exit }')
-          test -n "$X264_PATH"
-          cp -L "$X264_PATH" $APPDIR/usr/lib/"$(basename "$X264_PATH")"
-
-          # Bundle adb and its non-glibc dependency closure separately. Keeping
-          # these libraries out of AppRun's global LD_LIBRARY_PATH prevents the
-          # Ubuntu ADB stack from leaking into Anchor's host GTK/WebKit process.
-          mkdir -p $APPDIR/usr/lib/adb
-          cp "$(command -v adb)" $APPDIR/usr/bin/adb.real
-          ldd $APPDIR/usr/bin/adb.real | awk '/=> \// { print $3 }' | while read -r lib; do
-            case "$(basename "$lib")" in
-              libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*) ;;
-              *) cp -Ln "$lib" $APPDIR/usr/lib/adb/ ;;
-            esac
-          done
-          cat > $APPDIR/usr/bin/adb << 'ADB_RUN'
-          #!/usr/bin/env bash
-          HERE="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-          export LD_LIBRARY_PATH="$HERE/../lib/adb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          exec "$HERE/adb.real" "$@"
-          ADB_RUN
-          chmod +x $APPDIR/usr/bin/adb
-          $APPDIR/usr/bin/adb version
-
-          # Desktop entry
-          cat > $APPDIR/usr/share/applications/anchor.desktop << 'DESKTOP'
-          [Desktop Entry]
-          Type=Application
-          Name=Anchor
-          Comment=Phone companion - screen mirroring, SMS, notifications, media control
-          Exec=anchor
-          Icon=anchor
-          StartupWMClass=com.anchor.desktop
-          Categories=Utility;
-          Terminal=false
-          DESKTOP
-
-          # Icon (resize to 256x256)
-          if command -v convert &>/dev/null; then
-            convert assets/anchor_logo_transparent.png -resize 256x256 $APPDIR/usr/share/icons/hicolor/256x256/apps/anchor.png
-          else
-            # Fallback: just copy, hope it's already 256x256
-            cp assets/anchor_logo_transparent.png $APPDIR/usr/share/icons/hicolor/256x256/apps/anchor.png
-          fi
-
-          # Symlinks and launcher at AppDir root. Tauri must use the host
-          # GTK/WebKit stack: copying it into AppDir creates an unsafe hybrid
-          # process with host extensions and can crash inside ld.so.
-          ln -sf usr/share/applications/anchor.desktop $APPDIR/anchor.desktop
-          ln -sf usr/share/icons/hicolor/256x256/apps/anchor.png $APPDIR/anchor.png
-          cat > $APPDIR/AppRun << 'APP_RUN'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          APPDIR="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-
-          # Register the embedded desktop entry for direct AppImage launches.
-          if [[ -n "${APPIMAGE:-}" ]]; then
-            XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-            DESKTOP_DIR="$XDG_DATA_HOME/applications"
-            ICON_DIR="$XDG_DATA_HOME/icons/hicolor/256x256/apps"
-            mkdir -p "$DESKTOP_DIR" "$ICON_DIR"
-            awk -v appimage="$APPIMAGE" '$0 == "Exec=anchor" { print "Exec=\"" appimage "\""; next } { print }' \
-              "$APPDIR/usr/share/applications/anchor.desktop" > "$DESKTOP_DIR/com.anchor.desktop.desktop"
-            cp "$APPDIR/usr/share/icons/hicolor/256x256/apps/anchor.png" "$ICON_DIR/anchor.png"
-          fi
-
-          export PATH="$APPDIR/usr/bin${PATH:+:$PATH}"
-          export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          exec "$APPDIR/usr/bin/anchor" "$@"
-          APP_RUN
-          chmod +x $APPDIR/AppRun
-
-          # Prove the packaged binary resolves x264 from AppDir, not the host.
-          LD_LIBRARY_PATH="$PWD/$APPDIR/usr/lib" ldd $APPDIR/usr/bin/anchor | grep "libx264.*$PWD/$APPDIR/usr/lib"
-
-      - name: Package AppDir with appimagetool
+      # Single source of truth: this script is also what `build-image` runs
+      # locally inside the Ubuntu 22.04 builder container. It builds the
+      # frontend + release binary, assembles AppDir, and packages with a
+      # pinned, sha256-verified appimagetool.
+      - name: Build and package AppImage
         env:
           ARCH: ${{ matrix.arch }}
-        run: |
-          cd anchor-desktop/target/appimage
-          /tmp/appimage-tools/appimagetool AppDir
+        working-directory: .
+        run: bash scripts/ci/appimage.sh
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4

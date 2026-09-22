@@ -217,4 +217,30 @@ cd "$APPIMAGE_DIR"
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$APPIMAGETOOL" \
     AppDir "Anchor-$ARCH.AppImage"
 
-echo "==> Done: $(ls -lh "Anchor-$ARCH.AppImage")"
+# Verify the image actually works: extract it (no FUSE needed), confirm the
+# packaged binary resolves every library with the bundled lib dir on the path,
+# and prove the bundled adb runs using only its private lib closure.
+echo "==> Verifying AppImage contents..."
+VERIFY_DIR="$APPIMAGE_DIR/verify"
+rm -rf "$VERIFY_DIR"
+mkdir -p "$VERIFY_DIR"
+(cd "$VERIFY_DIR" && APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE_DIR/Anchor-$ARCH.AppImage" --appimage-extract >/dev/null)
+SQFS="$VERIFY_DIR/squashfs-root"
+
+for required in "$SQFS/AppRun" "$SQFS/usr/bin/anchor" "$SQFS/usr/bin/adb" \
+    "$SQFS/usr/share/applications/anchor.desktop" \
+    "$SQFS/usr/share/icons/hicolor/256x256/apps/anchor.png"; do
+    if [ ! -e "$required" ]; then
+        echo "AppImage verification failed: missing $required" >&2
+        exit 1
+    fi
+done
+
+if LD_LIBRARY_PATH="$SQFS/usr/lib" ldd "$SQFS/usr/bin/anchor" | grep "not found"; then
+    echo "AppImage verification failed: anchor has unresolved libraries" >&2
+    exit 1
+fi
+"$SQFS/usr/bin/adb" version >/dev/null
+
+rm -rf "$VERIFY_DIR"
+echo "==> Done: $(ls -lh "Anchor-$ARCH.AppImage") (verified: extracts cleanly, all libraries resolve, bundled adb runs)"

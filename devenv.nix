@@ -79,6 +79,11 @@
     exec ./gradlew :anchorSdk:testDebugUnitTest --no-daemon "$@"
   '';
 
+  # Run a CI job exactly as GitHub runs it (scripts/ci.sh job list).
+  scripts.ci.exec = ''
+    exec "$DEVENV_ROOT/scripts/ci.sh" "$@"
+  '';
+
   scripts.android-install.exec = ''
     set -euo pipefail
     cd "$DEVENV_ROOT/anchor"

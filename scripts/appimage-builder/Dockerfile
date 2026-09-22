@@ -45,6 +45,7 @@ RUN apt-get update \
         nasm \
         perl \
         pkg-config \
+        protobuf-compiler \
         xz-utils \
         yasm \
     && rm -rf /var/lib/apt/lists/*
