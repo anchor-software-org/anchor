@@ -94,8 +94,17 @@ impl AnchorListener {
             .ok();
         let server_config = quinn_transport::server_config(config.identity.server_config()?)
             .map_err(|_| ListenerError::TransportConfiguration)?;
-        let endpoint = quinn::Endpoint::server(server_config, config.bind_address)
-            .map_err(ListenerError::Bind)?;
+        let socket =
+            quinn_transport::bind_udp_socket(config.bind_address).map_err(ListenerError::Bind)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| ListenerError::Bind(std::io::Error::other("no async runtime")))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .map_err(ListenerError::Bind)?;
         Ok(Self {
             endpoint,
             session_identity: config.session_identity,

@@ -231,7 +231,7 @@ mod tests {
         type Error = ();
 
         fn save(&mut self, _: &PairedPeer) -> Result<(), Self::Error> {
-            self.0.clone()
+            self.0
         }
     }
 

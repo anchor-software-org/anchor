@@ -28,9 +28,14 @@ pub fn advertisement() -> CapabilityAdvertisement {
             STATUS_TYPE_URL.into(),
             FRAME_TYPE_URL.into(),
         ],
-        // Screen video is ordered/reliable; datagrams remain available only
-        // to capabilities whose payload is explicitly transient.
-        supports_datagrams: false,
+        // Screen video rides lossy datagrams: parity rebuilds singly-lost
+        // fragments, and skipping head-of-line blocking saves ~1 RTT per
+        // dropped packet. Reference-chain integrity on this path is enforced
+        // by mark_frame_gap (any dropped/coalesced AU suppresses P-frames
+        // until an IDR). ANCHOR_SCREEN_DATAGRAMS=0 forces the reliable stream
+        // as a debug escape hatch.
+        supports_datagrams: std::env::var("ANCHOR_SCREEN_DATAGRAMS")
+            .map_or(true, |value| value != "0"),
     }
 }
 pub fn endpoint_advertisement() -> EndpointAdvertisement {

@@ -6,12 +6,33 @@
 //! records can be carried in QUIC datagrams or in the length-prefixed reliable
 //! stream framing below.
 
+use rustc_hash::FxHashMap;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
 use thiserror::Error;
 
 pub const FRAME_MAGIC: [u8; 4] = *b"ANFR";
 pub const FRAME_VERSION: u8 = 1;
+/// Wire version stamped on parity datagrams. It tags the grouping scheme —
+/// v1 parity used contiguous 16-fragment groups, v2 interleaves members —
+/// so receivers can apply the matching math or safely drop what they do not
+/// understand. Data fragments stay on version 1; only parity moves.
+pub const PARITY_WIRE_VERSION: u8 = 2;
 pub const FRAME_KIND_SCREEN: u8 = 1;
 pub const FRAME_KIND_CAMERA: u8 = 2;
+/// XOR-parity redundancy record covering one group of data fragments of the
+/// same access unit. `flags` carries the XOR of the covered fragment payload
+/// lengths so a missing fragment's exact length is recoverable; the
+/// `fragment_index` field carries the parity group index and
+/// `fragment_count` the access unit's real fragment count. Receivers that
+/// predate this kind drop it after decode, so senders can always emit parity
+/// without a capability negotiation.
+pub const FRAME_KIND_PARITY: u8 = 3;
+/// Number of consecutive data fragments covered by one parity datagram.
+/// Single-parity XOR recovers at most one lost fragment per group, which
+/// matches the dominant real-world loss pattern on lightly congested links.
+pub const PARITY_GROUP_FRAGMENTS: usize = 16;
 pub const FLAG_KEYFRAME: u16 = 1;
 pub const FLAG_CODEC_CONFIG: u16 = 1 << 1;
 pub const FRAME_HEADER_BYTES: usize = 52;
@@ -68,19 +89,30 @@ impl FrameHeader {
             return Err(FrameError::TooLarge(FRAME_PAYLOAD_BYTES));
         }
         let mut bytes = Vec::with_capacity(FRAME_HEADER_BYTES + payload.len());
-        bytes.extend_from_slice(&FRAME_MAGIC);
-        bytes.push(FRAME_VERSION);
-        bytes.push(self.kind);
-        bytes.extend_from_slice(&self.flags.to_le_bytes());
-        bytes.extend_from_slice(&self.capability_session_id.to_le_bytes());
-        bytes.extend_from_slice(&self.flow_id.to_le_bytes());
-        bytes.extend_from_slice(&self.sequence.to_le_bytes());
-        bytes.extend_from_slice(&self.fragment_index.to_le_bytes());
-        bytes.extend_from_slice(&self.fragment_count.to_le_bytes());
-        bytes.extend_from_slice(&self.presentation_time_us.to_le_bytes());
-        bytes.extend_from_slice(&self.codec_config_id.to_le_bytes());
-        bytes.extend_from_slice(payload);
+        self.write(&mut bytes, payload);
         Ok(bytes)
+    }
+
+    /// Appends the encoded header and payload to `out`. The header fields are
+    /// validated by the caller once per access unit, so this stays on the
+    /// fragmentation fast path.
+    fn write(self, out: &mut Vec<u8>, payload: &[u8]) {
+        // Fixed-size stack layout: the compiler turns these into plain
+        // stores and the whole header lands in `out` with one memcpy.
+        let mut header = [0_u8; FRAME_HEADER_BYTES];
+        header[..4].copy_from_slice(&FRAME_MAGIC);
+        header[4] = FRAME_VERSION;
+        header[5] = self.kind;
+        header[6..8].copy_from_slice(&self.flags.to_le_bytes());
+        header[8..16].copy_from_slice(&self.capability_session_id.to_le_bytes());
+        header[16..24].copy_from_slice(&self.flow_id.to_le_bytes());
+        header[24..32].copy_from_slice(&self.sequence.to_le_bytes());
+        header[32..34].copy_from_slice(&self.fragment_index.to_le_bytes());
+        header[34..36].copy_from_slice(&self.fragment_count.to_le_bytes());
+        header[36..44].copy_from_slice(&self.presentation_time_us.to_le_bytes());
+        header[44..52].copy_from_slice(&self.codec_config_id.to_le_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(payload);
     }
 
     pub fn decode(datagram: &[u8]) -> Result<(Self, &[u8]), FrameError> {
@@ -93,11 +125,14 @@ impl FrameHeader {
         if datagram[..4] != FRAME_MAGIC {
             return Err(FrameError::InvalidMagic);
         }
-        if datagram[4] != FRAME_VERSION {
+        if !matches!(datagram[4], 1 | 2) {
             return Err(FrameError::UnsupportedVersion(datagram[4]));
         }
         let kind = datagram[5];
-        if !matches!(kind, FRAME_KIND_SCREEN | FRAME_KIND_CAMERA) {
+        if !matches!(
+            kind,
+            FRAME_KIND_SCREEN | FRAME_KIND_CAMERA | FRAME_KIND_PARITY
+        ) {
             return Err(FrameError::InvalidKind(kind));
         }
         let flags = u16::from_le_bytes([datagram[6], datagram[7]]);
@@ -129,6 +164,9 @@ impl FrameHeader {
 }
 
 /// Split one encoded access unit into bounded QUIC datagrams.
+///
+/// Every fragment is a zero-copy slice of one arena allocation, so the whole
+/// access unit costs a single buffer plus `count` cheap `Bytes` handles.
 pub fn fragment_frame(
     kind: u8,
     capability_session_id: u64,
@@ -137,7 +175,7 @@ pub fn fragment_frame(
     presentation_time_us: u64,
     codec_config_id: u64,
     frame: &[u8],
-) -> Result<Vec<Vec<u8>>, FrameError> {
+) -> Result<Vec<Bytes>, FrameError> {
     fragment_frame_with_flags(
         kind,
         0,
@@ -164,7 +202,10 @@ pub fn fragment_frame_with_flags(
     presentation_time_us: u64,
     codec_config_id: u64,
     frame: &[u8],
-) -> Result<Vec<Vec<u8>>, FrameError> {
+) -> Result<Vec<Bytes>, FrameError> {
+    if !matches!(kind, FRAME_KIND_SCREEN | FRAME_KIND_CAMERA) {
+        return Err(FrameError::InvalidKind(kind));
+    }
     if frame.is_empty() {
         return Err(FrameError::Truncated);
     }
@@ -178,24 +219,114 @@ pub fn fragment_frame_with_flags(
         ));
     }
     let count = count as u16;
-    frame
-        .chunks(FRAME_PAYLOAD_BYTES)
-        .enumerate()
-        .map(|(index, payload)| {
-            FrameHeader {
-                kind,
-                flags,
-                capability_session_id,
-                flow_id,
-                sequence,
-                fragment_index: index as u16,
-                fragment_count: count,
-                presentation_time_us,
-                codec_config_id,
+    // Pack every fragment into a single arena, then hand out zero-copy slice
+    // handles. Quinn keeps each `Bytes` alive until the datagram is flushed,
+    // so the arena is freed only after the last fragment leaves the queue.
+    let mut arena = Vec::with_capacity(frame.len() + usize::from(count) * FRAME_HEADER_BYTES);
+    let mut packets = Vec::with_capacity(usize::from(count));
+    for (index, payload) in frame.chunks(FRAME_PAYLOAD_BYTES).enumerate() {
+        let start = arena.len();
+        FrameHeader {
+            kind,
+            flags,
+            capability_session_id,
+            flow_id,
+            sequence,
+            fragment_index: index as u16,
+            fragment_count: count,
+            presentation_time_us,
+            codec_config_id,
+        }
+        .write(&mut arena, payload);
+        packets.push((start, arena.len()));
+    }
+    let arena = Bytes::from(arena);
+    Ok(packets
+        .into_iter()
+        .map(|(start, end)| arena.slice(start..end))
+        .collect())
+}
+
+/// Split one encoded access unit into datagrams plus XOR-parity redundancy.
+///
+/// Emits `ceil(count / PARITY_GROUP_FRAGMENTS)` parity datagrams whose
+/// payloads are the bytewise XOR of each group's fragments, zero-padded to
+/// `FRAME_PAYLOAD_BYTES`. Groups are interleaved — group `g` covers fragment
+/// indices `g, g + num_groups, g + 2·num_groups, …` — so a burst of up to
+/// `num_groups − 1` consecutive losses lands in distinct groups and every
+/// loss stays single-XOR recoverable. The parity header's `flags` field
+/// carries the XOR of the covered payload lengths so the one missing
+/// fragment in a group can be reconstructed byte-exact, including its real
+/// length. Parity datagrams are emitted after the data burst so they do not
+/// interleave with media delivery. They cost roughly 1/16 of media bandwidth
+/// on the lossy datagram path and are meaningless on reliable streams, so
+/// callers should use this only where datagrams may be dropped.
+#[allow(clippy::too_many_arguments)]
+pub fn fragment_frame_with_parity(
+    kind: u8,
+    flags: u16,
+    capability_session_id: u64,
+    flow_id: u64,
+    sequence: u64,
+    presentation_time_us: u64,
+    codec_config_id: u64,
+    frame: &[u8],
+) -> Result<Vec<Bytes>, FrameError> {
+    let mut packets = fragment_frame_with_flags(
+        kind,
+        flags,
+        capability_session_id,
+        flow_id,
+        sequence,
+        presentation_time_us,
+        codec_config_id,
+        frame,
+    )?;
+    let count = packets.len() as u16;
+    let num_groups = (count as usize).div_ceil(PARITY_GROUP_FRAGMENTS);
+    let mut parity = Vec::with_capacity(num_groups);
+    for group_index in 0..num_groups {
+        let mut acc = [0_u8; FRAME_PAYLOAD_BYTES];
+        let mut length_xor = 0_u16;
+        for packet in packets.iter().skip(group_index).step_by(num_groups) {
+            let payload = &packet[FRAME_HEADER_BYTES..];
+            length_xor ^= payload.len() as u16;
+            for (a, b) in acc.iter_mut().zip(payload.iter()) {
+                *a ^= *b;
             }
-            .encode(payload)
-        })
-        .collect()
+        }
+        let mut bytes = Vec::with_capacity(FRAME_DATAGRAM_BYTES);
+        FrameHeader {
+            kind: FRAME_KIND_PARITY,
+            flags: length_xor,
+            capability_session_id,
+            flow_id,
+            sequence,
+            fragment_index: group_index as u16,
+            fragment_count: count,
+            presentation_time_us,
+            codec_config_id,
+        }
+        .write(&mut bytes, &acc);
+        // Parity wire version tags the grouping scheme: v1 was contiguous
+        // groups, v2 interleaves members. Receivers that only know v1 reject
+        // the header outright — never mis-reconstruct with the wrong scheme.
+        bytes[4] = PARITY_WIRE_VERSION;
+        parity.push(Bytes::from(bytes));
+    }
+    packets.extend(parity);
+    Ok(packets)
+}
+
+/// Read the routing flow ID out of an ANFR datagram. Used by the session's
+/// datagram dispatcher before per-flow validation — it deliberately skips
+/// kind and fragment checks so a malformed packet still reaches the flow
+/// that owns it and is rejected there with full context.
+pub fn datagram_flow_id(datagram: &[u8]) -> Option<u64> {
+    if datagram.len() < FRAME_HEADER_BYTES || datagram[..4] != FRAME_MAGIC {
+        return None;
+    }
+    Some(u64::from_le_bytes(datagram[16..24].try_into().unwrap()))
 }
 
 /// Prefix one ANFR packet for a reliable QUIC stream.
@@ -211,11 +342,290 @@ pub fn encode_stream_packet(packet: &[u8]) -> Result<Vec<u8>, FrameError> {
     Ok(bytes)
 }
 
+/// Interleave little-endian length prefixes with ANFR packets for a vectored
+/// reliable-stream write. Each packet becomes two consecutive chunks — a
+/// 4-byte length prefix and the packet itself — so callers can submit the
+/// result to `write_all_chunks` without concatenating anything.
+pub fn stream_chunks(packets: &[Bytes]) -> Result<Vec<Bytes>, FrameError> {
+    let mut prefixes = Vec::with_capacity(packets.len() * STREAM_PACKET_LENGTH_BYTES);
+    for packet in packets {
+        if packet.is_empty() || packet.len() > FRAME_DATAGRAM_BYTES {
+            return Err(FrameError::TooLarge(FRAME_DATAGRAM_BYTES));
+        }
+        prefixes.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+    }
+    let prefixes = Bytes::from(prefixes);
+    let mut chunks = Vec::with_capacity(packets.len() * 2);
+    for (index, packet) in packets.iter().enumerate() {
+        let start = index * STREAM_PACKET_LENGTH_BYTES;
+        chunks.push(prefixes.slice(start..start + STREAM_PACKET_LENGTH_BYTES));
+        chunks.push(packet.clone());
+    }
+    Ok(chunks)
+}
+
+/// Bounds applied while reassembling ANFR fragments. Datagrams are
+/// intentionally lossy, so incomplete access units must never accumulate
+/// without limit.
+const PARTIAL_FRAME_TTL: Duration = Duration::from_millis(500);
+const MAX_PARTIAL_FRAMES: usize = 32;
+
+struct PartialFrame {
+    created: Instant,
+    fragment_count: u16,
+    fragments: Vec<Option<Bytes>>,
+    received: usize,
+    total_bytes: usize,
+}
+
+/// One stored parity record: the XOR of a fragment group's payloads plus the
+/// XOR of their payload lengths. Bounded like partial frames — parity that
+/// outlives a frame's TTL is useless anyway.
+struct ParityEntry {
+    created: Instant,
+    length_xor: u16,
+    payload: Bytes,
+}
+
+/// Generous bound: a max-size frame carries ~500 parity groups and a handful
+/// of frames may be in flight, so the cap stays far above realistic use while
+/// still bounding memory (~8 MiB) against a stream of stray parity packets.
+const MAX_PENDING_PARITIES: usize = 8192;
+
+/// Reassembles ANFR datagrams back into complete access units.
+///
+/// Fragments are stored as zero-copy slices of the received datagrams, so the
+/// only payload copy happens once, when the complete frame is produced. The
+/// map is bounded and half-assembled frames expire quickly.
+#[derive(Default)]
+pub struct Reassembler {
+    partial: FxHashMap<u64, PartialFrame>,
+    /// Parity records indexed by (frame sequence, parity group index). They
+    /// can arrive before, between, or after data fragments — datagrams are
+    /// unordered — so they live in their own map rather than inside a
+    /// PartialFrame that may not exist yet.
+    pending_parities: FxHashMap<(u64, u16), ParityEntry>,
+    /// Expiry sweeps are throttled to once per TTL: running `retain` on every
+    /// datagram costs an O(map) scan for no benefit — stale entries can sit
+    /// one extra interval without harm since the map is bounded anyway.
+    last_sweep: Option<Instant>,
+}
+
+impl Reassembler {
+    /// Feed one received datagram. Returns the complete access unit once its
+    /// last fragment arrives. Datagrams for other flows, other kinds, or with
+    /// inconsistent fragment counts are discarded.
+    pub fn add_datagram(
+        &mut self,
+        datagram: &Bytes,
+        kind: u8,
+        capability_session_id: u64,
+        flow_id: u64,
+    ) -> Option<Vec<u8>> {
+        let (header, _) = FrameHeader::decode(datagram).ok()?;
+        if header.capability_session_id != capability_session_id || header.flow_id != flow_id {
+            return None;
+        }
+        if header.kind == FRAME_KIND_PARITY {
+            self.store_parity(header, datagram);
+            return self.try_parity_recovery(header.sequence);
+        }
+        if header.kind != kind {
+            return None;
+        }
+        let now = Instant::now();
+        if (!self.partial.is_empty() || !self.pending_parities.is_empty())
+            && self
+                .last_sweep
+                .is_none_or(|t| now.duration_since(t) >= PARTIAL_FRAME_TTL)
+        {
+            self.partial
+                .retain(|_, frame| now.duration_since(frame.created) <= PARTIAL_FRAME_TTL);
+            self.pending_parities
+                .retain(|_, parity| now.duration_since(parity.created) <= PARTIAL_FRAME_TTL);
+            self.last_sweep = Some(now);
+        }
+        if self.partial.len() >= MAX_PARTIAL_FRAMES
+            && !self.partial.contains_key(&header.sequence)
+            && let Some(oldest) = self
+                .partial
+                .iter()
+                .min_by_key(|(_, frame)| frame.created)
+                .map(|(sequence, _)| *sequence)
+        {
+            self.partial.remove(&oldest);
+        }
+        let entry = self
+            .partial
+            .entry(header.sequence)
+            .or_insert_with(|| PartialFrame {
+                created: now,
+                fragment_count: header.fragment_count,
+                // A frame can never legitimately exceed MAX_FRAME_BYTES, so a
+                // claimed fragment count above the maximum possible can never
+                // complete — cap the slot vector rather than trusting the wire.
+                fragments: vec![
+                    None;
+                    usize::from(header.fragment_count)
+                        .min(MAX_FRAME_BYTES.div_ceil(FRAME_PAYLOAD_BYTES))
+                ],
+                received: 0,
+                total_bytes: 0,
+            });
+        if entry.fragment_count != header.fragment_count {
+            self.partial.remove(&header.sequence);
+            return None;
+        }
+        let index = usize::from(header.fragment_index);
+        if index >= entry.fragments.len() {
+            // Impossible fragment index for a capped slot vector — this frame
+            // could never complete within MAX_FRAME_BYTES anyway.
+            self.partial.remove(&header.sequence);
+            return None;
+        }
+        if entry.fragments[index].is_none() {
+            let payload = datagram.slice(FRAME_HEADER_BYTES..);
+            entry.total_bytes += payload.len();
+            if entry.total_bytes > MAX_FRAME_BYTES {
+                self.partial.remove(&header.sequence);
+                return None;
+            }
+            entry.fragments[index] = Some(payload);
+            entry.received += 1;
+        }
+        let received = entry.received;
+        let fragment_count = usize::from(entry.fragment_count);
+        if received != fragment_count {
+            // Parity can only help while every missing fragment could still
+            // sit in a distinct group; deeper holes are guaranteed dead.
+            let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
+            if fragment_count - received <= num_groups {
+                return self.try_parity_recovery(header.sequence);
+            }
+            return None;
+        }
+        let entry = self.partial.remove(&header.sequence)?;
+        let mut frame = Vec::with_capacity(entry.total_bytes);
+        for fragment in entry.fragments {
+            frame.extend_from_slice(&fragment?);
+        }
+        Some(frame)
+    }
+
+    /// Store one parity datagram keyed by (frame sequence, group index).
+    /// Parity payloads are fixed-width; a short or absent payload can never
+    /// reconstruct anything, so it is dropped. Only `PARITY_WIRE_VERSION`
+    /// records are applied: builds between the first contiguous-parity
+    /// implementation and the interleaved rewrite both stamped `1`, so a
+    /// v1 record's grouping is unknowable and reconstructing from it could
+    /// yield garbage bytes — dropping costs only the recovery itself.
+    fn store_parity(&mut self, header: FrameHeader, datagram: &Bytes) {
+        let payload = datagram.slice(FRAME_HEADER_BYTES..);
+        if datagram[4] != PARITY_WIRE_VERSION
+            || payload.len() != FRAME_PAYLOAD_BYTES
+            || self.pending_parities.len() >= MAX_PENDING_PARITIES
+        {
+            return;
+        }
+        self.pending_parities.insert(
+            (header.sequence, header.fragment_index),
+            ParityEntry {
+                created: Instant::now(),
+                length_xor: header.flags,
+                payload,
+            },
+        );
+    }
+
+    /// Reconstruct a frame whose missing fragments are each their parity
+    /// group's only hole. XOR parity recovers at most one loss per group —
+    /// but groups stripe fragments `i, i + num_groups, …`, so up to
+    /// `num_groups` losses stay recoverable as long as no group is holed
+    /// twice. The scan only runs when `missing <= num_groups`, which is the
+    /// precondition for every hole to sit in a distinct group.
+    fn try_parity_recovery(&mut self, sequence: u64) -> Option<Vec<u8>> {
+        loop {
+            let candidate = {
+                let entry = self.partial.get(&sequence)?;
+                let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
+                if entry.fragments.len() - entry.received > num_groups {
+                    return None;
+                }
+                let mut holes = vec![0usize; num_groups];
+                for (index, slot) in entry.fragments.iter().enumerate() {
+                    if slot.is_none() {
+                        holes[index % num_groups] += 1;
+                    }
+                }
+                entry
+                    .fragments
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, slot)| {
+                        if slot.is_some() {
+                            return None;
+                        }
+                        let group = index % num_groups;
+                        if holes[group] == 1
+                            && self
+                                .pending_parities
+                                .contains_key(&(sequence, group as u16))
+                        {
+                            return Some((index, group));
+                        }
+                        None
+                    })
+            };
+            let (missing, group) = candidate?;
+            let entry = self.partial.get(&sequence)?;
+            let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
+            let parity = self.pending_parities.get(&(sequence, group as u16))?;
+            let mut acc = [0_u8; FRAME_PAYLOAD_BYTES];
+            acc.copy_from_slice(&parity.payload);
+            let mut length_xor = parity.length_xor;
+            for fragment in entry
+                .fragments
+                .iter()
+                .skip(group)
+                .step_by(num_groups)
+                .flatten()
+            {
+                length_xor ^= fragment.len() as u16;
+                for (a, b) in acc.iter_mut().zip(fragment.iter()) {
+                    *a ^= *b;
+                }
+            }
+            let missing_len = usize::from(length_xor);
+            if missing_len == 0 || missing_len > FRAME_PAYLOAD_BYTES {
+                return None;
+            }
+            let recovered = Bytes::copy_from_slice(&acc[..missing_len]);
+            let entry = self.partial.get_mut(&sequence)?;
+            entry.total_bytes += missing_len;
+            if entry.total_bytes > MAX_FRAME_BYTES {
+                self.partial.remove(&sequence);
+                return None;
+            }
+            entry.fragments[missing] = Some(recovered);
+            entry.received += 1;
+            if entry.received == usize::from(entry.fragment_count) {
+                let entry = self.partial.remove(&sequence)?;
+                let mut frame = Vec::with_capacity(entry.total_bytes);
+                for fragment in entry.fragments {
+                    frame.extend_from_slice(&fragment?);
+                }
+                return Some(frame);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn wire_packet(
         kind: u8,
         flags: u16,
@@ -269,12 +679,18 @@ mod tests {
 
     #[test]
     fn decode_rejects_supported_version() {
+        // Version 2 is the parity grouping-scheme tag; anything past it is
+        // genuinely unknown and must still be rejected.
         let mut packet = valid_packet();
-        packet[4] = 2;
+        packet[4] = 3;
         assert_eq!(
             FrameHeader::decode(&packet),
-            Err(FrameError::UnsupportedVersion(2)),
+            Err(FrameError::UnsupportedVersion(3)),
         );
+        for version in [1u8, PARITY_WIRE_VERSION] {
+            packet[4] = version;
+            assert!(FrameHeader::decode(&packet).is_ok());
+        }
     }
 
     #[test]
@@ -522,5 +938,294 @@ mod tests {
         let mut packet = vec![0u8; FRAME_HEADER_BYTES];
         packet[..4].copy_from_slice(b"NOPE");
         assert_eq!(FrameHeader::decode(&packet), Err(FrameError::InvalidMagic));
+    }
+
+    #[test]
+    fn stream_chunks_interleave_prefixes_without_copying_payloads() {
+        let packets = fragment_frame(FRAME_KIND_SCREEN, 9, 4, 77, 123, 1, &[7; 3000]).unwrap();
+        let chunks = stream_chunks(&packets).unwrap();
+        assert_eq!(chunks.len(), packets.len() * 2);
+        for (index, packet) in packets.iter().enumerate() {
+            let prefix = &chunks[index * 2];
+            assert_eq!(prefix.len(), STREAM_PACKET_LENGTH_BYTES);
+            assert_eq!(
+                u32::from_le_bytes(prefix[..].try_into().unwrap()) as usize,
+                packet.len()
+            );
+            // The payload chunk must be the same arena storage, not a copy.
+            assert!(std::ptr::eq(
+                chunks[index * 2 + 1].as_ptr(),
+                packet.as_ptr()
+            ));
+        }
+        let mut stream = Vec::new();
+        for chunk in &chunks {
+            stream.extend_from_slice(chunk);
+        }
+        let mut offset = 0;
+        let mut reassembled = Vec::new();
+        while offset < stream.len() {
+            let end = offset + STREAM_PACKET_LENGTH_BYTES;
+            let length = u32::from_le_bytes(stream[offset..end].try_into().unwrap()) as usize;
+            let (header, payload) = FrameHeader::decode(&stream[end..end + length]).unwrap();
+            assert_eq!(header.sequence, 77);
+            reassembled.extend_from_slice(payload);
+            offset = end + length;
+        }
+        assert_eq!(reassembled, vec![7u8; 3000]);
+    }
+
+    #[test]
+    fn reassembler_reassembles_out_of_order_and_filters_flow() {
+        let payload: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let packets = fragment_frame(FRAME_KIND_CAMERA, 9, 4, 77, 123, 1, &payload).unwrap();
+        let mut reassembler = Reassembler::default();
+        // Wrong flow id, duplicate fragment, then out-of-order completion.
+        assert!(
+            reassembler
+                .add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 999)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[2], FRAME_KIND_CAMERA, 9, 4)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[1], FRAME_KIND_CAMERA, 9, 4)
+                .is_none()
+        );
+        let rebuilt = reassembler
+            .add_datagram(&packets[0], FRAME_KIND_CAMERA, 9, 4)
+            .unwrap();
+        assert_eq!(rebuilt, payload);
+    }
+
+    #[test]
+    fn reassembler_drops_foreign_kinds_and_sessions() {
+        let packets = fragment_frame(FRAME_KIND_SCREEN, 1, 2, 3, 0, 0, &[1, 2, 3]).unwrap();
+        let mut reassembler = Reassembler::default();
+        assert!(
+            reassembler
+                .add_datagram(&packets[0], FRAME_KIND_CAMERA, 1, 2)
+                .is_none()
+        );
+        assert!(
+            reassembler
+                .add_datagram(&packets[0], FRAME_KIND_SCREEN, 2, 2)
+                .is_none()
+        );
+        // A malformed datagram never reaches the map at all.
+        assert!(
+            reassembler
+                .add_datagram(&Bytes::from_static(b"ANFR"), FRAME_KIND_SCREEN, 1, 2)
+                .is_none()
+        );
+        // But a correct packet still completes.
+        assert_eq!(
+            reassembler.add_datagram(&packets[0], FRAME_KIND_SCREEN, 1, 2),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn parity_fragmentation_appends_one_parity_per_group() {
+        // 40 fragments -> groups of 16 + 16 + 8 -> 3 parity datagrams.
+        let frame = vec![9u8; FRAME_PAYLOAD_BYTES * 40];
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        assert_eq!(packets.len(), 43);
+        for (index, packet) in packets.iter().enumerate().skip(40) {
+            let (header, payload) = FrameHeader::decode(packet).unwrap();
+            assert_eq!(header.kind, FRAME_KIND_PARITY);
+            assert_eq!(header.fragment_index as usize, index - 40);
+            assert_eq!(header.fragment_count, 40);
+            assert_eq!(header.sequence, 3);
+            assert_eq!(payload.len(), FRAME_PAYLOAD_BYTES);
+        }
+    }
+
+    #[test]
+    fn parity_recovers_single_lost_fragment() {
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 40)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        // Drop fragment 7 (group 0); every other packet including parity arrives.
+        let mut reassembler = Reassembler::default();
+        let mut rebuilt = None;
+        for (index, packet) in packets.iter().enumerate() {
+            if index == 7 {
+                continue;
+            }
+            if let Some(frame) = reassembler.add_datagram(packet, FRAME_KIND_SCREEN, 1, 2) {
+                rebuilt = Some(frame);
+            }
+        }
+        assert_eq!(rebuilt.unwrap(), frame);
+    }
+
+    #[test]
+    fn parity_arriving_before_data_still_recovers() {
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 20)
+            .map(|index| (index % 199) as u8)
+            .collect();
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        // Parity lands first (unordered datagrams), fragment 2 is lost.
+        let mut rebuilt = None;
+        for packet in packets.iter().skip(20) {
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
+                    .is_none()
+            );
+        }
+        for (index, packet) in packets.iter().enumerate().take(20) {
+            if index == 2 {
+                continue;
+            }
+            if let Some(frame) = reassembler.add_datagram(packet, FRAME_KIND_SCREEN, 1, 2) {
+                rebuilt = Some(frame);
+            }
+        }
+        assert_eq!(rebuilt.unwrap(), frame);
+    }
+
+    #[test]
+    fn parity_recovers_lost_short_final_fragment() {
+        // 17 fragments with a short tail: loss in the last group exercises the
+        // length-XOR recovery path.
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 16 + 137)
+            .map(|index| (index % 241) as u8)
+            .collect();
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        let mut rebuilt = None;
+        for (index, packet) in packets.iter().enumerate() {
+            if index == 16 {
+                continue;
+            }
+            if let Some(frame) = reassembler.add_datagram(packet, FRAME_KIND_SCREEN, 1, 2) {
+                rebuilt = Some(frame);
+            }
+        }
+        assert_eq!(rebuilt.unwrap(), frame);
+    }
+
+    #[test]
+    fn parity_recovers_burst_loss_across_interleaved_groups() {
+        // Three consecutive fragment losses land in three different
+        // interleaved groups — each is its group's only hole and recovers.
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 40)
+            .map(|index| (index % 211) as u8)
+            .collect();
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        let mut rebuilt = None;
+        for (index, packet) in packets.iter().enumerate() {
+            if (10..13).contains(&index) {
+                continue;
+            }
+            if let Some(frame) = reassembler.add_datagram(packet, FRAME_KIND_SCREEN, 1, 2) {
+                rebuilt = Some(frame);
+            }
+        }
+        assert_eq!(rebuilt.as_deref(), Some(frame.as_slice()));
+    }
+
+    #[test]
+    fn parity_cannot_recover_two_losses_in_one_group() {
+        // Interleaved groups for a 40-fragment frame are indices mod 3, so
+        // fragments 3 and 6 share a group — two holes defeat single-XOR.
+        let frame = vec![5u8; FRAME_PAYLOAD_BYTES * 40];
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        for (index, packet) in packets.iter().enumerate() {
+            if index == 3 || index == 6 {
+                continue;
+            }
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn parity_is_ignored_when_nothing_is_lost() {
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 18)
+            .map(|index| (index % 211) as u8)
+            .collect();
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        let mut rebuilt = None;
+        for packet in packets.iter() {
+            if let Some(frame) = reassembler.add_datagram(packet, FRAME_KIND_SCREEN, 1, 2) {
+                rebuilt = Some(frame);
+            }
+        }
+        assert_eq!(rebuilt.unwrap(), frame);
+    }
+
+    #[test]
+    fn parity_with_legacy_v1_wire_tag_is_ignored() {
+        // Builds between the first contiguous-parity implementation and the
+        // interleaved rewrite both stamped version 1, so a v1 record's
+        // grouping is unknowable. Applying it risks reconstructing garbage —
+        // the record must be dropped even when it could have helped.
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 18)
+            .map(|index| (index % 197) as u8)
+            .collect();
+        let mut packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        for packet in packets.iter_mut().skip(18) {
+            let mut downgraded = packet.to_vec();
+            downgraded[4] = 1;
+            *packet = Bytes::from(downgraded);
+        }
+        let mut reassembler = Reassembler::default();
+        for (index, packet) in packets.iter().enumerate() {
+            if index == 1 {
+                continue;
+            }
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
+                    .is_none()
+            );
+        }
+        assert!(reassembler.pending_parities.is_empty());
+    }
+
+    #[test]
+    fn parity_for_another_flow_is_ignored() {
+        let frame = vec![8u8; FRAME_PAYLOAD_BYTES * 20];
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        for packet in packets.iter().skip(20) {
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 99)
+                    .is_none()
+            );
+        }
+        assert!(reassembler.pending_parities.is_empty());
     }
 }

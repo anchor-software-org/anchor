@@ -36,6 +36,9 @@
  * writer and lets its replaceable-frame queue discard old screen content.
  */
 #define ANCHOR_STREAM_RECEIVE_WINDOW (512u * 1024u)
+// ACK quickly so the peer's RTT/loss feedback loop tracks LAN conditions
+// instead of MsQuic's 25 ms default delay.
+#define ANCHOR_MAX_ACK_DELAY_MS 5u
 
 typedef struct anchor_connection_s {
     const QUIC_API_TABLE *api;
@@ -380,6 +383,8 @@ Java_org_anchor_sdk_MsQuicTransport_nativeCreate(
     settings.IsSet.StreamRecvWindowBidiLocalDefault = TRUE;
     settings.StreamRecvWindowBidiRemoteDefault = ANCHOR_STREAM_RECEIVE_WINDOW;
     settings.IsSet.StreamRecvWindowBidiRemoteDefault = TRUE;
+    settings.MaxAckDelayMs = ANCHOR_MAX_ACK_DELAY_MS;
+    settings.IsSet.MaxAckDelayMs = TRUE;
     failed_step = "ConfigurationOpen";
     if (QUIC_FAILED(status = anchor->api->ConfigurationOpen(
             anchor->registration, &alpn, 1, &settings, sizeof(settings), NULL, &anchor->configuration))) goto error;

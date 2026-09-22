@@ -32,6 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The runner image ships a stale apt index; without an update the cache
+      # action downloads superseded package versions and the mirror 404s.
+      - name: Update apt index
+        run: sudo apt-get update
+
       - name: Install system build deps
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
@@ -68,7 +73,7 @@ jobs:
             adb
           # Bump this when the package set changes; otherwise the action can
           # restore an older architecture-specific cache without new libraries.
-          version: 1.3
+          version: 1.4
 
       # The apt cache action can restore an older cache that predates a newly
       # added package. Install protoc explicitly so every architecture has the
