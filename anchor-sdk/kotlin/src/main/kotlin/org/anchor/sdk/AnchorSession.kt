@@ -91,7 +91,12 @@ class AnchorSession private constructor(
 ) : AutoCloseable {
     private val queuedEvents = ArrayDeque<AnchorSessionEvent>()
     private val queuedStreamData = mutableMapOf<Long, ArrayDeque<AnchorStreamData>>()
-    private val queuedDatagrams = ArrayDeque<ByteArray>()
+    /* Inbound datagrams route to per-flow queues by the ANFR flow ID, like
+     * the Rust dispatcher — a single shared queue would let one flow's
+     * reader consume another flow's datagrams and drop them as header
+     * mismatches, which is silent cross-flow media loss. */
+    private val queuedDatagrams = mutableMapOf<Long, ArrayDeque<ByteArray>>()
+    private val datagramRoutes = mutableSetOf<Long>()
     /* Queue containers and their counters share one lock. This makes a
      * snapshot describe a real state rather than a mixture of two moments. */
     private val queueLock = Any()
@@ -284,17 +289,17 @@ class AnchorSession private constructor(
         }
     }
 
-    internal suspend fun readDatagram(): ByteArray {
+    internal suspend fun readDatagram(flowId: Long): ByteArray {
         var idlePolls = 0
         while (true) {
-            takeQueuedDatagram()?.let { return it }
+            takeQueuedDatagram(flowId)?.let { return it }
             if (closedReason != null) throw AnchorSessionException("QUIC transport closed")
             val polled = pollMutex.withLock {
                 val events = transport.poll()
                 dispatch(events)
                 events.size
             }
-            takeQueuedDatagram()?.let { return it }
+            takeQueuedDatagram(flowId)?.let { return it }
             if (closedReason != null) throw AnchorSessionException("QUIC transport closed")
             // Media datagrams arrive in bursts microseconds apart — spin
             // briefly so an in-flight burst is not delayed by a sleep, then
@@ -327,18 +332,27 @@ class AnchorSession private constructor(
                     }
                 }
                 is QuicEvent.Datagram -> synchronized(queueLock) {
-                    // Media datagrams are replaceable: an over-full queue means
-                    // the consumer is behind, so drop the oldest rather than
-                    // deliver stale video or grow memory without bound. Mirrors
-                    // the Rust dispatcher's bounded per-flow route channel.
-                    while (queuedDatagrams.size >= MAX_QUEUED_DATAGRAMS) {
-                        queuedDatagrams.pollFirst()?.let { dropped ->
-                            datagramQueueAccounting.dequeue(dropped.size)
-                            droppedDatagrams++
+                    // Route by ANFR flow ID; datagrams for unregistered or
+                    // malformed packets are dropped as ordinary media loss.
+                    // Media datagrams are replaceable: an over-full queue
+                    // means the consumer is behind, so drop the oldest
+                    // rather than deliver stale video or grow memory without
+                    // bound. Mirrors the Rust dispatcher's per-flow channel.
+                    val queue = VideoFrameProtocol.datagramFlowId(event.bytes)
+                        ?.takeIf { it in datagramRoutes }
+                        ?.let { queuedDatagrams.getOrPut(it) { ArrayDeque() } }
+                    if (queue == null) {
+                        droppedDatagrams++
+                    } else {
+                        while (queue.size >= MAX_QUEUED_DATAGRAMS) {
+                            queue.pollFirst()?.let { dropped ->
+                                datagramQueueAccounting.dequeue(dropped.size)
+                                droppedDatagrams++
+                            }
                         }
+                        queue.addLast(event.bytes)
+                        datagramQueueAccounting.enqueue(event.bytes.size)
                     }
-                    queuedDatagrams.addLast(event.bytes)
-                    datagramQueueAccounting.enqueue(event.bytes.size)
                 }
                 is QuicEvent.Failed -> throw AnchorSessionException(event.reason)
                 is QuicEvent.Closed -> if (closedReason == null) closedReason = event.code.toInt()
@@ -467,8 +481,22 @@ class AnchorSession private constructor(
         }
     }
 
-    private fun takeQueuedDatagram(): ByteArray? = synchronized(queueLock) {
-        queuedDatagrams.takeFirstOrNull()?.also { datagramQueueAccounting.dequeue(it.size) }
+    private fun takeQueuedDatagram(flowId: Long): ByteArray? = synchronized(queueLock) {
+        val queue = queuedDatagrams[flowId] ?: return@synchronized null
+        queue.pollFirst()?.also {
+            datagramQueueAccounting.dequeue(it.size)
+            if (queue.isEmpty()) queuedDatagrams.remove(flowId)
+        }
+    }
+
+    /** Register a datagram route before the open request so early datagrams queue. */
+    internal fun registerDatagramFlow(flowId: Long) = synchronized(queueLock) {
+        datagramRoutes.add(flowId)
+    }
+
+    internal fun unregisterDatagramFlow(flowId: Long) = synchronized(queueLock) {
+        datagramRoutes.remove(flowId)
+        queuedDatagrams.remove(flowId)?.forEach { datagramQueueAccounting.dequeue(it.size) }
     }
 
     companion object {
@@ -561,6 +589,7 @@ class AnchorCapability internal constructor(
         require(allowedTypeUrls.contains(payloadTypeUrl)) { "datagram type URL was not advertised" }
         session.requireCapability(sessionId, payloadTypeUrl, requiresDatagrams = true)
         val flowId = session.allocateFlowId()
+        session.registerDatagramFlow(flowId)
         val requestId = session.allocateRequestId()
         session.send(requestId, ControlEnvelope.newBuilder().setDatagramFlowOpen(
             org.anchor.sdk.v1.DatagramFlowOpen.newBuilder()
@@ -590,10 +619,11 @@ class AnchorDatagramFlow internal constructor(
         session.sendDatagram(bytes)
     }
 
-    suspend fun receive(): ByteArray = session.readDatagram()
+    suspend fun receive(): ByteArray = session.readDatagram(flowId)
 
     suspend fun close() {
         check(!closed) { "datagram flow is closed" }
+        session.unregisterDatagramFlow(flowId)
         session.sendDatagramFlowClosed(flowId)
         closed = true
     }

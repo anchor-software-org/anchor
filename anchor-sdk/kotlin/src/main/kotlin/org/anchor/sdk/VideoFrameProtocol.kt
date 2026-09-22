@@ -19,6 +19,13 @@ object VideoFrameProtocol {
      * during decode-kind filtering, so senders may emit parity unconditionally.
      */
     const val KIND_PARITY = 3
+    /**
+     * Wire version stamped on parity datagrams, tagging the grouping scheme:
+     * v1 covered contiguous 16-fragment groups, v2 interleaves members so a
+     * burst of consecutive losses lands in distinct groups. Peers that only
+     * know version 1 drop v2 records outright — never mis-reconstruct.
+     */
+    const val PARITY_WIRE_VERSION = 2
     /** Consecutive data fragments covered by one parity datagram. */
     const val PARITY_GROUP_FRAGMENTS = 16
     const val FLAG_KEYFRAME = 1
@@ -36,9 +43,26 @@ object VideoFrameProtocol {
         val fragmentCount: Int,
         val presentationTimeUs: Long,
         val codecConfigId: Long,
+        val version: Int = 1,
     )
 
     data class Packet(val header: Header, val payload: ByteArray)
+
+    /**
+     * Read the routing flow ID out of an ANFR datagram without full header
+     * validation. The session uses it to queue inbound datagrams per flow —
+     * malformed packets return null and are dropped rather than delivered to
+     * a flow that would reject them as a header mismatch.
+     */
+    fun datagramFlowId(datagram: ByteArray): Long? {
+        if (datagram.size < HEADER_BYTES ||
+            datagram[0] != MAGIC[0] || datagram[1] != MAGIC[1] ||
+            datagram[2] != MAGIC[2] || datagram[3] != MAGIC[3]
+        ) {
+            return null
+        }
+        return ByteBuffer.wrap(datagram, 16, 8).order(ByteOrder.LITTLE_ENDIAN).long
+    }
 
     /** Fragment one encoded access unit into MTU-safe Anchor datagrams. */
     fun fragment(
@@ -124,7 +148,7 @@ object VideoFrameProtocol {
             parity += ByteBuffer.allocate(HEADER_BYTES + PAYLOAD_BYTES)
                 .order(ByteOrder.LITTLE_ENDIAN)
                 .put(MAGIC)
-                .put(1)
+                .put(PARITY_WIRE_VERSION.toByte())
                 .put(KIND_PARITY.toByte())
                 .putShort(lengthXor.toShort())
                 .putLong(capabilitySessionId)
@@ -143,7 +167,9 @@ object VideoFrameProtocol {
     fun decode(datagram: ByteArray): Packet? {
         if (datagram.size < HEADER_BYTES) return null
         if (datagram.size > DATAGRAM_BYTES) return null
-        if (!datagram.copyOfRange(0, 4).contentEquals(MAGIC) || datagram[4].toInt() != 1) return null
+        if (!datagram.copyOfRange(0, 4).contentEquals(MAGIC)) return null
+        val version = datagram[4].toInt()
+        if (version != 1 && version != PARITY_WIRE_VERSION) return null
         val buffer = ByteBuffer.wrap(datagram).order(ByteOrder.LITTLE_ENDIAN)
         buffer.position(5)
         val kind = buffer.get().toInt() and 0xff
@@ -159,7 +185,7 @@ object VideoFrameProtocol {
         val codecConfigId = buffer.long
         return Packet(
             Header(kind, flags, capabilitySessionId, flowId, sequence, fragmentIndex,
-                fragmentCount, presentationTimeUs, codecConfigId),
+                fragmentCount, presentationTimeUs, codecConfigId, version),
             datagram.copyOfRange(HEADER_BYTES, datagram.size),
         )
     }
