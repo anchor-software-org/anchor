@@ -332,7 +332,7 @@ class AnchorSession private constructor(
                     // deliver stale video or grow memory without bound. Mirrors
                     // the Rust dispatcher's bounded per-flow route channel.
                     while (queuedDatagrams.size >= MAX_QUEUED_DATAGRAMS) {
-                        queuedDatagrams.removeFirstOrNull()?.let { dropped ->
+                        queuedDatagrams.pollFirst()?.let { dropped ->
                             datagramQueueAccounting.dequeue(dropped.size)
                             droppedDatagrams++
                         }
