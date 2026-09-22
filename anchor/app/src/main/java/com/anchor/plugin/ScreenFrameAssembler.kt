@@ -8,7 +8,7 @@ internal class ScreenFrameAssembler(
     private val clock: () -> Long = System::nanoTime,
     private val onEvent: (OutcomeEvent) -> Unit = {},
 ) {
-    enum class Outcome { COMPLETE, DUPLICATE, STALE, GAP, TIMEOUT, AWAITING_IDR, REJECTED }
+    enum class Outcome { COMPLETE, DUPLICATE, STALE, GAP, TIMEOUT, AWAITING_IDR, REJECTED, PARITY_RECOVERED }
 
     data class OutcomeEvent(
         val outcome: Outcome,
@@ -251,38 +251,62 @@ internal class ScreenFrameAssembler(
     }
 
     /**
-     * Rebuild a frame that is missing exactly one fragment covered by a stored
-     * parity group. Single-parity XOR recovers at most one loss per group;
-     * wider holes leave the frame partial until its assembly timeout.
+     * Rebuild a frame whose missing fragments are each their parity group's
+     * only hole. Single-parity XOR recovers at most one loss per group, but
+     * groups stripe fragments `i, i + numGroups, …` — so up to `numGroups`
+     * losses recover as long as no group is holed twice.
      */
     private fun tryParityRecovery(sequence: Long): List<CompletedFrame> {
         val partial = pending[sequence] ?: return emptyList()
-        if (partial.completed != null ||
-            partial.count != partial.header.fragmentCount - 1
-        ) {
-            return emptyList()
-        }
-        val missing = partial.fragments.indexOfFirst { it == null }
-        if (missing < 0) return emptyList()
-        val group = missing / VideoFrameProtocol.PARITY_GROUP_FRAGMENTS
-        val parity = pendingParities[sequence]?.get(group) ?: return emptyList()
-        val start = group * VideoFrameProtocol.PARITY_GROUP_FRAGMENTS
-        val end = minOf(start + VideoFrameProtocol.PARITY_GROUP_FRAGMENTS, partial.fragments.size)
-        val acc = parity.payload.copyOf()
-        var lengthXor = parity.lengthXor
-        for (i in start until end) {
-            val fragment = partial.fragments[i] ?: continue
-            lengthXor = lengthXor xor fragment.size
-            for (j in fragment.indices) {
-                acc[j] = (acc[j].toInt() xor fragment[j].toInt()).toByte()
+        if (partial.completed != null) return emptyList()
+        while (partial.count < partial.header.fragmentCount) {
+            val numGroups =
+                (partial.fragments.size + VideoFrameProtocol.PARITY_GROUP_FRAGMENTS - 1) /
+                    VideoFrameProtocol.PARITY_GROUP_FRAGMENTS
+            if (partial.fragments.size - partial.count > numGroups) return emptyList()
+            val groupHoles = IntArray(numGroups)
+            for (i in partial.fragments.indices) {
+                if (partial.fragments[i] == null) groupHoles[i % numGroups]++
             }
+            var target = -1
+            for (i in partial.fragments.indices) {
+                if (partial.fragments[i] == null &&
+                    groupHoles[i % numGroups] == 1 &&
+                    pendingParities[sequence]?.containsKey(i % numGroups) == true
+                ) {
+                    target = i
+                    break
+                }
+            }
+            if (target < 0) return emptyList()
+            val group = target % numGroups
+            val parity = pendingParities[sequence]?.get(group) ?: return emptyList()
+            val acc = parity.payload.copyOf()
+            var lengthXor = parity.lengthXor
+            var i = group
+            while (i < partial.fragments.size) {
+                partial.fragments[i]?.let { fragment ->
+                    lengthXor = lengthXor xor fragment.size
+                    for (j in fragment.indices) {
+                        acc[j] = (acc[j].toInt() xor fragment[j].toInt()).toByte()
+                    }
+                }
+                i += numGroups
+            }
+            if (lengthXor <= 0 || lengthXor > VideoFrameProtocol.PAYLOAD_BYTES) return emptyList()
+            val recovered = acc.copyOf(lengthXor)
+            partial.fragments[target] = recovered
+            partial.bytes += recovered.size
+            partial.count++
+            retainedBytes += recovered.size
+            emit(
+                Outcome.PARITY_RECOVERED,
+                sequence = sequence,
+                fragmentIndex = target,
+                fragmentCount = partial.header.fragmentCount,
+                frameBytes = partial.bytes,
+            )
         }
-        if (lengthXor <= 0 || lengthXor > VideoFrameProtocol.PAYLOAD_BYTES) return emptyList()
-        val recovered = acc.copyOf(lengthXor)
-        partial.fragments[missing] = recovered
-        partial.bytes += recovered.size
-        partial.count++
-        retainedBytes += recovered.size
         partial.completedAtNs = clock()
         partial.completed = ByteArray(partial.bytes).also { output ->
             var offset = 0

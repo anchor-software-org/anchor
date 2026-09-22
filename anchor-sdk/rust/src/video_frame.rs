@@ -244,16 +244,18 @@ pub fn fragment_frame_with_flags(
 
 /// Split one encoded access unit into datagrams plus XOR-parity redundancy.
 ///
-/// For every group of `PARITY_GROUP_FRAGMENTS` data fragments one parity
-/// datagram is appended whose payload is the bytewise XOR of the group's
-/// payloads, each zero-padded to `FRAME_PAYLOAD_BYTES`. The parity header's
-/// `flags` field carries the XOR of the covered payload lengths so the one
-/// missing fragment in a group can be reconstructed byte-exact, including its
-/// real length (all fragments but the last are full-sized). Parity datagrams
-/// are emitted after the data burst so they do not interleave with media
-/// delivery. They cost roughly 1/16 of media bandwidth on the lossy datagram
-/// path and are meaningless on reliable streams, so callers should use this
-/// only where datagrams may be dropped.
+/// Emits `ceil(count / PARITY_GROUP_FRAGMENTS)` parity datagrams whose
+/// payloads are the bytewise XOR of each group's fragments, zero-padded to
+/// `FRAME_PAYLOAD_BYTES`. Groups are interleaved — group `g` covers fragment
+/// indices `g, g + num_groups, g + 2·num_groups, …` — so a burst of up to
+/// `num_groups − 1` consecutive losses lands in distinct groups and every
+/// loss stays single-XOR recoverable. The parity header's `flags` field
+/// carries the XOR of the covered payload lengths so the one missing
+/// fragment in a group can be reconstructed byte-exact, including its real
+/// length. Parity datagrams are emitted after the data burst so they do not
+/// interleave with media delivery. They cost roughly 1/16 of media bandwidth
+/// on the lossy datagram path and are meaningless on reliable streams, so
+/// callers should use this only where datagrams may be dropped.
 #[allow(clippy::too_many_arguments)]
 pub fn fragment_frame_with_parity(
     kind: u8,
@@ -276,11 +278,12 @@ pub fn fragment_frame_with_parity(
         frame,
     )?;
     let count = packets.len() as u16;
-    let mut parity = Vec::with_capacity(count as usize / PARITY_GROUP_FRAGMENTS + 1);
-    for (group_index, group) in packets.chunks(PARITY_GROUP_FRAGMENTS).enumerate() {
+    let num_groups = (count as usize).div_ceil(PARITY_GROUP_FRAGMENTS);
+    let mut parity = Vec::with_capacity(num_groups);
+    for group_index in 0..num_groups {
         let mut acc = [0_u8; FRAME_PAYLOAD_BYTES];
         let mut length_xor = 0_u16;
-        for packet in group {
+        for packet in packets.iter().skip(group_index).step_by(num_groups) {
             let payload = &packet[FRAME_HEADER_BYTES..];
             length_xor ^= payload.len() as u16;
             for (a, b) in acc.iter_mut().zip(payload.iter()) {
@@ -519,50 +522,82 @@ impl Reassembler {
         );
     }
 
-    /// Reconstruct a frame that is missing exactly one fragment covered by a
-    /// stored parity group. XOR parity recovers at most one loss per group —
-    /// wider holes simply fail and the frame stays partial until its TTL.
+    /// Reconstruct a frame whose missing fragments are each their parity
+    /// group's only hole. XOR parity recovers at most one loss per group —
+    /// but groups stripe fragments `i, i + num_groups, …`, so up to
+    /// `num_groups` losses stay recoverable as long as no group is holed
+    /// twice. The scan only runs when `missing <= num_groups`, which is the
+    /// precondition for every hole to sit in a distinct group.
     fn try_parity_recovery(&mut self, sequence: u64) -> Option<Vec<u8>> {
-        {
+        loop {
+            let candidate = {
+                let entry = self.partial.get(&sequence)?;
+                let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
+                if entry.fragments.len() - entry.received > num_groups {
+                    return None;
+                }
+                let mut group_holes = vec![0usize; num_groups];
+                for (index, slot) in entry.fragments.iter().enumerate() {
+                    if slot.is_none() {
+                        group_holes[index % num_groups] += 1;
+                    }
+                }
+                entry
+                    .fragments
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, slot)| {
+                        slot.is_none()
+                            && group_holes[index % num_groups] == 1
+                            && self
+                                .pending_parities
+                                .contains_key(&(sequence, (index % num_groups) as u16))
+                    })
+                    .map(|(index, _)| index)
+                    .next()
+            };
+            let missing = candidate?;
             let entry = self.partial.get(&sequence)?;
-            if entry.received + 1 != usize::from(entry.fragment_count) {
+            let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
+            let group = missing % num_groups;
+            let parity = self.pending_parities.get(&(sequence, group as u16))?;
+            let mut acc = [0_u8; FRAME_PAYLOAD_BYTES];
+            acc.copy_from_slice(&parity.payload);
+            let mut length_xor = parity.length_xor;
+            for fragment in entry
+                .fragments
+                .iter()
+                .skip(group)
+                .step_by(num_groups)
+                .flatten()
+            {
+                length_xor ^= fragment.len() as u16;
+                for (a, b) in acc.iter_mut().zip(fragment.iter()) {
+                    *a ^= *b;
+                }
+            }
+            let missing_len = usize::from(length_xor);
+            if missing_len == 0 || missing_len > FRAME_PAYLOAD_BYTES {
                 return None;
             }
-        }
-        let entry = self.partial.get(&sequence)?;
-        let missing = entry.fragments.iter().position(Option::is_none)?;
-        let group = missing / PARITY_GROUP_FRAGMENTS;
-        let parity = self.pending_parities.get(&(sequence, group as u16))?;
-        let start = group * PARITY_GROUP_FRAGMENTS;
-        let end = (start + PARITY_GROUP_FRAGMENTS).min(entry.fragments.len());
-        let mut acc = [0_u8; FRAME_PAYLOAD_BYTES];
-        acc.copy_from_slice(&parity.payload);
-        let mut length_xor = parity.length_xor;
-        for fragment in entry.fragments[start..end].iter().flatten() {
-            length_xor ^= fragment.len() as u16;
-            for (a, b) in acc.iter_mut().zip(fragment.iter()) {
-                *a ^= *b;
+            let recovered = Bytes::copy_from_slice(&acc[..missing_len]);
+            let entry = self.partial.get_mut(&sequence)?;
+            entry.total_bytes += missing_len;
+            if entry.total_bytes > MAX_FRAME_BYTES {
+                self.partial.remove(&sequence);
+                return None;
+            }
+            entry.fragments[missing] = Some(recovered);
+            entry.received += 1;
+            if entry.received == usize::from(entry.fragment_count) {
+                let entry = self.partial.remove(&sequence)?;
+                let mut frame = Vec::with_capacity(entry.total_bytes);
+                for fragment in entry.fragments {
+                    frame.extend_from_slice(&fragment?);
+                }
+                return Some(frame);
             }
         }
-        let missing_len = usize::from(length_xor);
-        if missing_len == 0 || missing_len > FRAME_PAYLOAD_BYTES {
-            return None;
-        }
-        let recovered = Bytes::copy_from_slice(&acc[..missing_len]);
-        let entry = self.partial.get_mut(&sequence)?;
-        entry.total_bytes += missing_len;
-        if entry.total_bytes > MAX_FRAME_BYTES {
-            self.partial.remove(&sequence);
-            return None;
-        }
-        entry.fragments[missing] = Some(recovered);
-        entry.received += 1;
-        let entry = self.partial.remove(&sequence)?;
-        let mut frame = Vec::with_capacity(entry.total_bytes);
-        for fragment in entry.fragments {
-            frame.extend_from_slice(&fragment?);
-        }
-        Some(frame)
     }
 }
 
@@ -1065,13 +1100,37 @@ mod tests {
     }
 
     #[test]
+    fn parity_recovers_burst_loss_across_interleaved_groups() {
+        // Three consecutive fragment losses land in three different
+        // interleaved groups — each is its group's only hole and recovers.
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 40)
+            .map(|index| (index % 211) as u8)
+            .collect();
+        let packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        let mut reassembler = Reassembler::default();
+        let mut rebuilt = None;
+        for (index, packet) in packets.iter().enumerate() {
+            if (10..13).contains(&index) {
+                continue;
+            }
+            if let Some(frame) = reassembler.add_datagram(packet, FRAME_KIND_SCREEN, 1, 2) {
+                rebuilt = Some(frame);
+            }
+        }
+        assert_eq!(rebuilt.as_deref(), Some(frame.as_slice()));
+    }
+
+    #[test]
     fn parity_cannot_recover_two_losses_in_one_group() {
+        // Interleaved groups for a 40-fragment frame are indices mod 3, so
+        // fragments 3 and 6 share a group — two holes defeat single-XOR.
         let frame = vec![5u8; FRAME_PAYLOAD_BYTES * 40];
         let packets =
             fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
         let mut reassembler = Reassembler::default();
         for (index, packet) in packets.iter().enumerate() {
-            if index == 3 || index == 4 {
+            if index == 3 || index == 6 {
                 continue;
             }
             assert!(

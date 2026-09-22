@@ -78,13 +78,16 @@ object VideoFrameProtocol {
     }
 
     /**
-     * Fragment one access unit and append one XOR-parity datagram per group of
-     * [PARITY_GROUP_FRAGMENTS] fragments. Each parity payload is the bytewise
+     * Fragment one access unit and append `ceil(count / PARITY_GROUP_FRAGMENTS)`
+     * XOR-parity datagrams. Groups are interleaved — group `g` covers fragment
+     * indices `g, g + numGroups, g + 2·numGroups, …` — so a burst of up to
+     * `numGroups − 1` consecutive losses lands in distinct groups and every
+     * loss stays single-XOR recoverable. Each parity payload is the bytewise
      * XOR of the group's payloads zero-padded to [PAYLOAD_BYTES]; its `flags`
      * field is the XOR of the covered payload lengths so a receiver can
-     * rebuild a singly-lost fragment byte-exact, including a short final
-     * fragment. Parity packets are emitted after the data burst. Only useful
-     * on lossy datagram flows — skip it on reliable streams.
+     * rebuild a lost fragment byte-exact, including a short final fragment.
+     * Parity packets are emitted after the data burst. Only useful on lossy
+     * datagram flows — skip it on reliable streams.
      */
     fun fragmentWithParity(
         kind: Int,
@@ -101,14 +104,13 @@ object VideoFrameProtocol {
             presentationTimeUs, codecConfigId, payload,
         )
         val count = packets.size
-        val parity = ArrayList<ByteArray>(count / PARITY_GROUP_FRAGMENTS + 1)
-        var groupIndex = 0
-        var start = 0
-        while (start < count) {
-            val end = minOf(start + PARITY_GROUP_FRAGMENTS, count)
+        val numGroups = (count + PARITY_GROUP_FRAGMENTS - 1) / PARITY_GROUP_FRAGMENTS
+        val parity = ArrayList<ByteArray>(numGroups)
+        for (groupIndex in 0 until numGroups) {
             val acc = ByteArray(PAYLOAD_BYTES)
             var lengthXor = 0
-            for (i in start until end) {
+            var i = groupIndex
+            while (i < count) {
                 val packet = packets[i]
                 val payloadLength = packet.size - HEADER_BYTES
                 lengthXor = lengthXor xor payloadLength
@@ -117,6 +119,7 @@ object VideoFrameProtocol {
                     acc[j] = (acc[j].toInt() xor packet[HEADER_BYTES + j].toInt()).toByte()
                     j++
                 }
+                i += numGroups
             }
             parity += ByteBuffer.allocate(HEADER_BYTES + PAYLOAD_BYTES)
                 .order(ByteOrder.LITTLE_ENDIAN)
@@ -133,8 +136,6 @@ object VideoFrameProtocol {
                 .putLong(codecConfigId)
                 .put(acc)
                 .array()
-            groupIndex++
-            start = end
         }
         return packets + parity
     }

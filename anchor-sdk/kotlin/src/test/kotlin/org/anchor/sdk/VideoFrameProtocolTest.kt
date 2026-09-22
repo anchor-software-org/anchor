@@ -109,20 +109,24 @@ class VideoFrameProtocolTest {
             codecConfigId = 5,
             payload = payload,
         )
-        // Group 1 covers fragment 16 only (the short tail); its parity record
-        // trails all data fragments: 17 data + group-0 parity at index 17.
+        // 17 fragments -> numGroups = 2, interleaved: group 0 covers the even
+        // indices {0,2,...,16}. Fragment 16 (the short tail) is in group 0,
+        // whose parity record trails the data at index 17.
         val missingIndex = 16
-        val parity = VideoFrameProtocol.decode(packets[18])!!
-        assertEquals(1, parity.header.fragmentIndex)
+        val parity = VideoFrameProtocol.decode(packets[17])!!
+        assertEquals(0, parity.header.fragmentIndex)
         val acc = parity.payload.copyOf()
         var lengthXor = parity.header.flags
-        for (i in 16 until 17) {
-            if (i == missingIndex) continue
-            val fragment = VideoFrameProtocol.decode(packets[i])!!.payload
-            lengthXor = lengthXor xor fragment.size
-            for (j in fragment.indices) {
-                acc[j] = (acc[j].toInt() xor fragment[j].toInt()).toByte()
+        var i = 0
+        while (i < 17) {
+            if (i != missingIndex) {
+                val fragment = VideoFrameProtocol.decode(packets[i])!!.payload
+                lengthXor = lengthXor xor fragment.size
+                for (j in fragment.indices) {
+                    acc[j] = (acc[j].toInt() xor fragment[j].toInt()).toByte()
+                }
             }
+            i += 2
         }
         val expectedTail = payload.copyOfRange(16 * VideoFrameProtocol.PAYLOAD_BYTES, payload.size)
         assertEquals(expectedTail.size, lengthXor)
