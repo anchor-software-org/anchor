@@ -371,6 +371,7 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
     /// content rect [off_x, off_y, inner_w × inner_h] is left untouched, so a
     /// full-canvas content rect costs nothing and a pillarboxed portrait
     /// stream fills just the side columns rather than the whole canvas.
+    #[allow(clippy::too_many_arguments)]
     fn fill_plane_margins(
         plane: &mut [u8],
         stride: usize,
@@ -463,6 +464,7 @@ fn camera_receiver_loop(fd: RawFd, rx: Receiver<Arc<Vec<u8>>>) -> Result<(), Str
     /// `rows` rows starting at (col, row). The Android NV12 helper corrupts
     /// the source's rightmost chroma column; after the mirrored paste that
     /// lands on the left edge of the output.
+    #[allow(clippy::too_many_arguments)]
     fn clamp_canvas_columns(
         canvas: &mut [u8],
         canvas_base: usize,
