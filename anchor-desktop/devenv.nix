@@ -104,6 +104,11 @@
     pnpm --dir frontend run check
   '';
 
+  # Run a CI job exactly as GitHub runs it (../scripts/ci.sh job list).
+  scripts.ci.exec = ''
+    exec "$DEVENV_ROOT/../scripts/ci.sh" "$@"
+  '';
+
   enterShell = ''
     echo "Anchor development environment"
     rustc --version

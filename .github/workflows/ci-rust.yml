@@ -33,7 +33,7 @@ jobs:
 
       - name: Verify SDK source checkout
         working-directory: .
-        run: bash scripts/verify-sdk-source.sh
+        run: bash scripts/ci/sdk-conformance.sh
 
   ci:
     name: fmt + clippy + test
@@ -64,22 +64,6 @@ jobs:
             libxdo-dev \
             llvm-dev
 
-      # Building FFmpeg 8.1 from source (the local/release default, kept for
-      # compatibility) dominates this job's runtime. PR validation doesn't
-      # ship this binary, so link a pinned, hash-verified prebuilt instead.
-      # Never do this for local development or verification-artifacts.yml.
-      - name: Link prebuilt FFmpeg (PR CI only)
-        env:
-          FFMPEG_URL: https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-13-14-50/ffmpeg-n8.1.2-52-g5a03dfa0f6-linux64-gpl-shared-8.1.tar.xz
-          FFMPEG_SHA256: 8621a28ecbbe87df59b571e2709f4d5492c7c87c11455028f10b2f6324578160
-        run: |
-          curl -fsSL -o /tmp/ffmpeg-prebuilt.tar.xz "$FFMPEG_URL"
-          echo "$FFMPEG_SHA256  /tmp/ffmpeg-prebuilt.tar.xz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/ffmpeg-prebuilt"
-          tar xf /tmp/ffmpeg-prebuilt.tar.xz -C "$RUNNER_TEMP/ffmpeg-prebuilt" --strip-components=1
-          echo "FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-prebuilt" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/ffmpeg-prebuilt/lib" >> "$GITHUB_ENV"
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -90,18 +74,6 @@ jobs:
           cache: pnpm
           cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
 
-      - name: Install Tauri frontend dependencies
-        working-directory: anchor-desktop/frontend
-        run: pnpm install --frozen-lockfile
-
-      - name: Check Tauri frontend
-        working-directory: anchor-desktop/frontend
-        run: pnpm run check
-
-      - name: Build Tauri frontend
-        working-directory: anchor-desktop/frontend
-        run: pnpm run build
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -111,23 +83,9 @@ jobs:
           workspaces: |
             anchor-desktop
 
-      - name: cargo fmt --check
-        run: |
-          cargo fmt --all --check
-
-      - name: cargo clippy
-        env:
-          RUSTFLAGS: "-D warnings"
-        run: |
-          cargo clippy --all-targets --no-default-features --features ffmpeg-prebuilt
-
-      - name: cargo test
-        run: cargo test --no-default-features --features ffmpeg-prebuilt -- --nocapture
-
-      - name: Check standalone video benchmarks
-        run: |
-          cargo test --manifest-path tools/frame-queue-bench/Cargo.toml
-          cargo check --manifest-path tools/wayland-encode-bench/Cargo.toml
-
-      - name: Check Tauri host
-        run: cargo check --locked --no-default-features --features ffmpeg-prebuilt
+      # The job's step list lives in the script so local runs match exactly;
+      # it also fetches the pinned prebuilt FFmpeg (PR CI doesn't ship the
+      # binary, so vendoring FFmpeg from source would dominate runtime).
+      - name: fmt + clippy + test
+        working-directory: .
+        run: bash scripts/ci/check.sh
