@@ -65,7 +65,7 @@ pub struct SdkScreenSender {
     /// every following P-frame references it. Once the replaceable-frame
     /// queue coalesces anything, hold P-frames until the next IDR arrives.
     /// This keeps the receiver from displaying a stale/broken reference chain.
-    stream_waiting_for_keyframe: Arc<AtomicBool>,
+    waiting_for_keyframe: Arc<AtomicBool>,
     capability_session_id: u64,
     frame_sequence: Arc<AtomicU64>,
     /// Monotonic admission schedule for screen access units.  Quinn paces
@@ -156,7 +156,7 @@ impl SdkScreenSender {
             frame_target: Arc::new(Mutex::new(None)),
             keyframe_request: Arc::new(Mutex::new(None)),
             last_keyframe_request: Arc::new(Mutex::new(None)),
-            stream_waiting_for_keyframe: Arc::new(AtomicBool::new(false)),
+            waiting_for_keyframe: Arc::new(AtomicBool::new(false)),
             capability_session_id,
             frame_sequence: Arc::new(AtomicU64::new(0)),
             next_frame_at: Arc::new(Mutex::new(Instant::now())),
@@ -226,11 +226,11 @@ impl SdkScreenSender {
         }
     }
 
-    /// Mark a producer-side coalescing gap on the reliable stream. The next
+    /// Mark a producer-side coalescing gap on either transport. The next
     /// access unit must be an IDR before any predictive unit is useful again.
-    pub fn mark_stream_gap(&self) {
-        if matches!(*self.frame_target.lock().unwrap(), Some(FrameTarget::Stream(_))) {
-            self.stream_waiting_for_keyframe.store(true, Ordering::Release);
+    pub fn mark_frame_gap(&self) {
+        if self.frame_target.lock().unwrap().is_some() {
+            self.waiting_for_keyframe.store(true, Ordering::Release);
             self.request_keyframe_recovery();
         }
     }
@@ -267,20 +267,20 @@ impl SdkScreenSender {
         );
         let flags = if contains_h264_idr(frame) { video_frame::FLAG_KEYFRAME } else { 0 };
         let keyframe = flags & video_frame::FLAG_KEYFRAME != 0;
-        if matches!(target, FrameTarget::Stream(_))
-            && should_drop_stream_predictive_frame(
-                self.stream_waiting_for_keyframe.load(Ordering::Acquire),
-                keyframe,
-            )
+        if should_drop_predictive_frame(self.waiting_for_keyframe.load(Ordering::Acquire), keyframe)
         {
-            // Do not put a P-frame after a coalescing gap on an ordered H.264
-            // stream. It references an access unit that was never delivered.
+            // Do not put a P-frame after a coalescing gap on either
+            // transport. It references an access unit that was never
+            // delivered; on datagrams it would also waste the loss budget.
             crate::anchorwayland::frame_trace::event!(
                 "sender_outcome",
                 {
                     "source_frame_id": source_frame_id,
                     "sender_sequence": sequence,
-                    "transport": "reliable_stream",
+                    "transport": match target {
+                        FrameTarget::Stream(_) => "reliable_stream",
+                        FrameTarget::Datagram(_) => "datagram",
+                    },
                     "outcome": "dropped",
                     "reason": "awaiting_keyframe_after_coalescing",
                     "encoded_bytes": frame.len(),
@@ -289,7 +289,7 @@ impl SdkScreenSender {
             return false;
         }
         if keyframe {
-            self.stream_waiting_for_keyframe.store(false, Ordering::Release);
+            self.waiting_for_keyframe.store(false, Ordering::Release);
         }
         let fragment_result = if self.fec_enabled && matches!(target, FrameTarget::Datagram(_)) {
             // Datagrams are lossy — append XOR parity so receivers can rebuild
@@ -397,7 +397,7 @@ impl SdkScreenSender {
             let stream_send_us = stream_started.elapsed().as_micros();
             if let Err(error) = result {
                 if should_schedule_keyframe_recovery(keyframe) {
-                    self.stream_waiting_for_keyframe.store(true, Ordering::Release);
+                    self.waiting_for_keyframe.store(true, Ordering::Release);
                     self.request_keyframe_recovery();
                 }
                 log::warn!(
@@ -550,7 +550,7 @@ fn should_schedule_keyframe_recovery(keyframe: bool) -> bool {
     !keyframe
 }
 
-fn should_drop_stream_predictive_frame(waiting_for_keyframe: bool, keyframe: bool) -> bool {
+fn should_drop_predictive_frame(waiting_for_keyframe: bool, keyframe: bool) -> bool {
     waiting_for_keyframe && !keyframe
 }
 
@@ -776,6 +776,11 @@ impl SdkScreenBinding {
                                 "reason": "replaceable_queue_newer_frame",
                             }
                         );
+                        // Coalesced access units are real losses for the
+                        // decoder: this frame's P-slices reference AUs that
+                        // were never sent. Suppress predictive frames until
+                        // one recovery IDR heals the chain.
+                        sender.mark_frame_gap();
                     }
                     if !sender.send_frame(&frame) {
                         log::debug!("SDK screen frame dropped for {device_id}");
@@ -831,7 +836,7 @@ impl SdkScreenBinding {
                                 "reason": "replaceable_queue_newer_frame",
                             }
                         );
-                        sender.mark_stream_gap();
+                        sender.mark_frame_gap();
                     }
                     if !sender.send_frame(&frame) {
                         log::debug!("SDK screen reliable-stream frame dropped for {device_id}");
@@ -922,8 +927,8 @@ mod tests {
 
     #[test]
     fn reliable_stream_holds_predictive_frames_after_a_gap() {
-        assert!(should_drop_stream_predictive_frame(true, false));
-        assert!(!should_drop_stream_predictive_frame(true, true));
-        assert!(!should_drop_stream_predictive_frame(false, false));
+        assert!(should_drop_predictive_frame(true, false));
+        assert!(!should_drop_predictive_frame(true, true));
+        assert!(!should_drop_predictive_frame(false, false));
     }
 }
