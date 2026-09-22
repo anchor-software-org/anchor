@@ -85,6 +85,12 @@ The script writes `libmsquic.so` and `libanchor_msquic_jni.so` to
 `src/main/jniLibs/<abi>/`. These local build outputs are not checked in. Build
 each ABI that the application ships.
 
+Gradle packages whatever `jniLibs/` contains without checking it — an APK
+built before this step succeeds, then fails at runtime with
+`UnsatisfiedLinkError` when `MsQuicRuntime` calls `System.loadLibrary`. If an
+installed app crashes on first connect, missing native libraries are the first
+thing to check.
+
 ## Connect and exchange data
 
 Create a `QuicConnectRequest` with the peer address, server name, the SHA-256

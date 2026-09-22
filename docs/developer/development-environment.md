@@ -23,6 +23,25 @@ For an existing checkout:
 git submodule update --init --recursive
 ```
 
+### Submodules and native libraries
+
+Anchor vendors its QUIC implementation differently per platform:
+
+- **Android** uses [MsQuic](https://github.com/microsoft/msquic) at
+  `anchor-sdk/kotlin/src/main/cpp/third_party/msquic`. MsQuic itself carries a
+  nested submodule, `submodules/quictls` (the OpenSSL fork it uses for TLS)
+- **Desktop** uses [Quinn](https://github.com/quinn-rs/quinn), a pure-Rust QUIC
+  implementation fetched by Cargo. There is nothing to build or initialize.
+
+The MsQuic build outputs are **not checked in**. The Gradle build packages whatever is present in `anchor-sdk/kotlin/src/main/jniLibs/<abi>/` — a fresh clone ships no `.so` files there, yet the APK still builds and installs successfully. 
+
+Build the native libraries once after cloning, and again whenever the MsQuic submodule pin moves or `jniLibs/` is cleaned:
+
+```sh
+android-msquic-build-all
+```
+This produces `libmsquic.so` and `libanchor_msquic_jni.so` for `arm64-v8a`, `armeabi-v7a`, and `x86_64`. To build a single ABI, use `android-msquic-build <abi>`.
+
 ## Android
 
 From the repository root, enter the Android shell:
@@ -82,6 +101,31 @@ cargo test
 `build-image` uses Docker by default. Set `CONTAINER_ENGINE` to a compatible
 engine if needed. It writes the AppImage under
 `anchor-desktop/target/appimage/`.
+
+### How the desktop build is wired
+
+The desktop is a Tauri app: a Rust binary hosting a WebKitGTK webview whose UI
+lives in `frontend/` (Svelte + Vite, built with **pnpm** — not npm). The
+coupling is in `anchor-desktop/tauri.conf.json`:
+
+- `cargo tauri dev` runs `beforeDevCommand` (`pnpm run dev`) to start the Vite
+  dev server on port 1420 and points the webview at it.
+- `cargo tauri build` runs `beforeBuildCommand` (`pnpm run build`) and embeds
+  the resulting `frontend/dist` into the binary.
+
+Entering the devenv shell runs `pnpm install` automatically
+(`languages.javascript.pnpm.install.enable` in `devenv.nix`). Outside devenv,
+run `pnpm --dir frontend install` yourself first.
+
+`frontend/dist` is not checked in, and `cargo run`/`cargo build` do **not**
+invoke the Tauri hooks — Tauri embeds `frontend/dist` at compile time, so a
+bare `cargo run --release` on a fresh checkout fails or produces a blank
+window. Either use `dev`/`cargo tauri build`, or build the frontend first:
+
+```sh
+pnpm --dir frontend install
+pnpm --dir frontend build
+```
 
 The Sideboat baselines also need a host `ffmpeg`; `--headed` needs `ffplay`.
 VA-API benchmarks additionally need a usable DRM render device and driver.
