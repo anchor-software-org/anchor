@@ -14,6 +14,11 @@ use thiserror::Error;
 
 pub const FRAME_MAGIC: [u8; 4] = *b"ANFR";
 pub const FRAME_VERSION: u8 = 1;
+/// Wire version stamped on parity datagrams. It tags the grouping scheme —
+/// v1 parity used contiguous 16-fragment groups, v2 interleaves members —
+/// so receivers can apply the matching math or safely drop what they do not
+/// understand. Data fragments stay on version 1; only parity moves.
+pub const PARITY_WIRE_VERSION: u8 = 2;
 pub const FRAME_KIND_SCREEN: u8 = 1;
 pub const FRAME_KIND_CAMERA: u8 = 2;
 /// XOR-parity redundancy record covering one group of data fragments of the
@@ -120,7 +125,7 @@ impl FrameHeader {
         if datagram[..4] != FRAME_MAGIC {
             return Err(FrameError::InvalidMagic);
         }
-        if datagram[4] != FRAME_VERSION {
+        if !matches!(datagram[4], 1 | 2) {
             return Err(FrameError::UnsupportedVersion(datagram[4]));
         }
         let kind = datagram[5];
@@ -303,6 +308,10 @@ pub fn fragment_frame_with_parity(
             codec_config_id,
         }
         .write(&mut bytes, &acc);
+        // Parity wire version tags the grouping scheme: v1 was contiguous
+        // groups, v2 interleaves members. Receivers that only know v1 reject
+        // the header outright — never mis-reconstruct with the wrong scheme.
+        bytes[4] = PARITY_WIRE_VERSION;
         parity.push(Bytes::from(bytes));
     }
     packets.extend(parity);
@@ -487,9 +496,10 @@ impl Reassembler {
         let received = entry.received;
         let fragment_count = usize::from(entry.fragment_count);
         if received != fragment_count {
-            // Only the one-short state can be parity-recoverable; skip the
-            // lookup for every other in-flight fragment.
-            if received + 1 == fragment_count {
+            // Parity can only help while every missing fragment could still
+            // sit in a distinct group; deeper holes are guaranteed dead.
+            let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
+            if fragment_count - received <= num_groups {
                 return self.try_parity_recovery(header.sequence);
             }
             return None;
@@ -504,10 +514,15 @@ impl Reassembler {
 
     /// Store one parity datagram keyed by (frame sequence, group index).
     /// Parity payloads are fixed-width; a short or absent payload can never
-    /// reconstruct anything, so it is dropped.
+    /// reconstruct anything, so it is dropped. Only `PARITY_WIRE_VERSION`
+    /// records are applied: builds between the first contiguous-parity
+    /// implementation and the interleaved rewrite both stamped `1`, so a
+    /// v1 record's grouping is unknowable and reconstructing from it could
+    /// yield garbage bytes — dropping costs only the recovery itself.
     fn store_parity(&mut self, header: FrameHeader, datagram: &Bytes) {
         let payload = datagram.slice(FRAME_HEADER_BYTES..);
-        if payload.len() != FRAME_PAYLOAD_BYTES
+        if datagram[4] != PARITY_WIRE_VERSION
+            || payload.len() != FRAME_PAYLOAD_BYTES
             || self.pending_parities.len() >= MAX_PENDING_PARITIES
         {
             return;
@@ -536,30 +551,34 @@ impl Reassembler {
                 if entry.fragments.len() - entry.received > num_groups {
                     return None;
                 }
-                let mut group_holes = vec![0usize; num_groups];
+                let mut holes = vec![0usize; num_groups];
                 for (index, slot) in entry.fragments.iter().enumerate() {
                     if slot.is_none() {
-                        group_holes[index % num_groups] += 1;
+                        holes[index % num_groups] += 1;
                     }
                 }
                 entry
                     .fragments
                     .iter()
                     .enumerate()
-                    .filter(|(index, slot)| {
-                        slot.is_none()
-                            && group_holes[index % num_groups] == 1
+                    .find_map(|(index, slot)| {
+                        if slot.is_some() {
+                            return None;
+                        }
+                        let group = index % num_groups;
+                        if holes[group] == 1
                             && self
                                 .pending_parities
-                                .contains_key(&(sequence, (index % num_groups) as u16))
+                                .contains_key(&(sequence, group as u16))
+                        {
+                            return Some((index, group));
+                        }
+                        None
                     })
-                    .map(|(index, _)| index)
-                    .next()
             };
-            let missing = candidate?;
+            let (missing, group) = candidate?;
             let entry = self.partial.get(&sequence)?;
             let num_groups = entry.fragments.len().div_ceil(PARITY_GROUP_FRAGMENTS);
-            let group = missing % num_groups;
             let parity = self.pending_parities.get(&(sequence, group as u16))?;
             let mut acc = [0_u8; FRAME_PAYLOAD_BYTES];
             acc.copy_from_slice(&parity.payload);
@@ -660,12 +679,18 @@ mod tests {
 
     #[test]
     fn decode_rejects_supported_version() {
+        // Version 2 is the parity grouping-scheme tag; anything past it is
+        // genuinely unknown and must still be rejected.
         let mut packet = valid_packet();
-        packet[4] = 2;
+        packet[4] = 3;
         assert_eq!(
             FrameHeader::decode(&packet),
-            Err(FrameError::UnsupportedVersion(2)),
+            Err(FrameError::UnsupportedVersion(3)),
         );
+        for version in [1u8, PARITY_WIRE_VERSION] {
+            packet[4] = version;
+            assert!(FrameHeader::decode(&packet).is_ok());
+        }
     }
 
     #[test]
@@ -1156,6 +1181,36 @@ mod tests {
             }
         }
         assert_eq!(rebuilt.unwrap(), frame);
+    }
+
+    #[test]
+    fn parity_with_legacy_v1_wire_tag_is_ignored() {
+        // Builds between the first contiguous-parity implementation and the
+        // interleaved rewrite both stamped version 1, so a v1 record's
+        // grouping is unknowable. Applying it risks reconstructing garbage —
+        // the record must be dropped even when it could have helped.
+        let frame: Vec<u8> = (0..FRAME_PAYLOAD_BYTES * 18)
+            .map(|index| (index % 197) as u8)
+            .collect();
+        let mut packets =
+            fragment_frame_with_parity(FRAME_KIND_SCREEN, 0, 1, 2, 3, 4, 5, &frame).unwrap();
+        for packet in packets.iter_mut().skip(18) {
+            let mut downgraded = packet.to_vec();
+            downgraded[4] = 1;
+            *packet = Bytes::from(downgraded);
+        }
+        let mut reassembler = Reassembler::default();
+        for (index, packet) in packets.iter().enumerate() {
+            if index == 1 {
+                continue;
+            }
+            assert!(
+                reassembler
+                    .add_datagram(packet, FRAME_KIND_SCREEN, 1, 2)
+                    .is_none()
+            );
+        }
+        assert!(reassembler.pending_parities.is_empty());
     }
 
     #[test]

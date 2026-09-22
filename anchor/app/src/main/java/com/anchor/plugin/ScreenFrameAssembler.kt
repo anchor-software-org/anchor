@@ -239,13 +239,26 @@ internal class ScreenFrameAssembler(
         return output
     }
 
-    /** Store one parity datagram; short payloads can never reconstruct. */
+    /**
+     * Store one parity datagram; short payloads can never reconstruct. Only
+     * PARITY_WIRE_VERSION records are applied — builds between the first
+     * contiguous-parity implementation and the interleaved rewrite both
+     * stamped version 1, so a v1 record's grouping is unknowable and
+     * reconstructing from it could yield garbage bytes.
+     */
     private fun storeParity(header: VideoFrameProtocol.Header, payload: ByteArray, nowNs: Long) {
-        if (payload.size != VideoFrameProtocol.PAYLOAD_BYTES || parityCount >= MAX_PARITY_RECORDS) {
+        if (header.version != VideoFrameProtocol.PARITY_WIRE_VERSION ||
+            payload.size != VideoFrameProtocol.PAYLOAD_BYTES ||
+            parityCount >= MAX_PARITY_RECORDS
+        ) {
             return
         }
         val groups = pendingParities.getOrPut(header.sequence) { HashMap() }
-        if (groups.put(header.fragmentIndex, ParityRecord(nowNs, header.flags, payload)) == null) {
+        if (groups.put(
+                header.fragmentIndex,
+                ParityRecord(nowNs, header.flags, payload),
+            ) == null
+        ) {
             parityCount++
         }
     }
