@@ -631,6 +631,20 @@ fn process_frame(
         // Fall through — encoder now exists (if init succeeded), encode this frame.
     }
 
+    // ── Congestion backpressure ──────────────────────────────────────────────
+    // A subscriber queue was full on the last publish. Skip ENCODING entirely
+    // rather than producing an access unit that gets dropped post-encode: a
+    // frame the encoder never saw cannot break the decoder's reference chain,
+    // so congestion costs framerate instead of a ~350KB recovery IDR (which
+    // then stalls the pacer and causes the next drop — the IDR treadmill).
+    // Pending keyframe requests stay queued and are honored once a drain
+    // thread clears the flag.
+    if broadcaster.as_ref().is_some_and(|bc| bc.has_backpressure()) {
+        state.frame_drops += 1;
+        state.total_frame_drops += 1;
+        return false;
+    }
+
     // ── Handle IDR requests from broadcaster ─────────────────────────────────
     // Peek rather than take: if honoring is still rate-limited, the flag stays
     // set so a later frame forces the IDR once the interval elapses.
