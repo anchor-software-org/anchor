@@ -109,9 +109,10 @@ class VideoFrameProtocolTest {
             codecConfigId = 5,
             payload = payload,
         )
-        // Group 1 covers fragments 16..16 (the short tail); drop it.
+        // Group 1 covers fragment 16 only (the short tail); its parity record
+        // trails all data fragments: 17 data + group-0 parity at index 17.
         val missingIndex = 16
-        val parity = VideoFrameProtocol.decode(packets[17])!!
+        val parity = VideoFrameProtocol.decode(packets[18])!!
         assertEquals(1, parity.header.fragmentIndex)
         val acc = parity.payload.copyOf()
         var lengthXor = parity.header.flags
