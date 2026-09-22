@@ -64,6 +64,11 @@
 
   scripts.android-build.exec = ''
     set -euo pipefail
+    if ! find "$DEVENV_ROOT/anchor-sdk/kotlin/src/main/jniLibs" -name '*.so' -print -quit 2>/dev/null | grep -q .; then
+      echo "warning: no native libraries under anchor-sdk/kotlin/src/main/jniLibs/" >&2
+      echo "the APK builds but crashes on first connect (UnsatisfiedLinkError)." >&2
+      echo "run: android-msquic-build-all" >&2
+    fi
     cd "$DEVENV_ROOT/anchor"
     exec ./gradlew :app:assembleDebug --no-daemon "$@"
   '';
@@ -102,5 +107,10 @@
     fi
     echo "Anchor Android development environment"
     echo "Use android-env, android-msquic-build [ABI], android-build, android-sdk-test, or android-install"
+    if [[ ! -f "$DEVENV_ROOT/anchor-sdk/kotlin/src/main/cpp/third_party/msquic/CMakeLists.txt" ]]; then
+      echo "note: MsQuic submodule not initialized — run: git submodule update --init --recursive" >&2
+    elif ! find "$DEVENV_ROOT/anchor-sdk/kotlin/src/main/jniLibs" -name '*.so' -print -quit 2>/dev/null | grep -q .; then
+      echo "note: Android native libraries not built — run: android-msquic-build-all" >&2
+    fi
   '';
 }
