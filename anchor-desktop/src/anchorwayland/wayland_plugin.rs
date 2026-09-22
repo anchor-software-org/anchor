@@ -9,6 +9,7 @@ use crate::anchorwayland::vaapi_encoder::{VaapiDeviceCtx, VaapiEncoder};
 use crate::anchorwayland::wayland_objects::DrmBufParams;
 use serde_json::json;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -113,6 +114,10 @@ struct CaptureState {
     next_encode_deadline: Option<Instant>,
     backend: Box<dyn CaptureBackend>,
     last_encoded_frame_time: Option<Instant>,
+    /// When the last recovery IDR was forced. Rate-limits keyframe honoring
+    /// so sustained backpressure can't turn into an IDR-per-frame storm —
+    /// each 300KB+ keyframe competes with the media that is already behind.
+    last_forced_idr: Option<Instant>,
     frame_drops: u64,
     total_frame_drops: u64,
     trace_ring: Arc<TraceRing>,
@@ -348,6 +353,7 @@ impl Plugin for AnchorPluginWayland {
                     next_encode_deadline: None,
                     backend,
                     last_encoded_frame_time: None,
+                    last_forced_idr: None,
                     frame_drops: 0,
                     total_frame_drops: 0,
                     trace_ring: Arc::new(TraceRing::new()),
@@ -448,7 +454,13 @@ impl Plugin for AnchorPluginWayland {
                             // Encoder re-created on next frame via process_frame.
                         }
                         CaptureAction::RequestKeyframe => {
-                            request_idr(&mut state, w, h, fourcc, &tx);
+                            // The receiver re-requests while awaiting IDR, so
+                            // honor at most one per interval; the next request
+                            // arrives before the limit could stall recovery.
+                            if idr_request_due(&state, Instant::now()) {
+                                state.last_forced_idr = Some(Instant::now());
+                                request_idr(&mut state, w, h, fourcc, &tx);
+                            }
                         }
                         CaptureAction::ResyncToPhone => {
                             let s = if state.streaming { "streaming" } else { "starting" };
@@ -620,9 +632,15 @@ fn process_frame(
     }
 
     // ── Handle IDR requests from broadcaster ─────────────────────────────────
-    if state.h264_encoder.is_some()
-        && broadcaster.as_ref().is_some_and(|bc| bc.take_keyframe_request())
-    {
+    // Peek rather than take: if honoring is still rate-limited, the flag stays
+    // set so a later frame forces the IDR once the interval elapses.
+    let keyframe_pending =
+        broadcaster.as_ref().is_some_and(|bc| bc.needs_keyframe.load(Ordering::Relaxed));
+    if state.h264_encoder.is_some() && keyframe_pending && idr_request_due(state, Instant::now()) {
+        if let Some(bc) = broadcaster {
+            bc.take_keyframe_request();
+        }
+        state.last_forced_idr = Some(Instant::now());
         state.frame_drops += 1;
         state.total_frame_drops += 1;
         log::debug!("Frame drop #{} — forcing IDR on next frame", state.total_frame_drops);
@@ -877,6 +895,14 @@ fn start_streaming(
             );
         }
     }
+}
+
+/// Minimum spacing between honored IDR requests. Matches the receiver's
+/// re-request cadence so a fresh request always lands before recovery stalls.
+const MIN_IDR_INTERVAL: Duration = Duration::from_millis(250);
+
+fn idr_request_due(state: &CaptureState, now: Instant) -> bool {
+    state.last_forced_idr.is_none_or(|at| now.duration_since(at) >= MIN_IDR_INTERVAL)
 }
 
 /// Force the next encoded frame to be an IDR keyframe so a decoder that lost
@@ -1536,6 +1562,7 @@ mod tests {
             next_encode_deadline: None,
             backend: Box::new(MockBackend::new(vec![])),
             last_encoded_frame_time: None,
+            last_forced_idr: None,
             frame_drops: 0,
             total_frame_drops: 0,
             trace_ring: Arc::new(TraceRing::new()),

@@ -112,7 +112,6 @@ impl FrameBroadcaster {
         });
         let legacy_frame = data;
         let mut all_delivered = true;
-        let mut legacy_drop = false;
         senders.retain(|id, tx| match tx.try_send(Arc::clone(&legacy_frame)) {
             Ok(()) => true,
             Err(mpsc::TrySendError::Full(_)) => {
@@ -127,12 +126,6 @@ impl FrameBroadcaster {
                     }
                 );
                 all_delivered = false;
-                // The SDK screen path intentionally drops replaceable frames
-                // and has its own transport-aware recovery. Keep IDR recovery
-                // enabled for other subscribers.
-                if !id.starts_with("sdk-") {
-                    legacy_drop = true;
-                }
                 true
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -179,7 +172,11 @@ impl FrameBroadcaster {
                 }
             );
         }
-        if legacy_drop {
+        // Any dropped access unit breaks the H.264 reference chain — the
+        // decoder's next P-frame would reference a frame it never received.
+        // This applies to SDK subscribers too: a publish-side drop never
+        // reaches their transport recovery, so the encoder must emit an IDR.
+        if !all_delivered {
             self.needs_keyframe.store(true, Ordering::Relaxed);
         }
         all_delivered
@@ -270,12 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn sdk_screen_queue_drop_does_not_force_keyframe() {
+    fn sdk_screen_queue_drop_forces_keyframe() {
+        // A publish-side drop breaks the decoder's reference chain and never
+        // reaches transport recovery — the encoder must emit an IDR.
         let bc = FrameBroadcaster::new();
         let _rx = bc.subscribe("sdk-screen:device-1".to_string(), 1);
         bc.publish(vec![1]);
         assert!(!bc.publish(vec![2]));
-        assert!(!bc.take_keyframe_request());
+        assert!(bc.take_keyframe_request());
     }
 
     #[test]
