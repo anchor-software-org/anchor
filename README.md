@@ -21,7 +21,19 @@ before installing.
 ## Install and build
 
 See the [installation guide](docs/public/getting-started/installation.md) for
-packages and compositor requirements.
+packages and compositor requirements. Development builds use
+[devenv](https://devenv.sh/); see
+[docs/developer/development-environment.md](docs/developer/development-environment.md)
+for the full setup.
+
+Clone with submodules — the Android SDK's QUIC transport (MsQuic) lives in a
+nested submodule:
+
+```bash
+git clone --recursive <repository-url>
+# or, in an existing checkout:
+git submodule update --init --recursive
+```
 
 To build the Android app from a checkout:
 
@@ -30,14 +42,29 @@ cd anchor
 ./gradlew installDebug
 ```
 
+The Gradle build packages whatever is in the SDK's `jniLibs/` directory and
+does **not** build MsQuic itself. If the native libraries have never been
+built, the APK installs fine but crashes on first connect. Build them once
+first (from the repository root devenv shell):
+
+```bash
+android-msquic-build-all
+```
+
 To build the Linux desktop application:
 
 ```bash
 cd anchor-desktop
-cargo run --release
+devenv shell
+dev
 ```
 
-The desktop build needs the native libraries listed in the installation guide.
+`dev` runs `cargo tauri dev`, which starts the frontend (pnpm + Vite) and the
+Rust app together. A plain `cargo run` skips the frontend build — Tauri
+embeds `frontend/dist` at compile time, so without it the build fails or the
+window is blank. The desktop build needs the native libraries listed in the
+installation guide. The desktop uses Quinn (pure-Rust QUIC); MsQuic is
+Android-only.
 
 ## Learn more
 
