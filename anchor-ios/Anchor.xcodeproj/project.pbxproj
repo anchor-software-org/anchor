@@ -29,6 +29,7 @@
 		AA0001030000000300000003 /* ClipboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001040000000400000004 /* ClipboardView.swift */; };
 		FE1C89EBE8BBFF8D916399AC /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C32A8D51FBF9C10FB8E041C8 /* Assets.xcassets */; };
 		FF3DA49C17174A36EDC4842C /* InputPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C11C6E55F38CA127A8E61055 /* InputPlugin.swift */; };
+		A10000000000000000000001 /* AnchorSDK in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000002 /* AnchorSDK */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -69,6 +70,17 @@
 		CD5B93FC85E023B3EFC90546 /* NetworkPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPlugin.swift; sourceTree = "<group>"; };
 		E9EFE4D94569E104A5007E9E /* ConnectionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionModels.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* AnchorSDK in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		1D3AC49A64DBCD360DC5C93E /* Core */ = {
@@ -183,6 +195,7 @@
 			buildConfigurationList = 9A3340A0BCD8AA8B00BE46C6 /* Build configuration list for PBXNativeTarget "Anchor" */;
 			buildPhases = (
 				63D364B80E211DB48EB26372 /* Sources */,
+				A10000000000000000000003 /* Frameworks */,
 				7346EBA95A3342D71D986520 /* Resources */,
 			);
 			buildRules = (
@@ -191,6 +204,7 @@
 			);
 			name = Anchor;
 			packageProductDependencies = (
+				A10000000000000000000002 /* AnchorSDK */,
 			);
 			productName = Anchor;
 			productReference = 067C4B964D6B6AD5DC23BD6C /* Anchor.app */;
@@ -243,12 +257,30 @@
 			minimizedProjectReferenceProxies = 1;
 			projectDirPath = "";
 			projectRoot = "";
+			packageReferences = (
+				A10000000000000000000004 /* XCLocalSwiftPackageReference "../anchor-sdk/swift" */,
+			);
 			targets = (
 				6F5D2FC464FFAA1DA15E11C1 /* Anchor */,
 				F550439999E9EDA3665F573C /* AnchorTests */,
 			);
 		};
 /* End PBXProject section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A10000000000000000000004 /* XCLocalSwiftPackageReference "../anchor-sdk/swift" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../anchor-sdk/swift;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000002 /* AnchorSDK */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000004 /* XCLocalSwiftPackageReference "../anchor-sdk/swift" */;
+			productName = AnchorSDK;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXResourcesBuildPhase section */
 		7346EBA95A3342D71D986520 /* Resources */ = {

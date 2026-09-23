@@ -13,6 +13,21 @@ public protocol AnchorQuicTransport: AnyObject {
     func close()
 }
 
+/// Type-erased ordered byte stream returned by a multiplexed QUIC transport.
+public protocol AnchorReliableStream: AnyObject {
+    var streamIdentifier: UInt64 { get }
+    func receive(maximumLength: Int) async throws -> Data
+    func send(_ bytes: Data) async throws
+}
+
+/// Operations needed by an Anchor host in addition to the control transport.
+/// Pairing remains an explicit phase; secondary streams are bound through the
+/// Protocol v1 StreamOpen/StreamOpened exchange before carrying feature data.
+public protocol AnchorNetworkQuicTransport: AnchorQuicTransport {
+    func connectForPairing(host: String, port: UInt16, serverName: String) async throws -> Data
+    func openReliableStream() async throws -> any AnchorReliableStream
+}
+
 public struct AnchorQuicConfiguration: Equatable {
     public let alpn: String
     public let maxControlRecordBytes: Int

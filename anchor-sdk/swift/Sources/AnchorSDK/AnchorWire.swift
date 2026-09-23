@@ -12,6 +12,8 @@ public enum AnchorWireError: Error, Equatable {
     case unsupportedFrameVersion(UInt8)
     case invalidFrameKind(UInt8)
     case invalidFrameFragments
+    case invalidStreamPacketLength
+    case frameBindingMismatch
     case frameTooLarge
 }
 
@@ -112,16 +114,7 @@ public struct AnchorControlFramer {
             expectingPreface = false
         }
 
-        if buffer.count >= 10 {
-            let varintBytes = buffer.prefix(10)
-            let hasContinuation = varintBytes.allSatisfy { ($0 & 0x80) != 0 }
-            let tenthByteOverflows = (varintBytes.last ?? 0) & 0x80 != 0 ||
-                (varintBytes.last ?? 0) & 0x7f > 1
-            if hasContinuation || tenthByteOverflows {
-                throw AnchorWireError.malformedVarint
-            }
-        }
-        guard let (length, prefixBytes) = Self.decodeVarint(buffer) else { return nil }
+        guard let (length, prefixBytes) = try Self.decodeVarint(buffer) else { return nil }
         guard length <= Self.maxRecordBytes else { throw AnchorWireError.controlRecordTooLarge }
         let total = prefixBytes + length
         guard buffer.count >= total else { return nil }
@@ -160,12 +153,14 @@ public struct AnchorControlFramer {
         return result
     }
 
-    private static func decodeVarint(_ data: Data) -> (length: Int, bytes: Int)? {
+    private static func decodeVarint(_ data: Data) throws -> (length: Int, bytes: Int)? {
         var value: UInt64 = 0
         var shift: UInt64 = 0
         for (index, byte) in data.prefix(10).enumerated() {
             let bits = UInt64(byte & 0x7f)
-            if shift >= 64 || (shift == 63 && bits > 1) { return nil }
+            if shift >= 64 || (shift == 63 && bits > 1) {
+                throw AnchorWireError.malformedVarint
+            }
             value |= bits << shift
             if byte & 0x80 == 0 {
                 guard value <= UInt64(Int.max) else { return nil }
@@ -173,9 +168,7 @@ public struct AnchorControlFramer {
             }
             shift += 7
         }
-        // A ten-byte continuation is malformed once all bytes are present;
-        // callers cannot distinguish it from a partial stream without an
-        // additional byte, so leave it buffered until then.
+        if data.count >= 10 { throw AnchorWireError.malformedVarint }
         return nil
     }
 }

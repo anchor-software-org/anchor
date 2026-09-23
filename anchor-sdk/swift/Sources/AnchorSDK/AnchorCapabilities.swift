@@ -45,7 +45,7 @@ public enum AnchorV1Capabilities {
             AnchorV1.TypeURL.screenSelectOutput, AnchorV1.TypeURL.screenRequestKeyframe,
             AnchorV1.TypeURL.screenOutputList, AnchorV1.TypeURL.screenStatus,
             AnchorV1.TypeURL.screenFrame,
-        ], supportsDatagrams: true),
+        ], supportsDatagrams: false),
         AnchorCapabilityDescriptor(name: AnchorV1.Capability.camera, recordTypeURLs: [
             AnchorV1.TypeURL.cameraStart, AnchorV1.TypeURL.cameraStop,
             AnchorV1.TypeURL.cameraStatus, AnchorV1.TypeURL.cameraCodecConfig,
