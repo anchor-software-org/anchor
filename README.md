@@ -54,3 +54,7 @@ For feedback or questions, email [devs@anchor-software.org](mailto:devs@anchor-s
 ## License
 
 Anchor is licensed under the [GPL-3.0](LICENSE).
+
+## Disclaimer 
+
+This project was made with assistance from agentic dev tools 
