@@ -24,7 +24,6 @@ clients are the supported release platforms. iOS support is preview-only.
 
 - Wayland is required.
 - Screen capture requires the compositor's `wlr-screencopy` support.
-- Virtual displays are available on Sway and Hyprland.
 - Clipboard support depends on the data-control protocol exposed by the
   compositor. GNOME needs XWayland for background clipboard monitoring.
 - The phone-camera feature requires `v4l2loopback`.
@@ -33,7 +32,7 @@ clients are the supported release platforms. iOS support is preview-only.
 
 ### Android phone
 
-- Android 10 or newer is supported.
+- Android 11 (API 30) or newer is supported.
 - Connect over Wi-Fi on the same local network, or use USB with an ADB reverse
   tunnel.
 - Android permissions are required for features such as SMS, notifications,
