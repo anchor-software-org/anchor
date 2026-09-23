@@ -10,6 +10,7 @@ struct VideoDisplayView: UIViewRepresentable {
     func makeUIView(context: Context) -> VideoLayerView {
         let view = VideoLayerView()
         videoPlugin.displayLayer = view.displayLayer
+        videoPlugin.requestKeyframe()
         return view
     }
 
@@ -17,6 +18,7 @@ struct VideoDisplayView: UIViewRepresentable {
         // Reconnect if the plugin's layer got swapped or cleared.
         if videoPlugin.displayLayer !== uiView.displayLayer {
             videoPlugin.displayLayer = uiView.displayLayer
+            videoPlugin.requestKeyframe()
         }
     }
 }

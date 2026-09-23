@@ -119,9 +119,8 @@ final class ClipboardPlugin: Plugin, ObservableObject {
         }
 
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        let (content, compressed) = maybeCompress(text)
-
-        var packet: [String: Any] = [
+        let content = text
+        let packet: [String: Any] = [
             "plugin_id": "clipboard",
             "type": "clipboard_content",
             "content_type": "text/plain",
@@ -129,14 +128,12 @@ final class ClipboardPlugin: Plugin, ObservableObject {
             "timestamp": timestamp,
             "hash": hash
         ]
-        if compressed { packet["compressed"] = "zlib" }
-
         if let jsonData = try? JSONSerialization.data(withJSONObject: packet),
            let jsonString = String(data: jsonData, encoding: .utf8) {
-            NSLog("[anchor.clipboard] Sending \(text.count) bytes to desktop\(compressed ? " (compressed)" : "")")
+            NSLog("[anchor.clipboard] Sending \(text.count) bytes to desktop")
             broker.send(AnchorEvent(target: .device, message: .json(jsonString)))
             lastSentHash = hash
-            addToHistory(text: text, source: "local", compressed: compressed)
+            addToHistory(text: text, source: "local", compressed: false)
         }
     }
 
@@ -153,9 +150,8 @@ final class ClipboardPlugin: Plugin, ObservableObject {
 
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
         let b64 = pngData.base64EncodedString()
-        let (content, compressed) = maybeCompress(b64)
-
-        var packet: [String: Any] = [
+        let content = b64
+        let packet: [String: Any] = [
             "plugin_id": "clipboard",
             "type": "clipboard_content",
             "content_type": "image/png",
@@ -163,14 +159,12 @@ final class ClipboardPlugin: Plugin, ObservableObject {
             "timestamp": timestamp,
             "hash": hash
         ]
-        if compressed { packet["compressed"] = "zlib" }
-
         if let jsonData = try? JSONSerialization.data(withJSONObject: packet),
            let jsonString = String(data: jsonData, encoding: .utf8) {
-            NSLog("[anchor.clipboard] Sending image (\(pngData.count) bytes) to desktop\(compressed ? " (compressed)" : "")")
+            NSLog("[anchor.clipboard] Sending image (\(pngData.count) bytes) to desktop")
             broker.send(AnchorEvent(target: .device, message: .json(jsonString)))
             lastSentHash = hash
-            addToHistory(imageData: pngData, contentType: "image/png", source: "local", compressed: compressed)
+            addToHistory(imageData: pngData, contentType: "image/png", source: "local", compressed: false)
         }
     }
 

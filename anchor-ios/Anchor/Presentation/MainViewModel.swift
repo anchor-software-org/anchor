@@ -75,6 +75,7 @@ class MainViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var connectionTimeoutTask: Task<Void, Never>?
     private var lastConnectedIp: String?
+    private var connectedDeviceId: String?
     private var startupAutoConnectTask: Task<Void, Never>?
 
     private enum Mode {
@@ -94,7 +95,11 @@ class MainViewModel: ObservableObject {
             isPreviewMode = false
             myDeviceId = Self.getOrCreateDeviceId()
             desktopIp = UserDefaults.standard.string(forKey: "desktop_ip") ?? ""
-            touchInputOnStream = UserDefaults.standard.bool(forKey: "touch_input_on_stream")
+            if UserDefaults.standard.object(forKey: "touch_input_on_stream") == nil {
+                touchInputOnStream = true
+            } else {
+                touchInputOnStream = UserDefaults.standard.bool(forKey: "touch_input_on_stream")
+            }
             touchpadSensitivity = UserDefaults.standard.object(forKey: "touchpad_sensitivity") as? Float ?? 1.5
             autoSyncClipboard = UserDefaults.standard.bool(forKey: "auto_sync_clipboard")
             previewState = nil
@@ -125,7 +130,8 @@ class MainViewModel: ObservableObject {
             videoPlugin: videoPlugin,
             trustedStore: trustedStore,
             deviceId: myDeviceId,
-            deviceName: myDeviceName
+            deviceName: myDeviceName,
+            isTablet: UIDevice.current.userInterfaceIdiom == .pad
         )
         clipboardPlugin.autoSyncEnabled = autoSyncClipboard
 
@@ -253,7 +259,7 @@ class MainViewModel: ObservableObject {
                 fingerprint: fingerprint,
                 pairedAt: entry.pairedAt,
                 lastSeen: entry.lastSeen,
-                isOnline: networkPlugin.isConnected,
+                isOnline: networkPlugin.isConnected && entry.deviceId == connectedDeviceId,
                 lastKnownIp: entry.lastKnownIp
             )
         }
@@ -286,18 +292,16 @@ class MainViewModel: ObservableObject {
                 connectionTimeoutTask?.cancel()
                 connectionTimeoutTask = nil
                 lastConnectedIp = host
+                connectedDeviceId = json["device_id"] as? String
                 UserDefaults.standard.set(host, forKey: "last_connected_ip")
-                // Save IP to trusted store for the connected device
-                trustedStore.devices.values.forEach { entry in
-                    trustedStore.updateLastSeen(entry.deviceId, ip: host)
-                }
-                refreshPairedDevices()
                 connectionState = ConnectionState(status: .connected, host: host, port: port)
+                refreshPairedDevices()
             default:
                 connectionTimeoutTask?.cancel()
                 connectionTimeoutTask = nil
-                refreshPairedDevices()
+                connectedDeviceId = nil
                 connectionState = ConnectionState(status: .disconnected, host: host, port: port, error: error ?? reason)
+                refreshPairedDevices()
             }
         }
     }
@@ -326,17 +330,17 @@ class MainViewModel: ObservableObject {
         guard connectionState.status == .disconnected, !ip.isEmpty else { return }
         desktopIp = ip
         lastConnectedIp = ip
-        networkPlugin.connect(ip: ip, port: 5025)
+        networkPlugin.connect(ip: ip, port: 5027)
 
-        // Connection timeout — 10 seconds
+        // QUIC includes TLS 1.3 and may also wait for a desktop pairing prompt.
         connectionTimeoutTask?.cancel()
         connectionTimeoutTask = Task {
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            try? await Task.sleep(nanoseconds: 65_000_000_000)
             if connectionState.status == .connecting {
                 disconnect()
                 connectionState = ConnectionState(
                     status: .disconnected,
-                    error: "Connection timed out after 10s"
+                    error: "Connection or pairing timed out after 65s"
                 )
             }
         }
@@ -353,6 +357,7 @@ class MainViewModel: ObservableObject {
         startupAutoConnectTask?.cancel()
         startupAutoConnectTask = nil
         lastConnectedIp = nil  // Don't auto-reconnect after manual disconnect
+        connectedDeviceId = nil
         UserDefaults.standard.removeObject(forKey: "last_connected_ip")
         networkPlugin.disconnect()
         connectionState = ConnectionState(status: .disconnected)

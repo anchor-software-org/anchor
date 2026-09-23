@@ -46,7 +46,10 @@ struct InputWaylandState {
     stream_output_y: i32,
     stream_output_w: u32,
     stream_output_h: u32,
-    /// Total compositor extent.
+    /// Bounding box of the compositor layout. Wayland output coordinates may
+    /// be negative when an output is left of or above the primary output.
+    layout_min_x: i32,
+    layout_min_y: i32,
     total_w: u32,
     total_h: u32,
 }
@@ -62,8 +65,59 @@ pub struct WaylandInput {
     stream_output_y: i32,
     stream_output_w: u32,
     stream_output_h: u32,
+    layout_min_x: i32,
+    layout_min_y: i32,
     total_w: u32,
     total_h: u32,
+}
+
+fn output_layout_bounds<'a>(outputs: impl Iterator<Item = &'a OutputInfo>) -> (i32, i32, u32, u32) {
+    let mut min_x = i64::MAX;
+    let mut min_y = i64::MAX;
+    let mut max_x = i64::MIN;
+    let mut max_y = i64::MIN;
+    let mut found = false;
+
+    for output in outputs {
+        found = true;
+        min_x = min_x.min(i64::from(output.x));
+        min_y = min_y.min(i64::from(output.y));
+        max_x = max_x.max(i64::from(output.x) + i64::from(output.width));
+        max_y = max_y.max(i64::from(output.y) + i64::from(output.height));
+    }
+
+    if !found {
+        return (0, 0, 1920, 1080);
+    }
+
+    (
+        min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        min_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        (max_x - min_x).clamp(1, i64::from(u32::MAX)) as u32,
+        (max_y - min_y).clamp(1, i64::from(u32::MAX)) as u32,
+    )
+}
+
+fn absolute_position_in_layout(
+    layout_min_x: i32,
+    layout_min_y: i32,
+    total_w: u32,
+    total_h: u32,
+    output_x: i32,
+    output_y: i32,
+    output_w: u32,
+    output_h: u32,
+    x_norm: f64,
+    y_norm: f64,
+) -> (u32, u32) {
+    let x = x_norm.clamp(0.0, 1.0);
+    let y = y_norm.clamp(0.0, 1.0);
+    let translated_x = (f64::from(output_x) - f64::from(layout_min_x)) + x * f64::from(output_w);
+    let translated_y = (f64::from(output_y) - f64::from(layout_min_y)) + y * f64::from(output_h);
+    (
+        translated_x.round().clamp(0.0, f64::from(total_w)) as u32,
+        translated_y.round().clamp(0.0, f64::from(total_h)) as u32,
+    )
 }
 
 impl WaylandInput {
@@ -88,6 +142,8 @@ impl WaylandInput {
             stream_output_y: 0,
             stream_output_w: 1920,
             stream_output_h: 1080,
+            layout_min_x: 0,
+            layout_min_y: 0,
             total_w: 1920,
             total_h: 1080,
         };
@@ -116,19 +172,18 @@ impl WaylandInput {
                 info.y
             );
         }
-        wl_state.total_w = wl_state
-            .outputs
-            .values()
-            .map(|o| (o.x as u32).saturating_add(o.width))
-            .max()
-            .unwrap_or(1920);
-        wl_state.total_h = wl_state
-            .outputs
-            .values()
-            .map(|o| (o.y as u32).saturating_add(o.height))
-            .max()
-            .unwrap_or(1080);
-        log::info!("Input: total compositor extent {}x{}", wl_state.total_w, wl_state.total_h);
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(wl_state.outputs.values());
+        wl_state.layout_min_x = min_x;
+        wl_state.layout_min_y = min_y;
+        wl_state.total_w = total_w;
+        wl_state.total_h = total_h;
+        log::info!(
+            "Input: compositor bounds origin=({},{}) extent={}x{}",
+            min_x,
+            min_y,
+            total_w,
+            total_h
+        );
 
         // Virtual pointer
         let virtual_pointer = match wl_state.pointer_manager.as_ref() {
@@ -236,6 +291,8 @@ impl WaylandInput {
             stream_output_y: wl_state.stream_output_y,
             stream_output_w: wl_state.stream_output_w,
             stream_output_h: wl_state.stream_output_h,
+            layout_min_x: wl_state.layout_min_x,
+            layout_min_y: wl_state.layout_min_y,
             total_w: wl_state.total_w,
             total_h: wl_state.total_h,
         })
@@ -283,22 +340,27 @@ impl InputBackend for WaylandInput {
         self.stream_output_y = oy;
         self.stream_output_w = width;
         self.stream_output_h = height;
-        // Expand total extent to include this output if needed.
-        let needed_w = (ox as u32).saturating_add(width);
-        let needed_h = (oy as u32).saturating_add(height);
-        if needed_w > self.total_w {
-            self.total_w = needed_w;
-        }
-        if needed_h > self.total_h {
-            self.total_h = needed_h;
-        }
+        // Expand the signed compositor bounding box to include a stream output
+        // that was not present during initial Wayland output discovery.
+        let current_max_x = i64::from(self.layout_min_x) + i64::from(self.total_w);
+        let current_max_y = i64::from(self.layout_min_y) + i64::from(self.total_h);
+        let min_x = i64::from(self.layout_min_x).min(i64::from(ox));
+        let min_y = i64::from(self.layout_min_y).min(i64::from(oy));
+        let max_x = current_max_x.max(i64::from(ox) + i64::from(width));
+        let max_y = current_max_y.max(i64::from(oy) + i64::from(height));
+        self.layout_min_x = min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        self.layout_min_y = min_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        self.total_w = (max_x - min_x).clamp(1, i64::from(u32::MAX)) as u32;
+        self.total_h = (max_y - min_y).clamp(1, i64::from(u32::MAX)) as u32;
         log::info!(
-            "Input: stream mapped to '{}' {}x{} at ({},{}) — total extent {}x{}",
+            "Input: stream mapped to '{}' {}x{} at ({},{}) — layout origin ({},{}) extent {}x{}",
             output_name,
             width,
             height,
             ox,
             oy,
+            self.layout_min_x,
+            self.layout_min_y,
             self.total_w,
             self.total_h,
         );
@@ -310,13 +372,22 @@ impl InputBackend for WaylandInput {
     }
 
     fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64) {
-        // Map normalized stream coords to global compositor pixel coords.
-        let global_x = self.stream_output_x as f64 + x_norm * self.stream_output_w as f64;
-        let global_y = self.stream_output_y as f64 + y_norm * self.stream_output_h as f64;
-        let abs_x = global_x as u32;
-        let abs_y = global_y as u32;
+        // Translate signed global compositor coordinates into the unsigned
+        // layout coordinate space required by wlr-virtual-pointer.
+        let (abs_x, abs_y) = absolute_position_in_layout(
+            self.layout_min_x,
+            self.layout_min_y,
+            self.total_w,
+            self.total_h,
+            self.stream_output_x,
+            self.stream_output_y,
+            self.stream_output_w,
+            self.stream_output_h,
+            x_norm,
+            y_norm,
+        );
         log::debug!(
-            "Input: abs norm=({:.3},{:.3}) -> global=({},{}) extent={}x{} output_offset=({},{})",
+            "Input: abs norm=({:.3},{:.3}) -> layout=({},{}) extent={}x{} output_offset=({},{}) layout_origin=({},{})",
             x_norm,
             y_norm,
             abs_x,
@@ -324,7 +395,9 @@ impl InputBackend for WaylandInput {
             self.total_w,
             self.total_h,
             self.stream_output_x,
-            self.stream_output_y
+            self.stream_output_y,
+            self.layout_min_x,
+            self.layout_min_y
         );
         self.virtual_pointer.motion_absolute(time, abs_x, abs_y, self.total_w, self.total_h);
         self.virtual_pointer.frame();
@@ -690,27 +763,28 @@ impl Dispatch<wl_output::WlOutput, ()> for InputWaylandState {
                             info.y
                         );
                         state.outputs.insert(oid, info);
-                        // Recompute total extent so late-arriving outputs (HEADLESS, hotplug) are included.
-                        let new_w = state
-                            .outputs
-                            .values()
-                            .map(|o| (o.x as u32).saturating_add(o.width))
-                            .max()
-                            .unwrap_or(state.total_w);
-                        let new_h = state
-                            .outputs
-                            .values()
-                            .map(|o| (o.y as u32).saturating_add(o.height))
-                            .max()
-                            .unwrap_or(state.total_h);
-                        if new_w != state.total_w || new_h != state.total_h {
+                        // Recompute signed bounds so late-arriving outputs
+                        // (HEADLESS/hotplug) can extend left or above origin.
+                        let (min_x, min_y, new_w, new_h) =
+                            output_layout_bounds(state.outputs.values());
+                        if min_x != state.layout_min_x
+                            || min_y != state.layout_min_y
+                            || new_w != state.total_w
+                            || new_h != state.total_h
+                        {
                             log::info!(
-                                "Input: compositor extent updated {}x{} → {}x{}",
+                                "Input: compositor bounds updated ({},{}) {}x{} → ({},{}) {}x{}",
+                                state.layout_min_x,
+                                state.layout_min_y,
                                 state.total_w,
                                 state.total_h,
+                                min_x,
+                                min_y,
                                 new_w,
                                 new_h
                             );
+                            state.layout_min_x = min_x;
+                            state.layout_min_y = min_y;
                             state.total_w = new_w;
                             state.total_h = new_h;
                         }
@@ -754,6 +828,13 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for InputWaylandState {
             }
             _ => {}
         }
+        // xdg-output supplies the authoritative logical position/size after
+        // wl_output::Done, so every correction must refresh the signed bounds.
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(state.outputs.values());
+        state.layout_min_x = min_x;
+        state.layout_min_y = min_y;
+        state.total_w = total_w;
+        state.total_h = total_h;
     }
 }
 
@@ -763,3 +844,96 @@ delegate_noop!(InputWaylandState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPoi
 delegate_noop!(InputWaylandState: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
 delegate_noop!(InputWaylandState: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
 delegate_noop!(InputWaylandState: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+
+    fn output(x: i32, y: i32, width: u32, height: u32) -> OutputInfo {
+        OutputInfo { x, y, width, height, ..OutputInfo::default() }
+    }
+
+    #[test]
+    fn positive_origin_layout_maps_second_output_corners_and_center() {
+        let outputs = [output(0, 0, 1920, 1080), output(1920, 0, 2560, 1440)];
+        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+
+        assert_eq!((min_x, min_y, width, height), (0, 0, 4480, 1440));
+        assert_eq!(
+            absolute_position_in_layout(min_x, min_y, width, height, 1920, 0, 2560, 1440, 0.0, 0.0),
+            (1920, 0)
+        );
+        assert_eq!(
+            absolute_position_in_layout(min_x, min_y, width, height, 1920, 0, 2560, 1440, 0.5, 0.5),
+            (3200, 720)
+        );
+        assert_eq!(
+            absolute_position_in_layout(min_x, min_y, width, height, 1920, 0, 2560, 1440, 1.0, 1.0),
+            (4480, 1440)
+        );
+    }
+
+    #[test]
+    fn negative_left_output_is_translated_into_unsigned_layout_space() {
+        let outputs = [output(-1280, 56, 1280, 1024), output(0, 0, 1920, 1080)];
+        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+
+        assert_eq!((min_x, min_y, width, height), (-1280, 0, 3200, 1080));
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, -1280, 56, 1280, 1024, 0.0, 0.0
+            ),
+            (0, 56)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, -1280, 56, 1280, 1024, 0.5, 0.5
+            ),
+            (640, 568)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, -1280, 56, 1280, 1024, 1.0, 1.0
+            ),
+            (1280, 1080)
+        );
+    }
+
+    #[test]
+    fn output_above_primary_translates_negative_y() {
+        let outputs = [output(320, -900, 1600, 900), output(0, 0, 1920, 1080)];
+        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+
+        assert_eq!((min_x, min_y, width, height), (0, -900, 1920, 1980));
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, 320, -900, 1600, 900, 0.0, 0.0
+            ),
+            (320, 0)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, 320, -900, 1600, 900, 0.5, 0.5
+            ),
+            (1120, 450)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, 320, -900, 1600, 900, 1.0, 1.0
+            ),
+            (1920, 900)
+        );
+    }
+
+    #[test]
+    fn normalized_coordinates_are_clamped_to_streamed_output() {
+        assert_eq!(
+            absolute_position_in_layout(0, 0, 1920, 1080, 0, 0, 1920, 1080, -1.0, 2.0),
+            (0, 1080)
+        );
+        assert_eq!(
+            absolute_position_in_layout(0, 0, 1920, 1080, 0, 0, 1920, 1080, 0.5, 0.5),
+            (960, 540)
+        );
+    }
+}

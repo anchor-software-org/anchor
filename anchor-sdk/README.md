@@ -27,10 +27,11 @@ Rust and Kotlin are the supported SDKs. They provide:
 The host application supplies the UI, permissions, local storage, and product
 policy. The SDK does not provide a complete Anchor application.
 
-Swift is preview-only. It includes the shared wire framing, session ordering,
-capability constants, and screen/camera datagram codec. Its
-`AnchorQuicTransport` is a boundary for an iOS `Network.framework` adapter.
-The iOS application has not migrated to this boundary yet.
+Swift is preview-only. It includes generated Protocol v1 message types, shared
+wire framing, session ordering, capability constants, and screen/camera
+datagram codec. It also provides a pinned-peer `Network.framework` QUIC
+transport for Apple platforms. The iOS application has not migrated to this
+boundary yet.
 
 ## Use the SDK from source
 

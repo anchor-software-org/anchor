@@ -43,6 +43,13 @@ public struct AnchorVideoFramePacket: Equatable {
     public let payload: Data
 }
 
+/// One complete encoded access unit reconstructed from one or more ANFR
+/// packets on a reliable stream.
+public struct AnchorVideoFrame: Equatable {
+    public let header: AnchorVideoFrameHeader
+    public let payload: Data
+}
+
 public enum AnchorVideoFrameCodec {
     private static let magic = Data([0x41, 0x4e, 0x46, 0x52]) // ANFR
     private static let version: UInt8 = 1
@@ -73,26 +80,43 @@ public enum AnchorVideoFrameCodec {
     }
 
     public static func decode(_ datagram: Data) -> AnchorVideoFramePacket? {
-        guard datagram.count >= AnchorVideoFrameHeader.headerBytes,
-              datagram.prefix(4) == magic,
-              datagram[4] == version else { return nil }
-        let kind = datagram[5]
-        guard kind == AnchorVideoFrameHeader.screenKind || kind == AnchorVideoFrameHeader.cameraKind else { return nil }
-        let fragmentIndex = readUInt16(datagram, at: 32)
-        let fragmentCount = readUInt16(datagram, at: 34)
-        guard fragmentCount > 0, fragmentIndex < fragmentCount else { return nil }
+        try? decodeValidated(datagram)
+    }
+
+    /// Strict decoder used by reliable streams, where malformed bytes must end
+    /// the binding rather than being silently treated as a lost datagram.
+    public static func decodeValidated(_ packet: Data) throws -> AnchorVideoFramePacket {
+        guard packet.count >= AnchorVideoFrameHeader.headerBytes else {
+            throw AnchorWireError.invalidFrameMagic
+        }
+        guard packet.prefix(4) == magic else { throw AnchorWireError.invalidFrameMagic }
+        guard packet[4] == version else {
+            throw AnchorWireError.unsupportedFrameVersion(packet[4])
+        }
+        let kind = packet[5]
+        guard kind == AnchorVideoFrameHeader.screenKind || kind == AnchorVideoFrameHeader.cameraKind else {
+            throw AnchorWireError.invalidFrameKind(kind)
+        }
+        let fragmentIndex = readUInt16(packet, at: 32)
+        let fragmentCount = readUInt16(packet, at: 34)
+        guard fragmentCount > 0, fragmentIndex < fragmentCount else {
+            throw AnchorWireError.invalidFrameFragments
+        }
         let header = AnchorVideoFrameHeader(
             kind: kind,
-            flags: readUInt16(datagram, at: 6),
-            capabilitySessionID: readUInt64(datagram, at: 8),
-            flowID: readUInt64(datagram, at: 16),
-            sequence: readUInt64(datagram, at: 24),
+            flags: readUInt16(packet, at: 6),
+            capabilitySessionID: readUInt64(packet, at: 8),
+            flowID: readUInt64(packet, at: 16),
+            sequence: readUInt64(packet, at: 24),
             fragmentIndex: fragmentIndex,
             fragmentCount: fragmentCount,
-            presentationTimeUs: readUInt64(datagram, at: 36),
-            codecConfigID: readUInt64(datagram, at: 44)
+            presentationTimeUs: readUInt64(packet, at: 36),
+            codecConfigID: readUInt64(packet, at: 44)
         )
-        return AnchorVideoFramePacket(header: header, payload: Data(datagram.dropFirst(AnchorVideoFrameHeader.headerBytes)))
+        return AnchorVideoFramePacket(
+            header: header,
+            payload: Data(packet.dropFirst(AnchorVideoFrameHeader.headerBytes))
+        )
     }
 
     private static func encode(header: AnchorVideoFrameHeader, payload: Data) -> Data {
@@ -127,5 +151,139 @@ public enum AnchorVideoFrameCodec {
         var value: UInt64 = 0
         for index in 0..<8 { value |= UInt64(data[offset + index]) << UInt64(index * 8) }
         return value
+    }
+}
+
+/// Byte-stream framing used by `org.anchor.screen@1`. QUIC stream reads can
+/// split or coalesce writes, so every ANFR packet carries a little-endian u32
+/// length prefix. The packet itself remains bounded to the protocol datagram
+/// size even though delivery is reliable.
+public struct AnchorVideoStreamFramer {
+    private var buffer = Data()
+    private var readOffset = 0
+
+    public init() {}
+
+    public var bufferedByteCount: Int { buffer.count - readOffset }
+
+    public mutating func feed(_ bytes: Data) {
+        compactIfNeeded(force: readOffset == buffer.count)
+        buffer.append(bytes)
+    }
+
+    public mutating func nextPacket() throws -> Data? {
+        guard bufferedByteCount >= 4 else { return nil }
+        let start = buffer.startIndex + readOffset
+        let length = Int(buffer[start])
+            | (Int(buffer[start + 1]) << 8)
+            | (Int(buffer[start + 2]) << 16)
+            | (Int(buffer[start + 3]) << 24)
+        guard length > 0 else { throw AnchorWireError.invalidStreamPacketLength }
+        guard length <= AnchorVideoFrameHeader.datagramBytes else {
+            throw AnchorWireError.frameTooLarge
+        }
+        guard bufferedByteCount >= 4 + length else { return nil }
+        let payloadStart = start + 4
+        let packet = Data(buffer[payloadStart..<(payloadStart + length)])
+        readOffset += 4 + length
+        compactIfNeeded(force: readOffset == buffer.count)
+        return packet
+    }
+
+    /// Avoid quadratic front-removal copies when a single QUIC read contains
+    /// dozens of ~1 KiB ANFR packets. Compact only after consuming a useful
+    /// chunk, or reset cheaply when the buffer is empty.
+    private mutating func compactIfNeeded(force: Bool = false) {
+        guard readOffset > 0, force || readOffset >= 64 * 1024 else { return }
+        if readOffset == buffer.count {
+            buffer.removeAll(keepingCapacity: true)
+        } else {
+            buffer = Data(buffer.dropFirst(readOffset))
+        }
+        readOffset = 0
+    }
+
+    public static func encode(_ packet: Data) throws -> Data {
+        guard !packet.isEmpty else { throw AnchorWireError.invalidStreamPacketLength }
+        guard packet.count <= AnchorVideoFrameHeader.datagramBytes else {
+            throw AnchorWireError.frameTooLarge
+        }
+        let length = UInt32(packet.count)
+        var framed = Data([
+            UInt8(length & 0xff),
+            UInt8((length >> 8) & 0xff),
+            UInt8((length >> 16) & 0xff),
+            UInt8((length >> 24) & 0xff),
+        ])
+        framed.append(packet)
+        return framed
+    }
+}
+
+/// Reassembles screen access units while enforcing the `StreamOpen` binding.
+/// Reliable delivery means fragments must arrive contiguously and in order;
+/// accepting a different session/stream or splicing sequences is a protocol
+/// violation, not recoverable packet loss.
+public struct AnchorScreenFrameAssembler {
+    public let capabilitySessionID: UInt64
+    public let streamID: UInt64
+
+    private var pendingHeader: AnchorVideoFrameHeader?
+    private var pendingPayload = Data()
+    private var nextFragmentIndex: UInt16 = 0
+
+    public init(capabilitySessionID: UInt64, streamID: UInt64) {
+        self.capabilitySessionID = capabilitySessionID
+        self.streamID = streamID
+    }
+
+    public mutating func consume(_ bytes: Data) throws -> AnchorVideoFrame? {
+        let packet = try AnchorVideoFrameCodec.decodeValidated(bytes)
+        let header = packet.header
+        guard header.kind == AnchorVideoFrameHeader.screenKind,
+              header.capabilitySessionID == capabilitySessionID,
+              header.flowID == streamID else {
+            throw AnchorWireError.frameBindingMismatch
+        }
+
+        if header.fragmentIndex == 0 {
+            guard pendingHeader == nil else { throw AnchorWireError.invalidFrameFragments }
+            pendingHeader = header
+            pendingPayload = packet.payload
+            pendingPayload.reserveCapacity(min(
+                AnchorVideoFrameHeader.maxFrameBytes,
+                Int(header.fragmentCount) * AnchorVideoFrameHeader.payloadBytes
+            ))
+            nextFragmentIndex = 1
+        } else {
+            guard let first = pendingHeader,
+                  header.fragmentIndex == nextFragmentIndex,
+                  header.fragmentCount == first.fragmentCount,
+                  header.sequence == first.sequence,
+                  header.flags == first.flags,
+                  header.presentationTimeUs == first.presentationTimeUs,
+                  header.codecConfigID == first.codecConfigID else {
+                throw AnchorWireError.invalidFrameFragments
+            }
+            guard pendingPayload.count + packet.payload.count <= AnchorVideoFrameHeader.maxFrameBytes else {
+                throw AnchorWireError.frameTooLarge
+            }
+            pendingPayload.append(packet.payload)
+            nextFragmentIndex += 1
+        }
+
+        guard let first = pendingHeader,
+              header.fragmentIndex + 1 == header.fragmentCount else { return nil }
+        let frame = AnchorVideoFrame(header: first, payload: pendingPayload)
+        pendingHeader = nil
+        pendingPayload = Data()
+        nextFragmentIndex = 0
+        return frame
+    }
+
+    public mutating func reset() {
+        pendingHeader = nil
+        pendingPayload = Data()
+        nextFragmentIndex = 0
     }
 }

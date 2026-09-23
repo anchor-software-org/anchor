@@ -3,6 +3,7 @@ import VideoToolbox
 import AVFoundation
 import CoreMedia
 import Combine
+import AnchorSDK
 
 class VideoPlugin: Plugin, ObservableObject {
     private static let frameQueueCapacity = 3
@@ -49,6 +50,9 @@ class VideoPlugin: Plugin, ObservableObject {
     private var queueWaitSumMs: Double = 0
     private var queueWaitMaxMs: Double = 0
     private var queueWaitSamples = 0
+    private var sourceAgeSumMs: Double = 0
+    private var sourceAgeMaxMs: Double = 0
+    private var sourceAgeSamples = 0
 
     init(broker: MessageBroker, previewState: PreviewState = .init()) {
         self.broker = broker
@@ -68,6 +72,9 @@ class VideoPlugin: Plugin, ObservableObject {
         maxFrameArrivalGapMsThisSecond = 0
         maxPendingFramesThisSecond = 0
         queueDropsThisSecond = 0
+        sourceAgeSumMs = 0
+        sourceAgeMaxMs = 0
+        sourceAgeSamples = 0
         pendingFramesLock.unlock()
         queueWaitSumMs = 0
         queueWaitMaxMs = 0
@@ -100,7 +107,26 @@ class VideoPlugin: Plugin, ObservableObject {
 
     // MARK: - Feed frame (called from NetworkPlugin's H264 read thread)
 
-    func feedFrame(_ data: Data, frameId: UInt64) {
+    func feedFrame(_ data: Data, frameId: UInt64, sourcePresentationTimeUs: UInt64? = nil) {
+        // Transport activity is immediate UI state. Do not keep the live video
+        // covered by a "Waiting" overlay until the one-second FPS window ends.
+        if !isReceiving {
+            DispatchQueue.main.async { [weak self] in
+                self?.isReceiving = true
+            }
+        }
+        var sourceAgeMs: Double?
+        if let sourcePresentationTimeUs {
+            let nowUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+            if nowUs >= sourcePresentationTimeUs {
+                let ageMs = Double(nowUs - sourcePresentationTimeUs) / 1_000
+                // This metric assumes roughly synchronized host/device clocks.
+                // Ignore obvious clock skew rather than polluting latency data.
+                if ageMs < 60_000 {
+                    sourceAgeMs = ageMs
+                }
+            }
+        }
         let frame = QueuedFrame(
             data: data,
             frameId: frameId,
@@ -111,6 +137,11 @@ class VideoPlugin: Plugin, ObservableObject {
         var arrivalGapMs: Double?
         var pendingDepth = 0
         pendingFramesLock.lock()
+        if let sourceAgeMs {
+            sourceAgeSumMs += sourceAgeMs
+            sourceAgeMaxMs = max(sourceAgeMaxMs, sourceAgeMs)
+            sourceAgeSamples += 1
+        }
         if lastFrameArrivalNs != 0 {
             let gapNs = frame.recvNs - lastFrameArrivalNs
             let gapMs = Double(gapNs) / 1_000_000.0
@@ -189,16 +220,27 @@ class VideoPlugin: Plugin, ObservableObject {
         }
     }
 
-    private func takeQueueIngressMetrics() -> (queueDrops: Int, maxArrivalGapMs: Double, maxPendingFrames: Int) {
+    private func takeQueueIngressMetrics() -> (
+        queueDrops: Int,
+        maxArrivalGapMs: Double,
+        maxPendingFrames: Int,
+        avgSourceAgeMs: Double,
+        maxSourceAgeMs: Double
+    ) {
         pendingFramesLock.lock()
         let snapshot = (
             queueDrops: queueDropsThisSecond,
             maxArrivalGapMs: maxFrameArrivalGapMsThisSecond,
-            maxPendingFrames: maxPendingFramesThisSecond
+            maxPendingFrames: maxPendingFramesThisSecond,
+            avgSourceAgeMs: sourceAgeSamples > 0 ? sourceAgeSumMs / Double(sourceAgeSamples) : 0,
+            maxSourceAgeMs: sourceAgeMaxMs
         )
         queueDropsThisSecond = 0
         maxFrameArrivalGapMsThisSecond = 0
         maxPendingFramesThisSecond = pendingFrames.count
+        sourceAgeSumMs = 0
+        sourceAgeMaxMs = 0
+        sourceAgeSamples = 0
         pendingFramesLock.unlock()
         return snapshot
     }
@@ -206,76 +248,27 @@ class VideoPlugin: Plugin, ObservableObject {
     // MARK: - NAL processing
 
     private func processNALUnits(in data: Data, frameId: UInt64, recvNs: UInt64) {
-        guard data.count >= 4 else { return }
+        guard let accessUnit = try? AnchorH264AccessUnit.parseAnnexB(data) else { return }
 
-        // Fast path: check if this is Annex B (starts with 00 00 00 01 or 00 00 01).
-        // The desktop typically sends one NAL per message without start codes,
-        // but may include them for SPS/PPS/IDR sequences.
-        data.withUnsafeBytes { buf in
-            let ptr = buf.bindMemory(to: UInt8.self)
-            guard let base = ptr.baseAddress else { return }
-
-            if data.count >= 4 && base[0] == 0 && base[1] == 0 {
-                // Has start codes — scan and split
-                processAnnexB(ptr: base, count: data.count, frameId: frameId, recvNs: recvNs)
-            } else {
-                // Raw NAL unit — process directly
-                handleNAL(ptr: base, count: data.count, frameId: frameId, recvNs: recvNs)
-            }
+        // ANFR payloads are complete access units. Apply parameter-set changes
+        // first, then submit all slice NALs as one CMSampleBuffer, matching the
+        // access-unit boundary used by Android.
+        if let latestSPS = accessUnit.sequenceParameterSets.last {
+            sps = latestSPS
         }
-    }
-
-    private func processAnnexB(ptr: UnsafePointer<UInt8>, count: Int, frameId: UInt64, recvNs: UInt64) {
-        var i = 0
-        var lastStart = -1
-
-        while i < count - 3 {
-            if ptr[i] == 0 && ptr[i+1] == 0 {
-                var scLen = 0
-                if ptr[i+2] == 1 { scLen = 3 }
-                else if i < count - 3 && ptr[i+2] == 0 && ptr[i+3] == 1 { scLen = 4 }
-
-                if scLen > 0 {
-                    if lastStart >= 0 {
-                        handleNAL(ptr: ptr + lastStart, count: i - lastStart, frameId: frameId, recvNs: recvNs)
-                    }
-                    lastStart = i + scLen
-                    i += scLen
-                    continue
-                }
-            }
-            i += 1
+        if let latestPPS = accessUnit.pictureParameterSets.last {
+            pps = latestPPS
         }
+        tryCreateFormatDescription()
 
-        if lastStart >= 0 && lastStart < count {
-            handleNAL(ptr: ptr + lastStart, count: count - lastStart, frameId: frameId, recvNs: recvNs)
-        }
+        guard !accessUnit.vclNALUnits.isEmpty, formatDescription != nil else { return }
 
-        if lastStart < 0 {
-            handleNAL(ptr: ptr, count: count, frameId: frameId, recvNs: recvNs)
-        }
-    }
-
-    private func handleNAL(ptr: UnsafePointer<UInt8>, count: Int, frameId: UInt64, recvNs: UInt64) {
-        guard count > 0 else { return }
-        let nalType = ptr[0] & 0x1F
-
-        switch nalType {
-        case 7: // SPS
-            sps = Data(bytes: ptr, count: count)
-            tryCreateFormatDescription()
-        case 8: // PPS
-            pps = Data(bytes: ptr, count: count)
-            tryCreateFormatDescription()
-        case 5: // IDR
-            decodeNAL(ptr: ptr, count: count, frameId: frameId, recvNs: recvNs)
-        case 1: // Non-IDR
-            if formatDescription != nil {
-                decodeNAL(ptr: ptr, count: count, frameId: frameId, recvNs: recvNs)
-            }
-        default:
-            break
-        }
+        enqueueAccessUnit(
+            nalUnits: accessUnit.sampleNALUnits,
+            isKeyframe: accessUnit.isKeyframe,
+            frameId: frameId,
+            recvNs: recvNs
+        )
     }
 
     // MARK: - Format description
@@ -325,20 +318,26 @@ class VideoPlugin: Plugin, ObservableObject {
 
     // MARK: - Decode & display (zero-copy path)
 
-    // Decode timing stats
-    private var decodeTimeSum: Double = 0
-    private var decodeTimeMax: Double = 0
-    private var decodeCount: Int = 0
+    // Sample construction + enqueue timing. This is deliberately not labelled
+    // decode time because AVSampleBufferDisplayLayer decodes asynchronously.
+    private var enqueueTimeSum: Double = 0
+    private var enqueueTimeMax: Double = 0
+    private var enqueueCount: Int = 0
 
-    private func decodeNAL(ptr: UnsafePointer<UInt8>, count: Int, frameId: UInt64, recvNs: UInt64) {
-        let decodeStart = CACurrentMediaTime()
+    private func enqueueAccessUnit(
+        nalUnits: [Data],
+        isKeyframe: Bool,
+        frameId: UInt64,
+        recvNs: UInt64
+    ) {
+        let enqueueStart = CACurrentMediaTime()
 
         guard let formatDescription = formatDescription,
               let layer = displayLayer else { return }
 
-        // Build AVCC: 4-byte big-endian length + NAL data
-        let totalLength = 4 + count
-        var nalLength = UInt32(count).bigEndian
+        // Build one AVCC sample for the entire access unit.
+        let totalLength = nalUnits.reduce(0) { $0 + 4 + $1.count }
+        guard totalLength > 4 else { return }
 
         var blockBuffer: CMBlockBuffer?
         let status = CMBlockBufferCreateWithMemoryBlock(
@@ -354,16 +353,30 @@ class VideoPlugin: Plugin, ObservableObject {
         )
         guard status == kCMBlockBufferNoErr, let bb = blockBuffer else { return }
 
-        // Copy length prefix
-        _ = withUnsafePointer(to: &nalLength) { lenPtr in
-            CMBlockBufferReplaceDataBytes(
-                with: lenPtr, blockBuffer: bb, offsetIntoDestination: 0, dataLength: 4
-            )
+        var destinationOffset = 0
+        for nal in nalUnits {
+            var nalLength = UInt32(nal.count).bigEndian
+            let lengthStatus = withUnsafePointer(to: &nalLength) { lenPtr in
+                CMBlockBufferReplaceDataBytes(
+                    with: lenPtr,
+                    blockBuffer: bb,
+                    offsetIntoDestination: destinationOffset,
+                    dataLength: 4
+                )
+            }
+            guard lengthStatus == kCMBlockBufferNoErr else { return }
+            destinationOffset += 4
+            let copyStatus = nal.withUnsafeBytes { bytes in
+                CMBlockBufferReplaceDataBytes(
+                    with: bytes.baseAddress!,
+                    blockBuffer: bb,
+                    offsetIntoDestination: destinationOffset,
+                    dataLength: nal.count
+                )
+            }
+            guard copyStatus == kCMBlockBufferNoErr else { return }
+            destinationOffset += nal.count
         }
-        // Copy NAL data
-        CMBlockBufferReplaceDataBytes(
-            with: ptr, blockBuffer: bb, offsetIntoDestination: 4, dataLength: count
-        )
 
         var sampleBuffer: CMSampleBuffer?
         var sampleSize = totalLength
@@ -389,6 +402,10 @@ class VideoPlugin: Plugin, ObservableObject {
                 Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
             )
+            CFDictionarySetValue(dict,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                Unmanaged.passUnretained(isKeyframe ? kCFBooleanFalse : kCFBooleanTrue).toOpaque()
+            )
         }
 
         if layer.status == .failed {
@@ -403,11 +420,10 @@ class VideoPlugin: Plugin, ObservableObject {
             presentNs: decodeDoneNs
         )
 
-        // Decode timing
-        let decodeMs = (CACurrentMediaTime() - decodeStart) * 1000
-        decodeTimeSum += decodeMs
-        if decodeMs > decodeTimeMax { decodeTimeMax = decodeMs }
-        decodeCount += 1
+        let enqueueMs = (CACurrentMediaTime() - enqueueStart) * 1000
+        enqueueTimeSum += enqueueMs
+        if enqueueMs > enqueueTimeMax { enqueueTimeMax = enqueueMs }
+        enqueueCount += 1
 
         // FPS + decode stats
         frameCount += 1
@@ -415,19 +431,19 @@ class VideoPlugin: Plugin, ObservableObject {
         let elapsed = now - lastFpsTime
         if elapsed >= 1.0 {
             let currentFps = Int(Double(frameCount) / elapsed)
-            let avgDecode = decodeCount > 0 ? decodeTimeSum / Double(decodeCount) : 0
-            let maxDecode = decodeTimeMax
+            let avgEnqueue = enqueueCount > 0 ? enqueueTimeSum / Double(enqueueCount) : 0
+            let maxEnqueue = enqueueTimeMax
             let ingress = takeQueueIngressMetrics()
             let avgQueueWait = queueWaitSamples > 0 ? queueWaitSumMs / Double(queueWaitSamples) : 0
             let maxQueueWait = queueWaitMaxMs
-            let nalSize = count
-            NSLog("[anchor] FPS: %d | decode avg=%.2fms max=%.2fms | queue_drops=%d | queue_wait avg=%.2fms max=%.2fms | arrival_gap_max=%.1fms pending_max=%d | NAL=%dB | layer=%@",
-                  currentFps, avgDecode, maxDecode, ingress.queueDrops, avgQueueWait, maxQueueWait,
-                  ingress.maxArrivalGapMs, ingress.maxPendingFrames, nalSize,
+            NSLog("[anchor] FPS: %d | enqueue avg=%.2fms max=%.2fms | source_age avg=%.1fms max=%.1fms | queue_drops=%d | queue_wait avg=%.2fms max=%.2fms | arrival_gap_max=%.1fms pending_max=%d | AU=%dB nals=%d | layer=%@",
+                  currentFps, avgEnqueue, maxEnqueue, ingress.avgSourceAgeMs, ingress.maxSourceAgeMs,
+                  ingress.queueDrops, avgQueueWait, maxQueueWait,
+                  ingress.maxArrivalGapMs, ingress.maxPendingFrames, totalLength, nalUnits.count,
                   layer.status == .failed ? "FAILED" : "ok")
-            decodeTimeSum = 0
-            decodeTimeMax = 0
-            decodeCount = 0
+            enqueueTimeSum = 0
+            enqueueTimeMax = 0
+            enqueueCount = 0
             queueWaitSumMs = 0
             queueWaitMaxMs = 0
             queueWaitSamples = 0
