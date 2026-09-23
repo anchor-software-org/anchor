@@ -45,10 +45,13 @@ The protocol has two data lanes:
   refresh state when required. Datagram payloads are bounded application
   packets, not Protocol Buffer control records.
 
-Screen video uses a reliable stream. Each encoded `ANFR` frame packet is
-prefixed with a 32-bit little-endian length because QUIC streams do not retain
-application message boundaries. Camera video uses the datagram lane when the
-capability is negotiated.
+Screen and camera video both use the datagram lane when the peer advertises
+datagram support. `ANFR` frames are fragmented into bounded datagrams with
+sequence numbers and XOR parity groups, so a single lost datagram can be
+rebuilt instead of stalling the picture. When the peer does not support
+datagrams, screen video falls back to a reliable stream; on the stream each
+`ANFR` frame packet is prefixed with a 32-bit little-endian length because
+QUIC streams do not retain application message boundaries.
 
 ## Capabilities
 
