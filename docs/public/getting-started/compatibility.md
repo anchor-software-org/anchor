@@ -10,7 +10,7 @@ desktop running Wayland.
 | Operating system | Linux |
 | Session | Wayland |
 | Screen sharing | A compositor that provides `zwlr_screencopy_manager_v1` |
-| Virtual display | Sway or Hyprland |
+| Virtual display | Sway |
 | Video encoding | VAAPI when available; software encoding otherwise |
 
 Anchor can start on any Wayland compositor. Screen sharing requires the
@@ -18,8 +18,9 @@ Anchor can start on any Wayland compositor. Screen sharing requires the
 compositors such as Sway, Hyprland, river, Wayfire, and labwc. Without it,
 screen sharing is unavailable.
 
-Virtual displays are available only on Sway and Hyprland. Anchor creates them
-through the compositor's command-line tools (`swaymsg` or `hyprctl`).
+Anchor creates virtual displays through `swaymsg`, so they are available only
+on Sway. On Hyprland you can stream an existing output, but Anchor does not
+create or size a new virtual output there.
 
 Clipboard support depends on the compositor:
 
@@ -40,6 +41,10 @@ The Android app requires Android 11 or newer (API level 30).
 It connects to a Linux desktop over Wi-Fi on the same local network. USB
 connections use an ADB reverse tunnel and require ADB access to the device.
 
+Screen and camera video travel over QUIC datagrams with parity recovery when
+both devices support them. Pairing a newer build with an older one still
+works — the connection falls back to ordered QUIC streams automatically.
+
 Android restricts background clipboard access. To send the current phone
 clipboard to the desktop, open Anchor and use **Send to Desktop**.
 
@@ -55,4 +60,4 @@ The Swift SDK is also preview-only.
 - Windows or macOS desktop hosts
 - Linux X11 desktop sessions
 - Screen sharing on Wayland compositors without `zwlr_screencopy_manager_v1`
-- Virtual displays outside Sway and Hyprland
+- Anchor-managed virtual displays outside Sway
