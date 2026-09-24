@@ -131,6 +131,28 @@ fn refreshed_stream_output<'a>(
         .or_else(|| outputs.iter().min_by_key(|(index, _)| *index).map(|(_, output)| output))
 }
 
+/// Resolve the global origin for the output that is currently being streamed.
+///
+/// A display name is the only safe local identity. Width and height are not an
+/// identity: a virtual display and the built-in display often have the same
+/// mode. If the input connection has not discovered the named display yet,
+/// use the capture worker's explicit origin instead of guessing from its size.
+fn stream_output_origin(
+    outputs: &HashMap<u32, OutputInfo>,
+    output_name: &str,
+    reported_x: Option<i32>,
+    reported_y: Option<i32>,
+) -> (i32, i32) {
+    if let Some(output) = outputs.values().find(|output| output.name == output_name) {
+        return (output.x, output.y);
+    }
+
+    match (reported_x, reported_y) {
+        (Some(x), Some(y)) => (x, y),
+        _ => (0, 0),
+    }
+}
+
 impl WaylandInput {
     /// Connect to Wayland, discover outputs, and create virtual devices.
     pub fn new() -> Result<WaylandInput, String> {
@@ -336,18 +358,7 @@ impl InputBackend for WaylandInput {
         // Prefer local xdg_output positions (always correct) over what
         // the screencopy backend reports — wl_output::Geometry gives wrong
         // positions for virtual outputs like HEADLESS on Sway.
-        let (ox, oy) = if let Some(output) = self
-            .outputs
-            .values()
-            .find(|o| o.name == output_name)
-            .or_else(|| self.outputs.values().find(|o| o.width == width && o.height == height))
-        {
-            (output.x, output.y)
-        } else if let (Some(x), Some(y)) = (output_x, output_y) {
-            (x, y)
-        } else {
-            (0, 0)
-        };
+        let (ox, oy) = stream_output_origin(&self.outputs, output_name, output_x, output_y);
 
         self.stream_output_x = ox;
         self.stream_output_y = oy;
@@ -936,6 +947,29 @@ mod coordinate_tests {
         assert_eq!(refreshed_stream_output(&outputs, "alpha").unwrap().name, "alpha");
         assert_eq!(refreshed_stream_output(&outputs, "deleted").unwrap().name, "zeta");
         assert!(refreshed_stream_output(&HashMap::new(), "deleted").is_none());
+    }
+
+    #[test]
+    fn unknown_virtual_output_uses_reported_origin_not_same_sized_primary() {
+        // Both displays are 1920x1080. Selecting by dimensions would map this
+        // event to eDP-1 instead of the selected HEADLESS-2 output.
+        let outputs =
+            HashMap::from([(1, OutputInfo { name: "eDP-1".into(), ..output(0, 0, 1920, 1080) })]);
+
+        assert_eq!(
+            stream_output_origin(&outputs, "HEADLESS-2", Some(1920), Some(-240)),
+            (1920, -240)
+        );
+    }
+
+    #[test]
+    fn known_output_position_overrides_capture_fallback() {
+        let outputs = HashMap::from([(
+            9,
+            OutputInfo { name: "HEADLESS-2".into(), ..output(-1600, 80, 1920, 1080) },
+        )]);
+
+        assert_eq!(stream_output_origin(&outputs, "HEADLESS-2", Some(0), Some(0)), (-1600, 80));
     }
 
     #[test]

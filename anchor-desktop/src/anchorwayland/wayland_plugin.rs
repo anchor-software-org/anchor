@@ -456,6 +456,20 @@ impl Plugin for AnchorPluginWayland {
                         CaptureAction::SelectOutput(idx) => {
                             if try_apply_output_selection(&mut state, &last_output_list, idx) {
                                 log::info!("SelectOutput({}) mid-stream — switching", idx);
+                                // Update absolute input before the next encoded frame. A pen
+                                // event can arrive as soon as the viewer selects the output.
+                                if let Some(output) =
+                                    last_output_list.get(state.selected_output_index)
+                                {
+                                    send_stream_info(
+                                        &tx,
+                                        output.width,
+                                        output.height,
+                                        &state.selected_output_name,
+                                        state.output_x,
+                                        state.output_y,
+                                    );
+                                }
                                 state.streaming = false;
                                 state.h264_encoder = None;
                                 send_stream_status(&tx, "switching", idx, None);
