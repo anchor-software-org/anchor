@@ -55,6 +55,19 @@ public final class AnchorNetworkReliableStream: AnchorReliableStream, @unchecked
         }
     }
 
+    public func finish() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            connection.send(content: Data(), contentContext: .finalMessage, isComplete: true,
+                            completion: .contentProcessed { error in
+                if let error {
+                    continuation.resume(throwing: AnchorNetworkTransportError.connectionFailed(error.localizedDescription))
+                } else {
+                    continuation.resume()
+                }
+            })
+        }
+    }
+
     public func cancel() { connection.cancel() }
 }
 
@@ -199,6 +212,10 @@ public final class AnchorNetworkFrameworkQuicTransport: AnchorNetworkQuicTranspo
         )
         withState { reliableStreams.append(stream) }
         return stream
+    }
+
+    public func receiveReliableStream() async throws -> any AnchorReliableStream {
+        throw AnchorNetworkTransportError.connectionFailed("inbound multiplexed QUIC streams are unavailable")
     }
 
     public func sendControl(_ bytes: Data) async throws {

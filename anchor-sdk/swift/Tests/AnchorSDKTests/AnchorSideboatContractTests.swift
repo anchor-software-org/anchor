@@ -6,6 +6,13 @@ import XCTest
 /// implementation needs physical-device interoperability coverage, while the
 /// byte and binding contracts below can be exhaustively checked on every host.
 final class AnchorSideboatContractTests: XCTestCase {
+    func testPeerDatagramLimitDistinguishesUnknownFromTooSmall() {
+        XCTAssertTrue(AnchorPeerDatagramLimit.accepts(payloadBytes: 1_100, usableFrameSize: 0))
+        XCTAssertTrue(AnchorPeerDatagramLimit.accepts(payloadBytes: 1_100, usableFrameSize: 1_100))
+        XCTAssertFalse(AnchorPeerDatagramLimit.accepts(payloadBytes: 1_100, usableFrameSize: 1_099))
+        XCTAssertFalse(AnchorPeerDatagramLimit.accepts(payloadBytes: 0, usableFrameSize: 1_100))
+    }
+
     func testANFRHeaderMatchesRustLittleEndianWireLayout() throws {
         let packet = try XCTUnwrap(AnchorVideoFrameCodec.fragment(
             kind: AnchorVideoFrameHeader.screenKind,
@@ -134,6 +141,58 @@ final class AnchorSideboatContractTests: XCTestCase {
         XCTAssertThrowsError(try assembler.consume(changed[1])) {
             XCTAssertEqual($0 as? AnchorWireError, .invalidFrameFragments)
         }
+    }
+
+    func testDatagramAssemblerReassemblesOutOfOrderFragments() throws {
+        let payload = Data((0..<(AnchorVideoFrameHeader.payloadBytes * 2 + 17)).map {
+            UInt8($0 % 251)
+        })
+        let packets = try AnchorVideoFrameCodec.fragment(
+            kind: AnchorVideoFrameHeader.screenKind,
+            flags: AnchorVideoFrameHeader.keyframeFlag,
+            capabilitySessionID: 3,
+            flowID: 7,
+            sequence: 9,
+            presentationTimeUs: 11,
+            codecConfigID: 13,
+            payload: payload
+        )
+        var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+
+        XCTAssertNil(try assembler.consume(packets[2]))
+        XCTAssertNil(try assembler.consume(packets[0]))
+        let frame = try XCTUnwrap(assembler.consume(packets[1]))
+        XCTAssertEqual(frame.payload, payload)
+        XCTAssertEqual(frame.header.sequence, 9)
+        XCTAssertEqual(frame.header.fragmentIndex, 0)
+    }
+
+    func testDatagramAssemblerSupersedesLossAndIgnoresLateOrDuplicatePackets() throws {
+        let incomplete = try AnchorVideoFrameCodec.fragment(
+            kind: AnchorVideoFrameHeader.screenKind,
+            capabilitySessionID: 3,
+            flowID: 7,
+            sequence: 20,
+            presentationTimeUs: 20,
+            codecConfigID: 1,
+            payload: Data(repeating: 1, count: AnchorVideoFrameHeader.payloadBytes + 1)
+        )
+        let replacement = try XCTUnwrap(AnchorVideoFrameCodec.fragment(
+            kind: AnchorVideoFrameHeader.screenKind,
+            flags: AnchorVideoFrameHeader.keyframeFlag,
+            capabilitySessionID: 3,
+            flowID: 7,
+            sequence: 21,
+            presentationTimeUs: 21,
+            codecConfigID: 2,
+            payload: Data([7, 8, 9])
+        ).first)
+        var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+
+        XCTAssertNil(try assembler.consume(incomplete[0]))
+        XCTAssertEqual(try assembler.consume(replacement)?.payload, Data([7, 8, 9]))
+        XCTAssertNil(try assembler.consume(incomplete[1]))
+        XCTAssertNil(try assembler.consume(replacement))
     }
 
     func testStreamBindingRejectsEveryMismatchedAcknowledgementField() throws {

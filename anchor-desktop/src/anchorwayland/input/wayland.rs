@@ -16,7 +16,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
 
-use super::InputBackend;
+use super::{InputBackend, OutputGeometry};
 
 const MOD_SHIFT: u32 = 1;
 
@@ -61,6 +61,7 @@ pub struct WaylandInput {
     virtual_keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
     char_to_keycode: HashMap<char, (u32, bool)>,
     outputs: HashMap<u32, OutputInfo>,
+    stream_output_name: String,
     stream_output_x: i32,
     stream_output_y: i32,
     stream_output_w: u32,
@@ -118,6 +119,16 @@ fn absolute_position_in_layout(
         translated_x.round().clamp(0.0, f64::from(total_w)) as u32,
         translated_y.round().clamp(0.0, f64::from(total_h)) as u32,
     )
+}
+
+fn refreshed_stream_output<'a>(
+    outputs: &'a HashMap<u32, OutputInfo>,
+    current_name: &str,
+) -> Option<&'a OutputInfo> {
+    outputs
+        .values()
+        .find(|output| output.name == current_name)
+        .or_else(|| outputs.iter().min_by_key(|(index, _)| *index).map(|(_, output)| output))
 }
 
 impl WaylandInput {
@@ -287,6 +298,7 @@ impl WaylandInput {
             virtual_keyboard,
             char_to_keycode,
             outputs: wl_state.outputs,
+            stream_output_name: String::new(),
             stream_output_x: wl_state.stream_output_x,
             stream_output_y: wl_state.stream_output_y,
             stream_output_w: wl_state.stream_output_w,
@@ -320,6 +332,7 @@ impl InputBackend for WaylandInput {
         output_x: Option<i32>,
         output_y: Option<i32>,
     ) {
+        self.stream_output_name = output_name.to_string();
         // Prefer local xdg_output positions (always correct) over what
         // the screencopy backend reports — wl_output::Geometry gives wrong
         // positions for virtual outputs like HEADLESS on Sway.
@@ -363,6 +376,66 @@ impl InputBackend for WaylandInput {
             self.layout_min_y,
             self.total_w,
             self.total_h,
+        );
+    }
+
+    fn set_output_layout(&mut self, outputs: &[OutputGeometry]) {
+        self.outputs = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                (
+                    index as u32,
+                    OutputInfo {
+                        name: output.name.clone(),
+                        x: output.x,
+                        y: output.y,
+                        width: output.width,
+                        height: output.height,
+                    },
+                )
+            })
+            .collect();
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(self.outputs.values());
+        self.layout_min_x = min_x;
+        self.layout_min_y = min_y;
+        self.total_w = total_w;
+        self.total_h = total_h;
+
+        // Capture and input must choose the same fallback. Both use the first
+        // output in the freshly published topology when the selected name is
+        // gone; HashMap iteration order must never decide the target.
+        let selected = refreshed_stream_output(&self.outputs, &self.stream_output_name);
+        if let Some(output) = selected {
+            if output.name != self.stream_output_name {
+                log::warn!(
+                    "Input: mapped output '{}' disappeared; falling back to '{}'",
+                    self.stream_output_name,
+                    output.name
+                );
+                self.stream_output_name = output.name.clone();
+            }
+            self.stream_output_x = output.x;
+            self.stream_output_y = output.y;
+            self.stream_output_w = output.width;
+            self.stream_output_h = output.height;
+        } else {
+            // Do not keep mapping input to geometry for an output that no
+            // longer exists. The default bounds keep any in-flight absolute
+            // event finite until a replacement topology arrives.
+            self.stream_output_name.clear();
+            self.stream_output_x = 0;
+            self.stream_output_y = 0;
+            self.stream_output_w = self.total_w;
+            self.stream_output_h = self.total_h;
+        }
+        log::info!(
+            "Input: refreshed output topology ({} outputs), layout origin ({},{}) extent {}x{}",
+            outputs.len(),
+            self.layout_min_x,
+            self.layout_min_y,
+            self.total_w,
+            self.total_h
         );
     }
 
@@ -854,6 +927,18 @@ mod coordinate_tests {
     }
 
     #[test]
+    fn topology_refresh_preserves_name_or_uses_published_first_output() {
+        let outputs = HashMap::from([
+            (1, OutputInfo { name: "alpha".into(), ..output(100, 0, 800, 600) }),
+            (0, OutputInfo { name: "zeta".into(), ..output(0, 0, 100, 100) }),
+        ]);
+
+        assert_eq!(refreshed_stream_output(&outputs, "alpha").unwrap().name, "alpha");
+        assert_eq!(refreshed_stream_output(&outputs, "deleted").unwrap().name, "zeta");
+        assert!(refreshed_stream_output(&HashMap::new(), "deleted").is_none());
+    }
+
+    #[test]
     fn positive_origin_layout_maps_second_output_corners_and_center() {
         let outputs = [output(0, 0, 1920, 1080), output(1920, 0, 2560, 1440)];
         let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
@@ -935,5 +1020,58 @@ mod coordinate_tests {
             absolute_position_in_layout(0, 0, 1920, 1080, 0, 0, 1920, 1080, 0.5, 0.5),
             (960, 540)
         );
+    }
+
+    #[test]
+    fn removing_virtual_output_shrinks_refreshed_layout() {
+        let with_virtual = [output(0, 0, 1920, 1080), output(1920, 0, 1080, 2340)];
+        let after_removal = [output(0, 0, 1920, 1080)];
+
+        assert_eq!(output_layout_bounds(with_virtual.iter()), (0, 0, 3000, 2340));
+        assert_eq!(output_layout_bounds(after_removal.iter()), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn absolute_mapping_is_bounded_for_representative_hotplug_layouts() {
+        let layouts = [
+            vec![output(0, 0, 1920, 1080)],
+            vec![output(-2560, -200, 2560, 1440), output(0, 0, 1920, 1080)],
+            vec![output(0, 0, 1920, 1080), output(1920, 60, 1080, 2340)],
+        ];
+        let normalized = [-10.0, -0.01, 0.0, 0.25, 0.5, 1.0, 1.01, 10.0];
+
+        for outputs in layouts {
+            let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+            for streamed in &outputs {
+                for x in normalized {
+                    for y in normalized {
+                        let (mapped_x, mapped_y) = absolute_position_in_layout(
+                            min_x,
+                            min_y,
+                            width,
+                            height,
+                            streamed.x,
+                            streamed.y,
+                            streamed.width,
+                            streamed.height,
+                            x,
+                            y,
+                        );
+                        assert!(mapped_x <= width);
+                        assert!(mapped_y <= height);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_valid_geometry_cannot_overflow_layout_bounds() {
+        let outputs = [
+            output(i32::MIN, i32::MIN, u32::MAX, u32::MAX),
+            output(i32::MAX, i32::MAX, u32::MAX, u32::MAX),
+        ];
+
+        assert_eq!(output_layout_bounds(outputs.iter()), (i32::MIN, i32::MIN, u32::MAX, u32::MAX));
     }
 }

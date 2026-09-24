@@ -44,6 +44,29 @@ final class AnchorAspectFitCoordinatesTests: XCTestCase {
         assertPoint(point, x: 0.25, y: 0.25)
     }
 
+    func testStrictMappingRejectsLetterboxBarsAndAcceptsVideoEdges() {
+        XCTAssertNil(AnchorAspectFitCoordinates.mapIfInside(
+            x: 200, y: 20,
+            viewWidth: 400, viewHeight: 300,
+            streamWidth: 1_600, streamHeight: 900
+        ))
+        let topEdge = AnchorAspectFitCoordinates.mapIfInside(
+            x: 200, y: 37.5,
+            viewWidth: 400, viewHeight: 300,
+            streamWidth: 1_600, streamHeight: 900
+        )
+        XCTAssertNotNil(topEdge)
+        assertPoint(topEdge!, x: 0.5, y: 0)
+    }
+
+    func testStrictMappingRejectsInputUntilStreamSizeIsKnown() {
+        XCTAssertNil(AnchorAspectFitCoordinates.mapIfInside(
+            x: 200, y: 150,
+            viewWidth: 400, viewHeight: 300,
+            streamWidth: 0, streamHeight: 0
+        ))
+    }
+
     private func map(x: Double, y: Double) -> AnchorNormalizedPoint {
         AnchorAspectFitCoordinates.map(
             x: x, y: y,

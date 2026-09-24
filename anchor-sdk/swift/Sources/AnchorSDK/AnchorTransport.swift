@@ -18,6 +18,7 @@ public protocol AnchorReliableStream: AnyObject {
     var streamIdentifier: UInt64 { get }
     func receive(maximumLength: Int) async throws -> Data
     func send(_ bytes: Data) async throws
+    func finish() async throws
 }
 
 /// Operations needed by an Anchor host in addition to the control transport.
@@ -26,6 +27,7 @@ public protocol AnchorReliableStream: AnyObject {
 public protocol AnchorNetworkQuicTransport: AnchorQuicTransport {
     func connectForPairing(host: String, port: UInt16, serverName: String) async throws -> Data
     func openReliableStream() async throws -> any AnchorReliableStream
+    func receiveReliableStream() async throws -> any AnchorReliableStream
 }
 
 public struct AnchorQuicConfiguration: Equatable {

@@ -3,6 +3,12 @@ import Foundation
 import Network
 import Security
 
+enum AnchorPeerDatagramLimit {
+    static func accepts(payloadBytes: Int, usableFrameSize: Int) -> Bool {
+        payloadBytes > 0 && (usableFrameSize == 0 || payloadBytes <= usableFrameSize)
+    }
+}
+
 /// A reliable stream that belongs to a modern multiplexed QUIC connection.
 @available(macOS 26.0, iOS 26.0, *)
 public final class AnchorModernNetworkReliableStream: AnchorReliableStream, @unchecked Sendable {
@@ -25,6 +31,10 @@ public final class AnchorModernNetworkReliableStream: AnchorReliableStream, @unc
     public func send(_ bytes: Data) async throws {
         try await stream.send(bytes)
     }
+
+    public func finish() async throws {
+        try await stream.send(Data(), endOfStream: true)
+    }
 }
 
 /// Multiplexed QUIC transport built on Apple's iOS/macOS 26 Network API.
@@ -43,7 +53,11 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
     private let stateLock = NSLock()
     private var connection: NetworkConnection<Network.QUIC>?
     private var controlStream: Network.QUIC.Stream<Network.QUICStream>?
+    private var datagramChannel: Network.QUIC.Datagrams<Network.QUICDatagram>?
     private var reliableStreams = [AnchorModernNetworkReliableStream]()
+    private var pendingInboundStreams = [AnchorModernNetworkReliableStream]()
+    private var inboundStreamWaiters = [CheckedContinuation<any AnchorReliableStream, Error>]()
+    private var inboundStreamsTask: Task<Void, Never>?
     private var verification: PeerVerification = .pairing
     private var peerCertificate = Data()
     private var terminalError: Error?
@@ -107,6 +121,7 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
 
         do {
             try await waitForReady(connection)
+            startReceivingInboundStreams(on: connection)
             let control = try await connection.openStream(directionality: .bidirectional)
             withState { controlStream = control }
             NSLog("[anchor.sdk.quic] modern control stream ready: %llu", control.streamID)
@@ -124,6 +139,29 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
         let reliable = AnchorModernNetworkReliableStream(stream)
         withState { reliableStreams.append(reliable) }
         return reliable
+    }
+
+    public func receiveReliableStream() async throws -> any AnchorReliableStream {
+        if let stream = withState({
+            pendingInboundStreams.isEmpty ? nil : pendingInboundStreams.removeFirst()
+        }) {
+            return stream
+        }
+        if let error = withState({ terminalError }) { throw error }
+        return try await withCheckedThrowingContinuation { continuation in
+            stateLock.lock()
+            if !pendingInboundStreams.isEmpty {
+                let stream = pendingInboundStreams.removeFirst()
+                stateLock.unlock()
+                continuation.resume(returning: stream)
+            } else if let terminalError {
+                stateLock.unlock()
+                continuation.resume(throwing: terminalError)
+            } else {
+                inboundStreamWaiters.append(continuation)
+                stateLock.unlock()
+            }
+        }
     }
 
     public func sendControl(_ bytes: Data) async throws {
@@ -144,11 +182,25 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
     }
 
     public func sendDatagram(_ bytes: Data) async throws {
-        throw AnchorNetworkTransportError.connectionFailed("QUIC datagram flows are not enabled")
+        guard !bytes.isEmpty, bytes.count <= AnchorVideoFrameHeader.datagramBytes else {
+            throw AnchorNetworkTransportError.connectionFailed("invalid QUIC datagram size")
+        }
+        let datagrams = try await resolvedDatagramChannel()
+        let usableFrameSize = withState({ connection?.usableDatagramFrameSize ?? 0 })
+        guard AnchorPeerDatagramLimit.accepts(
+            payloadBytes: bytes.count,
+            usableFrameSize: usableFrameSize
+        ) else {
+            throw AnchorNetworkTransportError.connectionFailed(
+                "peer QUIC datagram limit is \(usableFrameSize) bytes"
+            )
+        }
+        try await datagrams.send(bytes)
     }
 
     public func receiveDatagram() async throws -> Data {
-        throw AnchorNetworkTransportError.connectionFailed("QUIC datagram flows are not enabled")
+        let datagrams = try await resolvedDatagramChannel()
+        return try await datagrams.receive().content
     }
 
     public func close() {
@@ -157,10 +209,64 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
         // child streams first, then the connection, and make later operations
         // observe a deterministic terminal error.
         reliableStreams.removeAll()
+        pendingInboundStreams.removeAll()
+        let waiters = inboundStreamWaiters
+        inboundStreamWaiters.removeAll()
+        inboundStreamsTask?.cancel()
+        inboundStreamsTask = nil
         controlStream = nil
+        datagramChannel = nil
         connection = nil
         terminalError = AnchorNetworkTransportError.connectionClosed
         stateLock.unlock()
+        waiters.forEach { $0.resume(throwing: AnchorNetworkTransportError.connectionClosed) }
+    }
+
+    private func startReceivingInboundStreams(on connection: NetworkConnection<Network.QUIC>) {
+        inboundStreamsTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await connection.inboundStreams { stream in
+                    self.enqueueInboundStream(AnchorModernNetworkReliableStream(stream))
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                self.failInboundStreams(error)
+            }
+        }
+    }
+
+    private func resolvedDatagramChannel() async throws
+        -> Network.QUIC.Datagrams<Network.QUICDatagram> {
+        if let channel = withState({ datagramChannel }) { return channel }
+        guard let connection = withState({ connection }) else {
+            throw closedOrTerminalError()
+        }
+        let channel = try await connection.datagrams
+        return withState {
+            if let existing = datagramChannel { return existing }
+            datagramChannel = channel
+            return channel
+        }
+    }
+
+    private func enqueueInboundStream(_ stream: AnchorModernNetworkReliableStream) {
+        stateLock.lock()
+        reliableStreams.append(stream)
+        let waiter = inboundStreamWaiters.isEmpty ? nil : inboundStreamWaiters.removeFirst()
+        if waiter == nil { pendingInboundStreams.append(stream) }
+        stateLock.unlock()
+        waiter?.resume(returning: stream)
+    }
+
+    private func failInboundStreams(_ error: Error) {
+        stateLock.lock()
+        let waiters = inboundStreamWaiters
+        inboundStreamWaiters.removeAll()
+        terminalError = error
+        stateLock.unlock()
+        waiters.forEach { $0.resume(throwing: error) }
     }
 
     private func waitForReady(_ connection: NetworkConnection<Network.QUIC>) async throws {

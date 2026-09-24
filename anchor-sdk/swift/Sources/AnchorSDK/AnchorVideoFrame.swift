@@ -287,3 +287,98 @@ public struct AnchorScreenFrameAssembler {
         nextFragmentIndex = 0
     }
 }
+
+/// Reassembles one newest screen access unit from unordered, replaceable QUIC
+/// datagrams. A newer sequence supersedes an incomplete older sequence. Late
+/// and duplicate packets are ignored so loss cannot stall the receive loop.
+public struct AnchorScreenDatagramAssembler {
+    public let capabilitySessionID: UInt64
+    public let flowID: UInt64
+
+    private struct PendingFrame {
+        let header: AnchorVideoFrameHeader
+        var fragments: [Data?]
+        var receivedCount = 0
+        var receivedBytes = 0
+    }
+
+    private var pending: PendingFrame?
+    private var lastCompletedSequence: UInt64?
+
+    public init(capabilitySessionID: UInt64, flowID: UInt64) {
+        self.capabilitySessionID = capabilitySessionID
+        self.flowID = flowID
+    }
+
+    public mutating func consume(_ bytes: Data) throws -> AnchorVideoFrame? {
+        let packet = try AnchorVideoFrameCodec.decodeValidated(bytes)
+        let header = packet.header
+        guard header.kind == AnchorVideoFrameHeader.screenKind,
+              header.capabilitySessionID == capabilitySessionID,
+              header.flowID == flowID else {
+            throw AnchorWireError.frameBindingMismatch
+        }
+
+        if let lastCompletedSequence, header.sequence <= lastCompletedSequence {
+            return nil
+        }
+        if let current = pending, header.sequence < current.header.sequence {
+            return nil
+        }
+        if pending == nil || header.sequence > pending!.header.sequence {
+            pending = PendingFrame(
+                header: header,
+                fragments: Array(repeating: nil, count: Int(header.fragmentCount))
+            )
+        }
+
+        guard var current = pending,
+              header.sequence == current.header.sequence,
+              header.fragmentCount == current.header.fragmentCount,
+              header.flags == current.header.flags,
+              header.presentationTimeUs == current.header.presentationTimeUs,
+              header.codecConfigID == current.header.codecConfigID else {
+            throw AnchorWireError.invalidFrameFragments
+        }
+
+        let index = Int(header.fragmentIndex)
+        if let existing = current.fragments[index] {
+            guard existing == packet.payload else { throw AnchorWireError.invalidFrameFragments }
+            return nil
+        }
+        guard current.receivedBytes + packet.payload.count <= AnchorVideoFrameHeader.maxFrameBytes else {
+            throw AnchorWireError.frameTooLarge
+        }
+        current.fragments[index] = packet.payload
+        current.receivedCount += 1
+        current.receivedBytes += packet.payload.count
+        pending = current
+
+        guard current.receivedCount == current.fragments.count else { return nil }
+        var payload = Data()
+        payload.reserveCapacity(current.receivedBytes)
+        for fragment in current.fragments {
+            guard let fragment else { throw AnchorWireError.invalidFrameFragments }
+            payload.append(fragment)
+        }
+        let canonicalHeader = AnchorVideoFrameHeader(
+            kind: current.header.kind,
+            flags: current.header.flags,
+            capabilitySessionID: current.header.capabilitySessionID,
+            flowID: current.header.flowID,
+            sequence: current.header.sequence,
+            fragmentIndex: 0,
+            fragmentCount: current.header.fragmentCount,
+            presentationTimeUs: current.header.presentationTimeUs,
+            codecConfigID: current.header.codecConfigID
+        )
+        lastCompletedSequence = current.header.sequence
+        pending = nil
+        return AnchorVideoFrame(header: canonicalHeader, payload: payload)
+    }
+
+    public mutating func reset() {
+        pending = nil
+        lastCompletedSequence = nil
+    }
+}

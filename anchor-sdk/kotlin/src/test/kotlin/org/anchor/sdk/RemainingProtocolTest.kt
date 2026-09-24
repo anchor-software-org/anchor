@@ -10,7 +10,6 @@ import org.anchor.sdk.v1.capabilities.screen.ScreenOutputList
 import org.anchor.sdk.v1.capabilities.screen.ScreenStatus
 import org.anchor.sdk.v1.capabilities.sms.SmsMessage
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -51,10 +50,7 @@ class RemainingProtocolTest {
         assertEquals(1, decodedOutputs.size)
         assertEquals("display-1", decodedOutputs.single().outputId)
         assertEquals("HDMI", decodedOutputs.single().displayName)
-        // Sideboat now uses a reliable QUIC stream. A screen capability must
-        // not advertise datagrams, or callers can accidentally recreate the
-        // lossy/reordering path that caused visible frame degradation.
-        assertFalse(ScreenProtocol.advertisement().supportsDatagrams)
+        assertTrue(ScreenProtocol.advertisement().supportsDatagrams)
     }
 
     @Test

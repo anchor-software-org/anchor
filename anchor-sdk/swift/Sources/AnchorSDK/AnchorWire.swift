@@ -71,6 +71,7 @@ public enum AnchorV1 {
         public static let fileOffer = "type.googleapis.com/anchor.v1.capabilities.files.FileOffer"
         public static let fileDecision = "type.googleapis.com/anchor.v1.capabilities.files.FileDecision"
         public static let fileContentStart = "type.googleapis.com/anchor.v1.capabilities.files.FileContentStart"
+        public static let fileContent = "type.googleapis.com/anchor.v1.capabilities.files.FileContent"
         public static let fileComplete = "type.googleapis.com/anchor.v1.capabilities.files.FileComplete"
         public static let smsMessage = "type.googleapis.com/anchor.v1.capabilities.sms.SmsMessage"
         public static let smsSend = "type.googleapis.com/anchor.v1.capabilities.sms.SmsSend"
