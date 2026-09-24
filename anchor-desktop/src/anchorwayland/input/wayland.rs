@@ -37,6 +37,8 @@ struct InputWaylandState {
     xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     /// All outputs, keyed by wl_output object id.
     outputs: HashMap<u32, OutputInfo>,
+    /// Bound output objects, retained so virtual pointers can target them.
+    output_objects: HashMap<u32, wl_output::WlOutput>,
     /// Map from xdg_output object id → wl_output object id, for routing xdg events.
     xdg_to_wl: HashMap<u32, u32>,
     /// Currently building output (accumulates geometry/mode/name events before Done).
@@ -57,7 +59,13 @@ struct InputWaylandState {
 /// Wayland-based pointer + keyboard injection.
 pub struct WaylandInput {
     conn: Connection,
+    /// Unbound fallback for compositors that do not expose virtual-pointer v2.
+    generic_virtual_pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
     virtual_pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    /// Output-bound virtual pointers keyed by stable Wayland output name.
+    output_virtual_pointers: HashMap<String, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
+    /// True only when `virtual_pointer` is constrained to the streamed output.
+    pointer_is_output_bound: bool,
     virtual_keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
     char_to_keycode: HashMap<char, (u32, bool)>,
     outputs: HashMap<u32, OutputInfo>,
@@ -121,6 +129,20 @@ fn absolute_position_in_layout(
     )
 }
 
+/// Convert normalized stream coordinates into the selected output's local
+/// coordinate frame. This is used only by an output-bound virtual pointer.
+fn absolute_position_in_output(
+    output_w: u32,
+    output_h: u32,
+    x_norm: f64,
+    y_norm: f64,
+) -> (u32, u32) {
+    (
+        (x_norm.clamp(0.0, 1.0) * f64::from(output_w)).round() as u32,
+        (y_norm.clamp(0.0, 1.0) * f64::from(output_h)).round() as u32,
+    )
+}
+
 fn refreshed_stream_output<'a>(
     outputs: &'a HashMap<u32, OutputInfo>,
     current_name: &str,
@@ -169,6 +191,7 @@ impl WaylandInput {
             keyboard_manager: None,
             xdg_output_manager: None,
             outputs: HashMap::new(),
+            output_objects: HashMap::new(),
             xdg_to_wl: HashMap::new(),
             pending_output: None,
             stream_output_x: 0,
@@ -219,7 +242,7 @@ impl WaylandInput {
         );
 
         // Virtual pointer
-        let virtual_pointer = match wl_state.pointer_manager.as_ref() {
+        let generic_virtual_pointer = match wl_state.pointer_manager.as_ref() {
             Some(m) => m.create_virtual_pointer(wl_state.seat.as_ref(), &qh, ()),
             None => {
                 return Err(
@@ -227,6 +250,24 @@ impl WaylandInput {
                 );
             }
         };
+        let mut output_virtual_pointers = HashMap::new();
+        if let Some(manager) =
+            wl_state.pointer_manager.as_ref().filter(|manager| manager.version() >= 2)
+        {
+            for (id, info) in &wl_state.outputs {
+                if let Some(output) = wl_state.output_objects.get(id) {
+                    let pointer = manager.create_virtual_pointer_with_output(
+                        wl_state.seat.as_ref(),
+                        Some(output),
+                        &qh,
+                        (),
+                    );
+                    output_virtual_pointers.insert(info.name.clone(), pointer);
+                }
+            }
+        } else {
+            log::warn!("Input: virtual-pointer v2 unavailable; absolute input uses global layout");
+        }
 
         // Virtual keyboard
         let virtual_keyboard = match (wl_state.keyboard_manager.as_ref(), wl_state.seat.as_ref()) {
@@ -316,7 +357,10 @@ impl WaylandInput {
 
         Ok(WaylandInput {
             conn,
-            virtual_pointer,
+            generic_virtual_pointer: generic_virtual_pointer.clone(),
+            virtual_pointer: generic_virtual_pointer,
+            output_virtual_pointers,
+            pointer_is_output_bound: false,
             virtual_keyboard,
             char_to_keycode,
             outputs: wl_state.outputs,
@@ -364,6 +408,17 @@ impl InputBackend for WaylandInput {
         self.stream_output_y = oy;
         self.stream_output_w = width;
         self.stream_output_h = height;
+        if let Some(pointer) = self.output_virtual_pointers.get(output_name) {
+            self.virtual_pointer = pointer.clone();
+            self.pointer_is_output_bound = true;
+        } else {
+            self.virtual_pointer = self.generic_virtual_pointer.clone();
+            self.pointer_is_output_bound = false;
+            log::warn!(
+                "Input: no output-bound pointer for '{}'; using global-layout fallback",
+                output_name
+            );
+        }
         // Expand the signed compositor bounding box to include a stream output
         // that was not present during initial Wayland output discovery.
         let current_max_x = i64::from(self.layout_min_x) + i64::from(self.total_w);
@@ -456,6 +511,33 @@ impl InputBackend for WaylandInput {
     }
 
     fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64) {
+        if self.pointer_is_output_bound {
+            let (x, y) = absolute_position_in_output(
+                self.stream_output_w,
+                self.stream_output_h,
+                x_norm,
+                y_norm,
+            );
+            log::debug!(
+                "Input: abs norm=({:.3},{:.3}) -> output-local=({},{}) extent={}x{} output='{}'",
+                x_norm,
+                y_norm,
+                x,
+                y,
+                self.stream_output_w,
+                self.stream_output_h,
+                self.stream_output_name
+            );
+            self.virtual_pointer.motion_absolute(
+                time,
+                x,
+                y,
+                self.stream_output_w,
+                self.stream_output_h,
+            );
+            self.virtual_pointer.frame();
+            return;
+        }
         // Translate signed global compositor coordinates into the unsigned
         // layout coordinate space required by wlr-virtual-pointer.
         let (abs_x, abs_y) = absolute_position_in_layout(
@@ -779,6 +861,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputWaylandState {
                 "wl_output" => {
                     let output =
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
+                    state.output_objects.insert(output.id().protocol_id(), output.clone());
                     // Request xdg_output for this wl_output to get logical position.
                     if let Some(mgr) = &state.xdg_output_manager {
                         let wl_id = output.id().protocol_id();
@@ -970,6 +1053,14 @@ mod coordinate_tests {
         )]);
 
         assert_eq!(stream_output_origin(&outputs, "HEADLESS-2", Some(0), Some(0)), (-1600, 80));
+    }
+
+    #[test]
+    fn output_bound_absolute_pointer_uses_only_the_selected_screen_extent() {
+        // The virtual output starts at x=1920 in a 3840px-wide layout. An
+        // output-bound pointer must receive local coordinates, not 2880/3840.
+        assert_eq!(absolute_position_in_output(1920, 1080, 0.5, 0.5), (960, 540));
+        assert_eq!(absolute_position_in_output(1920, 1080, -1.0, 2.0), (0, 1080));
     }
 
     #[test]
