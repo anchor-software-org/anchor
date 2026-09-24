@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 
 /// Fixed binary header shared by screen and camera QUIC datagrams.
 public struct AnchorVideoFrameHeader: Equatable {
@@ -288,29 +289,48 @@ public struct AnchorScreenFrameAssembler {
     }
 }
 
-/// Reassembles one newest screen access unit from unordered, replaceable QUIC
-/// datagrams. A newer sequence supersedes an incomplete older sequence. Late
-/// and duplicate packets are ignored so loss cannot stall the receive loop.
+/// Reassembles screen access units from unordered QUIC datagrams. A small,
+/// bounded reorder window prevents harmless packet reordering from breaking an
+/// H.264 reference chain. Real loss clears dependent frames and waits for IDR.
 public struct AnchorScreenDatagramAssembler {
     public let capabilitySessionID: UInt64
     public let flowID: UInt64
 
     private struct PendingFrame {
         let header: AnchorVideoFrameHeader
+        let firstSeenNanoseconds: UInt64
         var fragments: [Data?]
         var receivedCount = 0
         var receivedBytes = 0
+        var completedAtNanoseconds: UInt64?
+
+        var isComplete: Bool { receivedCount == fragments.count }
+        var isKeyframe: Bool {
+            header.flags & AnchorVideoFrameHeader.keyframeFlag != 0
+        }
     }
 
-    private var pending: PendingFrame?
-    private var lastCompletedSequence: UInt64?
+    private var pending: [UInt64: PendingFrame] = [:]
+    private var retainedBytes = 0
+    private var lastDeliveredSequence: UInt64?
+    private var waitingForKeyframe = true
+    private var keyframeRequestPending = false
+    private var gapSinceNanoseconds: UInt64?
+
+    private static let maximumPendingFrames = 8
+    private static let maximumFragmentsPerFrame = 4_096
+    private static let reorderTimeoutNanoseconds: UInt64 = 50_000_000
+    private static let assemblyTimeoutNanoseconds: UInt64 = 250_000_000
 
     public init(capabilitySessionID: UInt64, flowID: UInt64) {
         self.capabilitySessionID = capabilitySessionID
         self.flowID = flowID
     }
 
-    public mutating func consume(_ bytes: Data) throws -> AnchorVideoFrame? {
+    public mutating func consume(
+        _ bytes: Data,
+        atNanoseconds now: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) throws -> [AnchorVideoFrame] {
         let packet = try AnchorVideoFrameCodec.decodeValidated(bytes)
         let header = packet.header
         guard header.kind == AnchorVideoFrameHeader.screenKind,
@@ -318,48 +338,126 @@ public struct AnchorScreenDatagramAssembler {
               header.flowID == flowID else {
             throw AnchorWireError.frameBindingMismatch
         }
+        guard header.fragmentCount <= Self.maximumFragmentsPerFrame else {
+            throw AnchorWireError.invalidFrameFragments
+        }
 
-        if let lastCompletedSequence, header.sequence <= lastCompletedSequence {
-            return nil
+        expireIncompleteFrames(atNanoseconds: now)
+
+        if let lastDeliveredSequence, header.sequence <= lastDeliveredSequence {
+            return []
         }
-        if let current = pending, header.sequence < current.header.sequence {
-            return nil
+        if pending[header.sequence] == nil,
+           pending.count >= Self.maximumPendingFrames {
+            enterRecovery()
         }
-        if pending == nil || header.sequence > pending!.header.sequence {
-            pending = PendingFrame(
+        if pending[header.sequence] == nil {
+            pending[header.sequence] = PendingFrame(
                 header: header,
+                firstSeenNanoseconds: now,
                 fragments: Array(repeating: nil, count: Int(header.fragmentCount))
             )
         }
 
-        guard var current = pending,
+        guard var current = pending[header.sequence],
               header.sequence == current.header.sequence,
               header.fragmentCount == current.header.fragmentCount,
               header.flags == current.header.flags,
               header.presentationTimeUs == current.header.presentationTimeUs,
               header.codecConfigID == current.header.codecConfigID else {
+            discard(sequence: header.sequence)
+            enterRecovery()
             throw AnchorWireError.invalidFrameFragments
         }
 
         let index = Int(header.fragmentIndex)
         if let existing = current.fragments[index] {
-            guard existing == packet.payload else { throw AnchorWireError.invalidFrameFragments }
-            return nil
+            guard existing == packet.payload else {
+                enterRecovery()
+                throw AnchorWireError.invalidFrameFragments
+            }
+            return drainCompletedFrames(atNanoseconds: now)
         }
-        guard current.receivedBytes + packet.payload.count <= AnchorVideoFrameHeader.maxFrameBytes else {
+        guard current.receivedBytes + packet.payload.count <= AnchorVideoFrameHeader.maxFrameBytes,
+              retainedBytes + packet.payload.count <= AnchorVideoFrameHeader.maxFrameBytes else {
+            enterRecovery()
             throw AnchorWireError.frameTooLarge
         }
         current.fragments[index] = packet.payload
         current.receivedCount += 1
         current.receivedBytes += packet.payload.count
-        pending = current
+        retainedBytes += packet.payload.count
+        if current.isComplete {
+            current.completedAtNanoseconds = now
+        }
+        pending[header.sequence] = current
+        return drainCompletedFrames(atNanoseconds: now)
+    }
 
-        guard current.receivedCount == current.fragments.count else { return nil }
+    /// Advances loss timers when no new datagram is available.
+    public mutating func poll(
+        atNanoseconds now: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> [AnchorVideoFrame] {
+        expireIncompleteFrames(atNanoseconds: now)
+        return drainCompletedFrames(atNanoseconds: now)
+    }
+
+    public mutating func takeKeyframeRequest() -> Bool {
+        guard keyframeRequestPending else { return false }
+        keyframeRequestPending = false
+        return true
+    }
+
+    private mutating func drainCompletedFrames(atNanoseconds now: UInt64) -> [AnchorVideoFrame] {
+        var output: [AnchorVideoFrame] = []
+
+        if waitingForKeyframe,
+           !pending.values.contains(where: { $0.isComplete && $0.isKeyframe }) {
+            keyframeRequestPending = true
+        }
+
+        while !pending.isEmpty {
+            let expected = lastDeliveredSequence.map { $0 &+ 1 }
+            let expectedReady = expected.flatMap { sequence in
+                pending[sequence]?.isComplete == true ? sequence : nil
+            }
+            let recoveryKeyframe = pending
+                .filter { $0.value.isComplete && $0.value.isKeyframe }
+                .map(\.key)
+                .min()
+            let candidate = !waitingForKeyframe ? (expectedReady ?? recoveryKeyframe) : recoveryKeyframe
+
+            if let candidate, let frame = pending[candidate] {
+                output.append(assembledFrame(frame))
+                lastDeliveredSequence = candidate
+                waitingForKeyframe = false
+                keyframeRequestPending = false
+                gapSinceNanoseconds = nil
+                discardThrough(sequence: candidate)
+                continue
+            }
+
+            if !waitingForKeyframe, gapSinceNanoseconds == nil, let expected {
+                gapSinceNanoseconds = pending
+                    .filter { $0.key > expected && $0.value.isComplete }
+                    .compactMap { $0.value.completedAtNanoseconds }
+                    .min()
+            }
+            if let gapSinceNanoseconds,
+               now >= gapSinceNanoseconds,
+               now - gapSinceNanoseconds >= Self.reorderTimeoutNanoseconds {
+                enterRecovery()
+            }
+            break
+        }
+        return output
+    }
+
+    private func assembledFrame(_ current: PendingFrame) -> AnchorVideoFrame {
         var payload = Data()
         payload.reserveCapacity(current.receivedBytes)
         for fragment in current.fragments {
-            guard let fragment else { throw AnchorWireError.invalidFrameFragments }
-            payload.append(fragment)
+            if let fragment { payload.append(fragment) }
         }
         let canonicalHeader = AnchorVideoFrameHeader(
             kind: current.header.kind,
@@ -372,13 +470,44 @@ public struct AnchorScreenDatagramAssembler {
             presentationTimeUs: current.header.presentationTimeUs,
             codecConfigID: current.header.codecConfigID
         )
-        lastCompletedSequence = current.header.sequence
-        pending = nil
         return AnchorVideoFrame(header: canonicalHeader, payload: payload)
     }
 
+    private mutating func expireIncompleteFrames(atNanoseconds now: UInt64) {
+        if pending.values.contains(where: {
+            !$0.isComplete && now >= $0.firstSeenNanoseconds &&
+                now - $0.firstSeenNanoseconds >= Self.assemblyTimeoutNanoseconds
+        }) {
+            enterRecovery()
+        }
+    }
+
+    private mutating func discard(sequence: UInt64) {
+        if let removed = pending.removeValue(forKey: sequence) {
+            retainedBytes -= removed.receivedBytes
+        }
+    }
+
+    private mutating func discardThrough(sequence: UInt64) {
+        for key in pending.keys.filter({ $0 <= sequence }) {
+            discard(sequence: key)
+        }
+    }
+
+    private mutating func enterRecovery() {
+        pending.removeAll(keepingCapacity: true)
+        retainedBytes = 0
+        gapSinceNanoseconds = nil
+        waitingForKeyframe = true
+        keyframeRequestPending = true
+    }
+
     public mutating func reset() {
-        pending = nil
-        lastCompletedSequence = nil
+        pending.removeAll(keepingCapacity: true)
+        retainedBytes = 0
+        lastDeliveredSequence = nil
+        waitingForKeyframe = true
+        keyframeRequestPending = false
+        gapSinceNanoseconds = nil
     }
 }

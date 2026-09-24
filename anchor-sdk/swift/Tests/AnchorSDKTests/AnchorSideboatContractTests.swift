@@ -159,40 +159,141 @@ final class AnchorSideboatContractTests: XCTestCase {
         )
         var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
 
-        XCTAssertNil(try assembler.consume(packets[2]))
-        XCTAssertNil(try assembler.consume(packets[0]))
-        let frame = try XCTUnwrap(assembler.consume(packets[1]))
+        XCTAssertTrue(try assembler.consume(packets[2], atNanoseconds: 0).isEmpty)
+        XCTAssertTrue(try assembler.consume(packets[0], atNanoseconds: 1).isEmpty)
+        let completed = try assembler.consume(packets[1], atNanoseconds: 2)
+        XCTAssertEqual(completed.count, 1)
+        let frame = try XCTUnwrap(completed.first)
         XCTAssertEqual(frame.payload, payload)
         XCTAssertEqual(frame.header.sequence, 9)
         XCTAssertEqual(frame.header.fragmentIndex, 0)
     }
 
-    func testDatagramAssemblerSupersedesLossAndIgnoresLateOrDuplicatePackets() throws {
-        let incomplete = try AnchorVideoFrameCodec.fragment(
+    func testDatagramAssemblerWaitsForReorderedSequenceWithoutBreakingReferenceChain() throws {
+        func packet(sequence: UInt64, flags: UInt16 = 0) throws -> Data {
+            try XCTUnwrap(AnchorVideoFrameCodec.fragment(
+                kind: AnchorVideoFrameHeader.screenKind,
+                flags: flags,
+                capabilitySessionID: 3,
+                flowID: 7,
+                sequence: sequence,
+                presentationTimeUs: sequence,
+                codecConfigID: 1,
+                payload: Data([UInt8(sequence)])
+            ).first)
+        }
+        var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+
+        XCTAssertEqual(
+            try assembler.consume(
+                packet(sequence: 20, flags: AnchorVideoFrameHeader.keyframeFlag),
+                atNanoseconds: 0
+            ).map(\.header.sequence),
+            [20]
+        )
+        XCTAssertTrue(try assembler.consume(packet(sequence: 22), atNanoseconds: 1).isEmpty)
+        let reordered = try assembler.consume(packet(sequence: 21), atNanoseconds: 49_000_000)
+        XCTAssertEqual(reordered.map(\.header.sequence), [21, 22])
+        XCTAssertFalse(assembler.takeKeyframeRequest())
+    }
+
+    func testDatagramAssemblerRecoversFromRealLossAtTimeoutBoundary() throws {
+        func packet(sequence: UInt64, flags: UInt16 = 0) throws -> Data {
+            try XCTUnwrap(AnchorVideoFrameCodec.fragment(
+                kind: AnchorVideoFrameHeader.screenKind,
+                flags: flags,
+                capabilitySessionID: 3,
+                flowID: 7,
+                sequence: sequence,
+                presentationTimeUs: sequence,
+                codecConfigID: 1,
+                payload: Data([UInt8(sequence)])
+            ).first)
+        }
+        var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+        _ = try assembler.consume(
+            packet(sequence: 20, flags: AnchorVideoFrameHeader.keyframeFlag),
+            atNanoseconds: 0
+        )
+        XCTAssertTrue(try assembler.consume(packet(sequence: 22), atNanoseconds: 0).isEmpty)
+        XCTAssertTrue(assembler.poll(atNanoseconds: 49_999_999).isEmpty)
+        XCTAssertFalse(assembler.takeKeyframeRequest())
+        XCTAssertTrue(assembler.poll(atNanoseconds: 50_000_000).isEmpty)
+        XCTAssertTrue(assembler.takeKeyframeRequest())
+        XCTAssertTrue(try assembler.consume(packet(sequence: 23), atNanoseconds: 50_000_001).isEmpty)
+        let recovered = try assembler.consume(
+            packet(sequence: 24, flags: AnchorVideoFrameHeader.keyframeFlag),
+            atNanoseconds: 50_000_002
+        )
+        XCTAssertEqual(recovered.map(\.header.sequence), [24])
+        XCTAssertFalse(assembler.takeKeyframeRequest())
+    }
+
+    func testDatagramAssemblerExpiresIncompleteFrameAndIgnoresItsLateFragment() throws {
+        let keyframe = try XCTUnwrap(AnchorVideoFrameCodec.fragment(
             kind: AnchorVideoFrameHeader.screenKind,
+            flags: AnchorVideoFrameHeader.keyframeFlag,
             capabilitySessionID: 3,
             flowID: 7,
             sequence: 20,
             presentationTimeUs: 20,
             codecConfigID: 1,
-            payload: Data(repeating: 1, count: AnchorVideoFrameHeader.payloadBytes + 1)
-        )
-        let replacement = try XCTUnwrap(AnchorVideoFrameCodec.fragment(
+            payload: Data([1])
+        ).first)
+        let incomplete = try AnchorVideoFrameCodec.fragment(
             kind: AnchorVideoFrameHeader.screenKind,
-            flags: AnchorVideoFrameHeader.keyframeFlag,
             capabilitySessionID: 3,
             flowID: 7,
             sequence: 21,
             presentationTimeUs: 21,
-            codecConfigID: 2,
-            payload: Data([7, 8, 9])
-        ).first)
+            codecConfigID: 1,
+            payload: Data(repeating: 2, count: AnchorVideoFrameHeader.payloadBytes + 1)
+        )
         var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
 
-        XCTAssertNil(try assembler.consume(incomplete[0]))
-        XCTAssertEqual(try assembler.consume(replacement)?.payload, Data([7, 8, 9]))
-        XCTAssertNil(try assembler.consume(incomplete[1]))
-        XCTAssertNil(try assembler.consume(replacement))
+        XCTAssertEqual(try assembler.consume(keyframe, atNanoseconds: 0).count, 1)
+        XCTAssertTrue(try assembler.consume(incomplete[0], atNanoseconds: 1).isEmpty)
+        XCTAssertTrue(assembler.poll(atNanoseconds: 250_000_001).isEmpty)
+        XCTAssertTrue(assembler.takeKeyframeRequest())
+        XCTAssertTrue(try assembler.consume(incomplete[1], atNanoseconds: 250_000_002).isEmpty)
+    }
+
+    func testDatagramAssemblerPreservesOrderAcrossStructuredFragmentShuffles() throws {
+        for seed in UInt64(1)...64 {
+            var random = seed
+            var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+            var delivered: [UInt64] = []
+            var now: UInt64 = 0
+
+            for windowStart in stride(from: UInt64(0), through: 32, by: 4) {
+                var packets: [Data] = []
+                for sequence in windowStart...min(windowStart + 3, 32) {
+                    packets += try AnchorVideoFrameCodec.fragment(
+                        kind: AnchorVideoFrameHeader.screenKind,
+                        flags: sequence == 0 ? AnchorVideoFrameHeader.keyframeFlag : 0,
+                        capabilitySessionID: 3,
+                        flowID: 7,
+                        sequence: sequence,
+                        presentationTimeUs: sequence,
+                        codecConfigID: 1,
+                        payload: Data(repeating: UInt8(sequence), count: Int(sequence * 791 % 3_000) + 1)
+                    )
+                }
+                if packets.count > 1 {
+                    for index in stride(from: packets.count - 1, through: 1, by: -1) {
+                        random = random &* 6_364_136_223_846_793_005 &+ 1
+                        packets.swapAt(index, Int(random % UInt64(index + 1)))
+                    }
+                }
+                for packet in packets {
+                    delivered += try assembler.consume(packet, atNanoseconds: now).map(\.header.sequence)
+                    now += 1_000
+                }
+            }
+
+            XCTAssertEqual(delivered, Array(UInt64(0)...32), "seed=\(seed)")
+            XCTAssertFalse(assembler.takeKeyframeRequest(), "seed=\(seed)")
+        }
     }
 
     func testStreamBindingRejectsEveryMismatchedAcknowledgementField() throws {
