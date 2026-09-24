@@ -205,6 +205,35 @@ pub fn fragment_frame_with_flags(
     codec_config_id: u64,
     frame: &[u8],
 ) -> Result<Vec<Bytes>, FrameError> {
+    fragment_frame_with_flags_and_limit(
+        kind,
+        flags,
+        capability_session_id,
+        flow_id,
+        sequence,
+        presentation_time_us,
+        codec_config_id,
+        frame,
+        FRAME_DATAGRAM_BYTES,
+    )
+}
+
+/// Split one access unit with a peer's application datagram limit.
+///
+/// The result still uses one shared arena and `Bytes` slices. This keeps the
+/// negotiated-limit path allocation-equivalent to the normal sender path.
+#[allow(clippy::too_many_arguments)]
+pub fn fragment_frame_with_flags_and_limit(
+    kind: u8,
+    flags: u16,
+    capability_session_id: u64,
+    flow_id: u64,
+    sequence: u64,
+    presentation_time_us: u64,
+    codec_config_id: u64,
+    frame: &[u8],
+    datagram_limit: usize,
+) -> Result<Vec<Bytes>, FrameError> {
     if !matches!(kind, FRAME_KIND_SCREEN | FRAME_KIND_CAMERA) {
         return Err(FrameError::InvalidKind(kind));
     }
@@ -214,11 +243,14 @@ pub fn fragment_frame_with_flags(
     if frame.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(MAX_FRAME_BYTES));
     }
-    let count = frame.len().div_ceil(FRAME_PAYLOAD_BYTES);
+    let datagram_bytes = datagram_limit.min(FRAME_DATAGRAM_BYTES);
+    let payload_bytes = datagram_bytes
+        .checked_sub(FRAME_HEADER_BYTES)
+        .filter(|payload_bytes| *payload_bytes > 0)
+        .ok_or(FrameError::DatagramLimitTooSmall(datagram_limit))?;
+    let count = frame.len().div_ceil(payload_bytes);
     if count > MAX_FRAME_FRAGMENTS {
-        return Err(FrameError::TooLarge(
-            MAX_FRAME_FRAGMENTS * FRAME_PAYLOAD_BYTES,
-        ));
+        return Err(FrameError::TooLarge(MAX_FRAME_FRAGMENTS * payload_bytes));
     }
     let count = count as u16;
     // Pack every fragment into a single arena, then hand out zero-copy slice
@@ -226,7 +258,7 @@ pub fn fragment_frame_with_flags(
     // so the arena is freed only after the last fragment leaves the queue.
     let mut arena = Vec::with_capacity(frame.len() + usize::from(count) * FRAME_HEADER_BYTES);
     let mut packets = Vec::with_capacity(usize::from(count));
-    for (index, payload) in frame.chunks(FRAME_PAYLOAD_BYTES).enumerate() {
+    for (index, payload) in frame.chunks(payload_bytes).enumerate() {
         let start = arena.len();
         FrameHeader {
             kind,
