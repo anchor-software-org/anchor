@@ -61,8 +61,8 @@ pub struct SdkScreenSender {
     frame_target: Arc<Mutex<Option<FrameTarget>>>,
     keyframe_request: Arc<Mutex<Option<Arc<FrameBroadcaster>>>>,
     last_keyframe_request: Arc<Mutex<Option<Instant>>>,
-    /// Reliable H.264 streams cannot safely skip a predictive access unit:
-    /// every following P-frame references it. Once the replaceable-frame
+    /// H.264 cannot safely skip a predictive access unit on either transport:
+    /// every following P-frame can reference it. Once the replaceable-frame
     /// queue coalesces anything, hold P-frames until the next IDR arrives.
     /// This keeps the receiver from displaying a stale/broken reference chain.
     waiting_for_keyframe: Arc<AtomicBool>,
@@ -483,7 +483,7 @@ impl SdkScreenSender {
                     // creates an IDR storm and makes the terminal view steadily
                     // worse. Only predictive-frame failures schedule recovery.
                     if should_schedule_keyframe_recovery(keyframe) {
-                        self.request_keyframe_recovery();
+                        self.mark_frame_gap();
                     }
                     log::warn!(
                         "SDK screen datagram send failed (flow={} source_frame_id={} sequence={} bytes={} fragments={} keyframe={} pacing_wait_us={} pacing_percent={} admission_us={} rtt_ms={} cwnd={} lost_packets={} congestion_events={} available={} required={}): {error}",
@@ -768,11 +768,18 @@ impl SdkScreenBinding {
         };
         let subscription_id = frame_subscription_id(&device_id);
         broadcaster.unsubscribe(&subscription_id);
-        let rx = broadcaster.subscribe_traced(subscription_id.clone(), 2);
+        let (rx, queue_gap) = broadcaster.subscribe_traced(subscription_id.clone(), 2);
         thread::Builder::new()
             .name(format!("anchor-sdk-screen-frames-{device_id}"))
             .spawn(move || {
                 while let Ok(mut frame) = rx.recv() {
+                    if queue_gap.swap(false, Ordering::AcqRel) {
+                        // The broadcaster rejected an earlier access unit
+                        // because this viewer fell behind. This gap is not
+                        // visible in ANFR sequence numbers, so recover before
+                        // sending another predictive H.264 frame.
+                        sender.mark_frame_gap();
+                    }
                     let mut coalesced = false;
                     // The screen is replaceable state, not a work queue. If
                     // capture outruns QUIC, discard every buffered older
@@ -830,11 +837,14 @@ impl SdkScreenBinding {
         };
         let subscription_id = frame_subscription_id(&device_id);
         broadcaster.unsubscribe(&subscription_id);
-        let rx = broadcaster.subscribe_traced(subscription_id.clone(), 2);
+        let (rx, queue_gap) = broadcaster.subscribe_traced(subscription_id.clone(), 2);
         thread::Builder::new()
             .name(format!("anchor-sdk-screen-stream-{device_id}"))
             .spawn(move || {
                 while let Ok(mut frame) = rx.recv() {
+                    if queue_gap.swap(false, Ordering::AcqRel) {
+                        sender.mark_frame_gap();
+                    }
                     let mut coalesced = false;
                     while let Ok(newer) = rx.try_recv() {
                         frame = newer;
