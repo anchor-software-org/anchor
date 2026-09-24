@@ -72,3 +72,20 @@ pub fn decode_request_keyframe(
 ) -> Result<v1::capabilities::screen::ScreenRequestKeyframe, prost::DecodeError> {
     v1::capabilities::screen::ScreenRequestKeyframe::decode(b)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_advertises_the_frame_datagram_flow() {
+        let advertisement = advertisement();
+        assert!(advertisement.supports_datagrams);
+        assert!(
+            advertisement
+                .record_type_urls
+                .iter()
+                .any(|url| url == FRAME_TYPE_URL)
+        );
+    }
+}

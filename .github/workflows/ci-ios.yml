@@ -1,0 +1,54 @@
+name: iOS CI
+
+on:
+  pull_request:
+    paths:
+      - "anchor-ios/**"
+      - "anchor-sdk/protocol/**"
+      - "anchor-sdk/swift/**"
+      - ".github/workflows/ci-ios.yml"
+      - "devenv.nix"
+  push:
+    branches: [main]
+    paths:
+      - "anchor-ios/**"
+      - "anchor-sdk/protocol/**"
+      - "anchor-sdk/swift/**"
+      - ".github/workflows/ci-ios.yml"
+      - "devenv.nix"
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Swift SDK and iPad app tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test Swift SDK
+        working-directory: anchor-sdk/swift
+        run: swift test
+
+      - name: Select an available iPad simulator
+        run: |
+          simulator_id=$(xcrun simctl list devices available --json | jq -r '
+            [.devices[][] | select(.name | test("iPad"))][0].udid // empty
+          ')
+          if [[ -z "$simulator_id" ]]; then
+            echo "No available iPad simulator is installed" >&2
+            exit 1
+          fi
+          echo "IOS_SIMULATOR_ID=$simulator_id" >> "$GITHUB_ENV"
+
+      - name: Run iPad app tests
+        working-directory: anchor-ios
+        run: |
+          xcrun simctl boot "$IOS_SIMULATOR_ID" || true
+          xcodebuild \
+            -project Anchor.xcodeproj \
+            -scheme Anchor \
+            -destination "id=$IOS_SIMULATOR_ID" \
+            -derivedDataPath "$RUNNER_TEMP/anchor-ios-derived-data" \
+            CODE_SIGNING_ALLOWED=NO \
+            test

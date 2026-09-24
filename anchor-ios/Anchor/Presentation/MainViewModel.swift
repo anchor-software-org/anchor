@@ -27,6 +27,10 @@ class MainViewModel: ObservableObject {
     let inputPlugin: InputPlugin
     private let networkPlugin: NetworkPlugin
     let clipboardPlugin: ClipboardPlugin
+    let mediaPlugin: MediaPlugin
+    let notificationPlugin: NotificationPlugin
+    let commandsPlugin: CommandsPlugin
+    let filesPlugin: FilesPlugin
 
     // Device identity
     private let myDeviceId: String
@@ -125,6 +129,10 @@ class MainViewModel: ObservableObject {
             initialHistory: previewState?.clipboardHistory ?? [],
             initialChangeCount: previewState == nil ? nil : 0
         )
+        mediaPlugin = MediaPlugin(broker: broker)
+        notificationPlugin = NotificationPlugin(broker: broker)
+        commandsPlugin = CommandsPlugin(broker: broker)
+        filesPlugin = FilesPlugin(broker: broker)
         networkPlugin = NetworkPlugin(
             broker: broker,
             videoPlugin: videoPlugin,
@@ -142,6 +150,10 @@ class MainViewModel: ObservableObject {
         videoPlugin.start()
         inputPlugin.start()
         clipboardPlugin.start()
+        mediaPlugin.start()
+        notificationPlugin.start()
+        commandsPlugin.start()
+        filesPlugin.start()
 
         // Refresh paired devices
         refreshPairedDevices()
@@ -178,6 +190,10 @@ class MainViewModel: ObservableObject {
         networkPlugin.stop()
         videoPlugin.stop()
         clipboardPlugin.stop()
+        mediaPlugin.stop()
+        notificationPlugin.stop()
+        commandsPlugin.stop()
+        filesPlugin.stop()
     }
 
     // MARK: - Event handling
@@ -194,6 +210,16 @@ class MainViewModel: ObservableObject {
         case .generic(let text):
             logs += "\(text)\n"
         case .binary:
+            break
+        case .clipboard:
+            break
+        case .media:
+            break
+        case .notification:
+            break
+        case .commands:
+            break
+        case .files:
             break
         }
     }
@@ -330,7 +356,11 @@ class MainViewModel: ObservableObject {
         guard connectionState.status == .disconnected, !ip.isEmpty else { return }
         desktopIp = ip
         lastConnectedIp = ip
-        networkPlugin.connect(ip: ip, port: 5027)
+        networkPlugin.connect(
+            ip: ip,
+            port: 5027,
+            displayPixelSize: Self.currentDisplayPixelSize()
+        )
 
         // QUIC includes TLS 1.3 and may also wait for a desktop pairing prompt.
         connectionTimeoutTask?.cancel()
@@ -344,6 +374,19 @@ class MainViewModel: ObservableObject {
                 )
             }
         }
+    }
+
+    private static func currentDisplayPixelSize() -> CGSize {
+        let activeScreen = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .sorted { left, right in
+                let leftActive = left.activationState == .foregroundActive
+                let rightActive = right.activationState == .foregroundActive
+                return leftActive && !rightActive
+            }
+            .first?
+            .screen
+        return (activeScreen ?? UIScreen.main).nativeBounds.size
     }
 
     func disconnect() {

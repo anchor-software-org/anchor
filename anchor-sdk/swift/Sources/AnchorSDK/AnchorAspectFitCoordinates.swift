@@ -21,10 +21,65 @@ public enum AnchorAspectFitCoordinates {
         streamWidth: Double,
         streamHeight: Double
     ) -> AnchorNormalizedPoint {
-        guard viewWidth > 0, viewHeight > 0,
-              viewWidth.isFinite, viewHeight.isFinite else {
+        guard let geometry = geometry(
+            viewWidth: viewWidth,
+            viewHeight: viewHeight,
+            streamWidth: streamWidth,
+            streamHeight: streamHeight
+        ) else {
             return AnchorNormalizedPoint(x: 0, y: 0)
         }
+
+        return AnchorNormalizedPoint(
+            x: clamp((x - geometry.offsetX) / geometry.width),
+            y: clamp((y - geometry.offsetY) / geometry.height)
+        )
+    }
+
+    /// Maps only points that are actually inside the aspect-fitted video.
+    /// This is the correct behavior for absolute drawing: touches in the
+    /// letterbox/pillarbox bars must not collapse onto a desktop edge.
+    public static func mapIfInside(
+        x: Double,
+        y: Double,
+        viewWidth: Double,
+        viewHeight: Double,
+        streamWidth: Double,
+        streamHeight: Double
+    ) -> AnchorNormalizedPoint? {
+        // Absolute input cannot be mapped safely until the stream dimensions
+        // are known. Falling back to the entire view here makes touches drift
+        // whenever the displayed video is letterboxed or pillarboxed.
+        guard streamWidth > 0, streamHeight > 0,
+              streamWidth.isFinite, streamHeight.isFinite else { return nil }
+
+        guard let geometry = geometry(
+            viewWidth: viewWidth,
+            viewHeight: viewHeight,
+            streamWidth: streamWidth,
+            streamHeight: streamHeight
+        ),
+        x >= geometry.offsetX,
+        x <= geometry.offsetX + geometry.width,
+        y >= geometry.offsetY,
+        y <= geometry.offsetY + geometry.height else {
+            return nil
+        }
+
+        return AnchorNormalizedPoint(
+            x: clamp((x - geometry.offsetX) / geometry.width),
+            y: clamp((y - geometry.offsetY) / geometry.height)
+        )
+    }
+
+    private static func geometry(
+        viewWidth: Double,
+        viewHeight: Double,
+        streamWidth: Double,
+        streamHeight: Double
+    ) -> (width: Double, height: Double, offsetX: Double, offsetY: Double)? {
+        guard viewWidth > 0, viewHeight > 0,
+              viewWidth.isFinite, viewHeight.isFinite else { return nil }
 
         let contentWidth: Double
         let contentHeight: Double
@@ -52,10 +107,7 @@ public enum AnchorAspectFitCoordinates {
             offsetY = 0
         }
 
-        return AnchorNormalizedPoint(
-            x: clamp((x - offsetX) / contentWidth),
-            y: clamp((y - offsetY) / contentHeight)
-        )
+        return (contentWidth, contentHeight, offsetX, offsetY)
     }
 
     private static func clamp(_ value: Double) -> Double {

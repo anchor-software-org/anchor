@@ -8,6 +8,188 @@ import UIKit
 import AnchorSDK
 import SwiftProtobuf
 
+/// Preserves submission order across async operations. Creating one Task per
+/// input event allows a later button-up to reach the QUIC actor before the
+/// earlier button-down, which can leave the host pointer stuck down.
+final class OrderedAsyncQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tail: Task<Void, Never>?
+    private var generation: UInt64 = 0
+
+    func enqueue(_ operation: @escaping @Sendable () async -> Void) {
+        lock.lock()
+        let predecessor = tail
+        let operationGeneration = generation
+        let task = Task { [weak self] in
+            if let predecessor {
+                await predecessor.value
+            }
+            guard let self, self.isCurrent(operationGeneration), !Task.isCancelled else { return }
+            await operation()
+        }
+        tail = task
+        lock.unlock()
+    }
+
+    func drain() async {
+        let task = lock.withLock { tail }
+        await task?.value
+    }
+
+    func cancelPending() {
+        lock.lock()
+        generation &+= 1
+        tail = nil
+        lock.unlock()
+    }
+
+    private func isCurrent(_ candidate: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return candidate == generation
+    }
+}
+
+/// Low-overhead receive-side telemetry. All durations use the iPad monotonic
+/// clock. The desktop wall-clock timestamp is reported only as a raw clock
+/// offset and as delay above the best offset observed in this run.
+private final class SideboatIngressDiagnostics {
+    private let startedNs = DispatchTime.now().uptimeNanoseconds
+    private var windowStartedNs = DispatchTime.now().uptimeNanoseconds
+    private var lastChunkNs: UInt64 = 0
+    private var currentAssemblyStartedNs: UInt64?
+    private var lastFrameSequence: UInt64?
+    private var reportedFirstFrame = false
+    private var sourceTimestampTracker = AnchorSourceTimestampTracker()
+
+    private var chunkCount = 0
+    private var chunkBytes = 0
+    private var largestChunkBytes = 0
+    private var maxChunkGapMs = 0.0
+    private var packetCount = 0
+    private var frameCount = 0
+    private var frameBytes = 0
+    private var sequenceGaps: UInt64 = 0
+    private var maxFramerBytes = 0
+    private var assemblySumMs = 0.0
+    private var assemblyMaxMs = 0.0
+    private var assemblySamples = 0
+    private var sourceExcessSumMs = 0.0
+    private var sourceExcessMaxMs = 0.0
+    private var sourceSamples = 0
+    private var latestRawClockOffsetMs: Double?
+    private var baselineClockOffsetMs: Double?
+
+    func recordChunk(bytes: Int, bufferedBytes: Int, atNs: UInt64) {
+        if lastChunkNs != 0 {
+            maxChunkGapMs = max(maxChunkGapMs, Double(atNs - lastChunkNs) / 1_000_000)
+        }
+        lastChunkNs = atNs
+        chunkCount += 1
+        chunkBytes += bytes
+        largestChunkBytes = max(largestChunkBytes, bytes)
+        maxFramerBytes = max(maxFramerBytes, bufferedBytes)
+    }
+
+    func recordPacket(atNs: UInt64) {
+        packetCount += 1
+        if currentAssemblyStartedNs == nil {
+            currentAssemblyStartedNs = atNs
+        }
+    }
+
+    func recordFrame(_ frame: AnchorVideoFrame, atNs: UInt64, receiverWallClockUs: UInt64) {
+        frameCount += 1
+        frameBytes += frame.payload.count
+        if let assemblyStartedNs = currentAssemblyStartedNs {
+            let assemblyMs = Double(atNs - assemblyStartedNs) / 1_000_000
+            assemblySumMs += assemblyMs
+            assemblyMaxMs = max(assemblyMaxMs, assemblyMs)
+            assemblySamples += 1
+        }
+        currentAssemblyStartedNs = nil
+
+        if let previous = lastFrameSequence,
+           frame.header.sequence > previous {
+            let distance = frame.header.sequence - previous
+            if distance > 1 {
+                sequenceGaps &+= distance - 1
+            }
+        }
+        lastFrameSequence = frame.header.sequence
+
+        if let observation = sourceTimestampTracker.observe(
+            sourceWallClockUs: frame.header.presentationTimeUs,
+            receiverWallClockUs: receiverWallClockUs
+        ) {
+            let excessMs = Double(observation.excessDelayUs) / 1_000
+            latestRawClockOffsetMs = Double(observation.rawClockOffsetUs) / 1_000
+            baselineClockOffsetMs = Double(observation.baselineClockOffsetUs) / 1_000
+            sourceExcessSumMs += excessMs
+            sourceExcessMaxMs = max(sourceExcessMaxMs, excessMs)
+            sourceSamples += 1
+        }
+
+        if !reportedFirstFrame {
+            reportedFirstFrame = true
+            NSLog(
+                "[anchor] [sideboat_ingress] first_access_unit_ms=%.1f sequence=%llu bytes=%d fragments=%d",
+                Double(atNs - startedNs) / 1_000_000,
+                frame.header.sequence,
+                frame.payload.count,
+                frame.header.fragmentCount
+            )
+        }
+    }
+
+    func reportIfDue(atNs: UInt64, bufferedBytes: Int) {
+        guard atNs - windowStartedNs >= 1_000_000_000 else { return }
+        maxFramerBytes = max(maxFramerBytes, bufferedBytes)
+        let windowMs = Double(atNs - windowStartedNs) / 1_000_000
+        let avgChunkBytes = chunkCount > 0 ? Double(chunkBytes) / Double(chunkCount) : 0
+        let avgAssemblyMs = assemblySamples > 0 ? assemblySumMs / Double(assemblySamples) : 0
+        let avgExcessMs = sourceSamples > 0 ? sourceExcessSumMs / Double(sourceSamples) : 0
+        let rawOffsetMs = latestRawClockOffsetMs ?? .nan
+        let baselineOffsetMs = baselineClockOffsetMs ?? .nan
+        NSLog(
+            "[anchor] [sideboat_ingress] window_ms=%.0f chunks=%d chunk_bytes=%d chunk_avg_bytes=%.0f chunk_max_bytes=%d chunk_gap_max_ms=%.1f packets=%d frames=%d frame_bytes=%d sequence_gaps=%llu framer_high_water_bytes=%d assembly_avg_ms=%.2f assembly_max_ms=%.2f source_clock_offset_ms=%.1f source_baseline_offset_ms=%.1f source_excess_avg_ms=%.2f source_excess_max_ms=%.2f",
+            windowMs,
+            chunkCount,
+            chunkBytes,
+            avgChunkBytes,
+            largestChunkBytes,
+            maxChunkGapMs,
+            packetCount,
+            frameCount,
+            frameBytes,
+            sequenceGaps,
+            maxFramerBytes,
+            avgAssemblyMs,
+            assemblyMaxMs,
+            rawOffsetMs,
+            baselineOffsetMs,
+            avgExcessMs,
+            sourceExcessMaxMs
+        )
+        windowStartedNs = atNs
+        chunkCount = 0
+        chunkBytes = 0
+        largestChunkBytes = 0
+        maxChunkGapMs = 0
+        packetCount = 0
+        frameCount = 0
+        frameBytes = 0
+        sequenceGaps = 0
+        maxFramerBytes = bufferedBytes
+        assemblySumMs = 0
+        assemblyMaxMs = 0
+        assemblySamples = 0
+        sourceExcessSumMs = 0
+        sourceExcessMaxMs = 0
+        sourceSamples = 0
+    }
+}
+
 /// Dual-channel TCP client plugin — mirrors Android's NetworkPlugin / Rust's DeviceManager.
 ///
 /// Port 5025: JSON control channel (bidirectional plugin messages)
@@ -27,6 +209,10 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     private let deviceId: String
     private let deviceName: String
     private let deviceKind: ANCHDeviceKind
+    private var displayWidth: UInt32 = 0
+    private var displayHeight: UInt32 = 0
+    private var batteryPercent: UInt32 = 0
+    private var batteryCharging = false
 
     // JSON channel (port 5025)
     private var jsonConnection: NWConnection?
@@ -53,8 +239,9 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     private var quicTransport: (any AnchorNetworkQuicTransport)?
     private var quicSession: AnchorSession?
     private var quicTask: Task<Void, Never>?
-    private var screenStream: (any AnchorReliableStream)?
     private var screenTask: Task<Void, Never>?
+    private var screenDatagramFlowID: UInt64?
+    private var fileStreamTask: Task<Void, Never>?
     private var v1LatencyTask: Task<Void, Never>?
     private let v1PingLock = NSLock()
     private var v1PendingPings: [UInt64: UInt64] = [:]
@@ -63,14 +250,23 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     private var capabilitySessions: [String: UInt64] = [:]
     private var nextRequestId: UInt64 = 1
     private var nextCapabilitySessionId: UInt64 = 1
+    private var nextDatagramFlowId: UInt64 = 1
     private var clipboardRevision: UInt64 = 0
     private var scrollAccumulator = AnchorScrollAccumulator()
+    private let v1OutboundQueue = OrderedAsyncQueue()
+    private let fileCoordinator: FileTransferCoordinator
 
     private static let desktopEndpoint = "io.anchor.desktop"
+    private static let deviceCapability = AnchorV1.Capability.device
     private static let clipboardCapability = "org.anchor.clipboard"
     private static let inputCapability = "org.anchor.input"
     private static let screenCapability = "org.anchor.screen"
+    private static let mediaCapability = "org.anchor.media"
+    private static let notificationsCapability = "org.anchor.notifications"
+    private static let commandsCapability = "org.anchor.commands"
+    private static let filesCapability = "org.anchor.files"
     private static let clipboardPublishType = "type.googleapis.com/anchor.v1.capabilities.clipboard.ClipboardPublish"
+    private static let clipboardClearType = "type.googleapis.com/anchor.v1.capabilities.clipboard.ClipboardClear"
     private static let inputKeyType = "type.googleapis.com/anchor.v1.capabilities.input.InputKey"
     private static let inputTextType = "type.googleapis.com/anchor.v1.capabilities.input.InputText"
     private static let inputAbsoluteType = "type.googleapis.com/anchor.v1.capabilities.input.InputPointerAbsolute"
@@ -90,12 +286,17 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         self.deviceId = deviceId
         self.deviceName = deviceName
         self.deviceKind = isTablet ? .tablet : .phone
+        self.fileCoordinator = FileTransferCoordinator { message in
+            broker.send(AnchorEvent(target: .service("files"), message: .files(message)))
+        }
     }
 
     // MARK: - Plugin lifecycle
 
     func start() {
         isRunning = true
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        refreshBatteryState(publish: false)
         // Listen for outbound Device-targeted events
         broker.events
             .filter { $0.target == .device }
@@ -103,6 +304,15 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 self?.handleOutbound(event)
             }
             .store(in: &cancellables)
+        Publishers.Merge(
+            NotificationCenter.default.publisher(for: UIDevice.batteryLevelDidChangeNotification),
+            NotificationCenter.default.publisher(for: UIDevice.batteryStateDidChangeNotification)
+        )
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.refreshBatteryState(publish: true)
+        }
+        .store(in: &cancellables)
     }
 
     func stop() {
@@ -120,8 +330,14 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
 
     // MARK: - Connect
 
-    func connect(ip: String, port: Int = 5027) {
+    func connect(ip: String, port: Int = 5027, displayPixelSize: CGSize) {
         guard quicTask == nil, !quicConnected else { return }
+        let dimensions = Self.validatedDisplayDimensions(
+            width: Double(displayPixelSize.width),
+            height: Double(displayPixelSize.height)
+        )
+        displayWidth = dimensions.width
+        displayHeight = dimensions.height
         broker.send(AnchorEvent(
             target: .gui,
             message: .json(#"{"type":"connection_status","status":"connecting","host":"\#(ip)","port":\#(port)}"#)
@@ -299,7 +515,7 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         }
         NSLog("[anchor] QUIC peer hello: \(remote.display.displayName), \(remote.endpoints.count) endpoint(s)")
 
-        for capability in [Self.clipboardCapability, Self.inputCapability, Self.screenCapability] {
+        for capability in [Self.deviceCapability, Self.clipboardCapability, Self.inputCapability, Self.mediaCapability, Self.notificationsCapability, Self.commandsCapability, Self.filesCapability, Self.screenCapability] {
             let advertised = remote.endpoints.contains { endpoint in
                 endpoint.endpointID == Self.desktopEndpoint && endpoint.capabilities.contains {
                     $0.name == capability && $0.major == 1
@@ -307,13 +523,114 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             }
             if advertised {
                 try await openV1Capability(capability, session: session)
+                if capability == Self.deviceCapability {
+                    try await sendV1DeviceState(session: session)
+                } else if capability == Self.mediaCapability {
+                    broker.send(AnchorEvent(
+                        target: .service("media"), message: .media(.availability(true))
+                    ))
+                } else if capability == Self.notificationsCapability {
+                    broker.send(AnchorEvent(
+                        target: .service("notifications"), message: .notification(.availability(true))
+                    ))
+                } else if capability == Self.commandsCapability {
+                    broker.send(AnchorEvent(
+                        target: .service("commands"), message: .commands(.availability(true))
+                    ))
+                } else if capability == Self.filesCapability {
+                    broker.send(AnchorEvent(
+                        target: .service("files"), message: .files(.availability(true))
+                    ))
+                }
             } else {
                 NSLog("[anchor] Desktop did not advertise \(capability)@1")
             }
         }
         if capabilitySessions[Self.screenCapability] != nil {
-            try await openV1ScreenStream(session: session, transport: transport)
+            try await openV1ScreenDatagramFlow(session: session)
         }
+        if capabilitySessions[Self.filesCapability] != nil {
+            startV1FileStreamReceiver(transport: transport)
+        }
+    }
+
+    static func validatedDisplayDimensions(width: Double, height: Double) -> (width: UInt32, height: UInt32) {
+        guard width.isFinite,
+              height.isFinite,
+              width >= 1,
+              height >= 1,
+              width.rounded() == width,
+              height.rounded() == height,
+              width <= Double(UInt32.max),
+              height <= Double(UInt32.max) else {
+            return (0, 0)
+        }
+        return (UInt32(width), UInt32(height))
+    }
+
+    static func makeDeviceState(
+        deviceName: String,
+        batteryPercent: UInt32,
+        charging: Bool,
+        displayWidth: UInt32,
+        displayHeight: UInt32
+    ) -> ANCHDeviceDeviceState {
+        var state = ANCHDeviceDeviceState()
+        state.deviceName = deviceName
+        state.batteryPercent = min(batteryPercent, 100)
+        state.charging = charging
+        state.displayWidth = displayWidth
+        state.displayHeight = displayHeight
+        return state
+    }
+
+    static func validatedBatteryPercent(level: Float) -> UInt32? {
+        guard level.isFinite, level >= 0 else { return nil }
+        return UInt32((min(level, 1) * 100).rounded())
+    }
+
+    private func refreshBatteryState(publish: Bool) {
+        let device = UIDevice.current
+        let percent = Self.validatedBatteryPercent(level: device.batteryLevel) ?? 0
+        let charging = device.batteryState == .charging || device.batteryState == .full
+        guard percent != batteryPercent || charging != batteryCharging else { return }
+        batteryPercent = percent
+        batteryCharging = charging
+
+        guard publish,
+              let session = quicSession,
+              capabilitySessions[Self.deviceCapability] != nil else { return }
+        Task { [weak self] in
+            do {
+                try await self?.sendV1DeviceState(session: session)
+            } catch {
+                NSLog("[anchor] Device battery update failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func sendV1DeviceState(session: AnchorSession) async throws {
+        guard let capabilityID = capabilitySessions[Self.deviceCapability] else { return }
+        let state = Self.makeDeviceState(
+            deviceName: deviceName,
+            batteryPercent: batteryPercent,
+            charging: batteryCharging,
+            displayWidth: displayWidth,
+            displayHeight: displayHeight
+        )
+        try await sendV1Record(
+            capabilityID,
+            type: AnchorV1.TypeURL.deviceState,
+            payload: try state.serializedData(),
+            session: session
+        )
+        NSLog(
+            "[anchor] Device state sent: battery=%u charging=%d display=%ux%u",
+            batteryPercent,
+            batteryCharging ? 1 : 0,
+            displayWidth,
+            displayHeight
+        )
     }
 
     private func makeV1Transport(identity: SecIdentity) -> any AnchorNetworkQuicTransport {
@@ -354,6 +671,13 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 try await session.sendEnvelope(try pongEnvelope.serializedData())
                 continue
             }
+            if case .capabilityRecord(let record)? = reply.body {
+                // A provider may publish initial state immediately after its
+                // capability opens (commands sends its list this way). Route
+                // that record while continuing to wait for this open reply.
+                try await routeV1Record(record)
+                continue
+            }
             if case .protocolError(let error)? = reply.body {
                 throw AnchorNetworkTransportError.connectionFailed("capability rejected: \(error.message)")
             }
@@ -361,17 +685,15 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func openV1ScreenStream(
-        session: AnchorSession,
-        transport: any AnchorNetworkQuicTransport
-    ) async throws {
+    private func openV1ScreenDatagramFlow(session: AnchorSession) async throws {
         guard let capabilityID = capabilitySessions[Self.screenCapability] else { return }
-        let stream = try await transport.openReliableStream()
         let requestID = nextRequestId
         nextRequestId += 1
-        let open = try AnchorStreamBindingCodec.openEnvelope(
+        let flowID = nextDatagramFlowId
+        nextDatagramFlowId += 2
+        let open = try AnchorDatagramFlowBindingCodec.openEnvelope(
             requestID: requestID,
-            streamID: stream.streamIdentifier,
+            flowID: flowID,
             capabilitySessionID: capabilityID,
             payloadTypeURL: AnchorV1.TypeURL.screenFrame
         )
@@ -379,10 +701,10 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
 
         while true {
             let reply = try ANCHControlEnvelope(serializedBytes: await session.receiveEnvelope())
-            if (try? AnchorStreamBindingCodec.validateOpened(
+            if (try? AnchorDatagramFlowBindingCodec.validateOpened(
                 reply,
                 requestID: requestID,
-                streamID: stream.streamIdentifier
+                flowID: flowID
             )) != nil {
                 break
             }
@@ -391,30 +713,22 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 var pongEnvelope = ANCHControlEnvelope(); pongEnvelope.pong = pong
                 try await session.sendEnvelope(try pongEnvelope.serializedData())
             } else if case .capabilityRecord(let record)? = reply.body {
-                try routeV1Record(record)
+                try await routeV1Record(record)
             } else if case .protocolError(let error)? = reply.body {
                 throw AnchorNetworkTransportError.connectionFailed(
-                    "screen stream rejected: \(error.message)"
+                    "screen datagram flow rejected: \(error.message)"
                 )
             } else {
-                NSLog("[anchor] Ignoring unrelated record while binding screen stream")
+                NSLog("[anchor] Ignoring unrelated record while binding screen datagram flow")
             }
         }
 
-        // Apple's modern QUIC API allocates the ID immediately but may defer
-        // exposing the stream to the peer until its local send half emits a
-        // STREAM frame. The binding is already accepted at this point; wake
-        // the reverse half so the desktop's accept_bi() can attach its video
-        // sender. The desktop deliberately drains this unused viewer-to-host
-        // half, while screen bytes arrive on the independent host-to-viewer
-        // half below.
-        try await stream.send(Data([0]))
-        screenStream = stream
+        screenDatagramFlowID = flowID
         screenTask = Task { [weak self] in
-            await self?.readV1ScreenStream(
-                stream,
+            await self?.readV1ScreenDatagrams(
+                session,
                 capabilityID: capabilityID,
-                streamID: stream.streamIdentifier
+                flowID: flowID
             )
         }
         try await sendV1Record(
@@ -429,36 +743,58 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             payload: try AnchorScreenCodec.requestKeyframe(),
             session: session
         )
-        NSLog("[anchor] Sideboat stream bound: QUIC stream \(stream.streamIdentifier)")
+        NSLog("[anchor] Sideboat datagram flow bound: flow \(flowID)")
     }
 
-    private func readV1ScreenStream(
-        _ stream: any AnchorReliableStream,
+    private func readV1ScreenDatagrams(
+        _ session: AnchorSession,
         capabilityID: UInt64,
-        streamID: UInt64
+        flowID: UInt64
     ) async {
-        var framer = AnchorVideoStreamFramer()
-        var assembler = AnchorScreenFrameAssembler(
+        var assembler = AnchorScreenDatagramAssembler(
             capabilitySessionID: capabilityID,
-            streamID: streamID
+            flowID: flowID
         )
+        let diagnostics = SideboatIngressDiagnostics()
         do {
             while !Task.isCancelled {
-                framer.feed(try await stream.receive(maximumLength: 64 * 1024))
-                while let packet = try framer.nextPacket() {
+                let packet = try await session.receiveDatagram()
+                let packetReceivedNs = DispatchTime.now().uptimeNanoseconds
+                diagnostics.recordChunk(
+                    bytes: packet.count,
+                    bufferedBytes: 0,
+                    atNs: packetReceivedNs
+                )
+                diagnostics.recordPacket(atNs: packetReceivedNs)
+                do {
                     if let frame = try assembler.consume(packet) {
+                        let frameReceivedNs = DispatchTime.now().uptimeNanoseconds
+                        let receiverWallClockUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+                        diagnostics.recordFrame(
+                            frame,
+                            atNs: frameReceivedNs,
+                            receiverWallClockUs: receiverWallClockUs
+                        )
                         videoPlugin.feedFrame(
                             frame.payload,
                             frameId: frame.header.sequence,
                             sourcePresentationTimeUs: frame.header.presentationTimeUs
                         )
                     }
+                } catch {
+                    // Datagram loss, reordering, or another negotiated media
+                    // flow must not terminate the screen receiver.
+                    NSLog("[anchor] Dropping invalid Sideboat datagram: \(error)")
                 }
+                diagnostics.reportIfDue(
+                    atNs: DispatchTime.now().uptimeNanoseconds,
+                    bufferedBytes: 0
+                )
             }
         } catch is CancellationError {
             return
         } catch {
-            NSLog("[anchor] Sideboat stream failed: \(error)")
+            NSLog("[anchor] Sideboat datagram receive failed: \(error)")
             assembler.reset()
             if let session = quicSession,
                let payload = try? AnchorScreenCodec.requestKeyframe() {
@@ -496,7 +832,14 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 case .sessionClose:
                     throw AnchorNetworkTransportError.connectionClosed
                 case .capabilityRecord(let record):
-                    try routeV1Record(record)
+                    try await routeV1Record(record)
+                case .streamOpen(let open):
+                    try await acceptV1FileStream(open, requestID: envelope.requestID, session: session)
+                case .streamOpened(let opened):
+                    await fileCoordinator.recordOpened(
+                        responseTo: envelope.responseTo,
+                        streamID: opened.quicStreamID
+                    )
                 default:
                     NSLog("[anchor] Protocol v1 control record: \(String(describing: envelope.body))")
                 }
@@ -512,12 +855,13 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         }
     }
 
-    private func routeV1Record(_ record: ANCHCapabilityRecord) throws {
+    private func routeV1Record(_ record: ANCHCapabilityRecord) async throws {
         if capabilitySessions[Self.screenCapability] == record.capabilitySessionID {
             if record.typeURL == AnchorV1.TypeURL.screenStatus {
                 let status = try ANCHScreenScreenStatus(serializedBytes: record.payload)
                 let info: [String: Any] = [
                     "type": "stream_info",
+                    "output_id": status.outputID,
                     "width": status.width,
                     "height": status.height,
                     "fps": status.fps,
@@ -527,39 +871,166 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 videoPlugin.handleStreamInfo(String(decoding: data, as: UTF8.self))
             } else if record.typeURL == AnchorV1.TypeURL.screenOutputList {
                 let outputs = try ANCHScreenScreenOutputList(serializedBytes: record.payload)
+                videoPlugin.handleOutputs(outputs.outputs)
                 NSLog("[anchor] Sideboat outputs received: \(outputs.outputs.count)")
             } else {
                 NSLog("[anchor] Ignoring unknown screen record \(record.typeURL)")
             }
             return
         }
-        guard record.typeURL == Self.clipboardPublishType,
-              capabilitySessions[Self.clipboardCapability] == record.capabilitySessionID else {
+        if capabilitySessions[Self.mediaCapability] == record.capabilitySessionID {
+            guard record.typeURL == AnchorV1.TypeURL.mediaState else {
+                NSLog("[anchor] Ignoring unknown media record \(record.typeURL)")
+                return
+            }
+            let state = try AnchorMediaCodec.decodeState(record.payload)
+            broker.send(AnchorEvent(target: .service("media"), message: .media(.state(state))))
+            return
+        }
+        if capabilitySessions[Self.notificationsCapability] == record.capabilitySessionID {
+            guard record.typeURL == AnchorV1.TypeURL.notificationPosted else {
+                NSLog("[anchor] Ignoring unsupported notification record \(record.typeURL)")
+                return
+            }
+            guard let notification = try Self.decodeDesktopNotification(record.payload) else {
+                NSLog("[anchor] Ignoring incomplete desktop notification")
+                return
+            }
+            broker.send(AnchorEvent(
+                target: .service("notifications"),
+                message: .notification(.posted(notification))
+            ))
+            return
+        }
+        if capabilitySessions[Self.commandsCapability] == record.capabilitySessionID {
+            if record.typeURL == AnchorV1.TypeURL.commandList {
+                let commands = try Self.decodeCommandList(record.payload)
+                broker.send(AnchorEvent(target: .service("commands"), message: .commands(.list(commands))))
+            } else if record.typeURL == AnchorV1.TypeURL.commandResult {
+                guard let result = try Self.decodeCommandResult(record.payload) else {
+                    NSLog("[anchor] Ignoring command result with unknown status")
+                    return
+                }
+                broker.send(AnchorEvent(target: .service("commands"), message: .commands(.result(result))))
+            } else {
+                NSLog("[anchor] Ignoring unknown command record \(record.typeURL)")
+            }
+            return
+        }
+        if capabilitySessions[Self.filesCapability] == record.capabilitySessionID {
+            switch record.typeURL {
+            case AnchorV1.TypeURL.fileOffer:
+                let offer = try AnchorFilesCodec.decodeOffer(
+                    record.payload,
+                    maximumByteLength: FileTransferCoordinator.maximumFileBytes
+                )
+                let accepted = await fileCoordinator.accept(offer)
+                guard let session = quicSession else { return }
+                try await sendV1Record(
+                    record.capabilitySessionID,
+                    type: AnchorV1.TypeURL.fileDecision,
+                    payload: try AnchorFilesCodec.decision(
+                        transferID: offer.transferID,
+                        accepted: accepted
+                    ),
+                    session: session
+                )
+            case AnchorV1.TypeURL.fileDecision:
+                await fileCoordinator.recordDecision(try AnchorFilesCodec.decodeDecision(record.payload))
+            case AnchorV1.TypeURL.fileContentStart:
+                await fileCoordinator.bind(try AnchorFilesCodec.decodeContentStart(record.payload))
+            case AnchorV1.TypeURL.fileComplete:
+                await fileCoordinator.complete(try AnchorFilesCodec.decodeComplete(record.payload))
+            default:
+                NSLog("[anchor] Ignoring unknown files record \(record.typeURL)")
+            }
+            return
+        }
+        guard capabilitySessions[Self.clipboardCapability] == record.capabilitySessionID else {
             NSLog("[anchor] Ignoring unbound capability record \(record.typeURL)")
             return
         }
-        let publish = try ANCHClipboardClipboardPublish(serializedBytes: record.payload)
-        guard !AnchorClipboardCodec.isEcho(publish, localNodeID: localNodeId) else { return }
-
-        let contentType: String
-        let content: String
-        let hashData: Data
-        switch publish.content {
-        case .textUtf8(let text):
-            contentType = "text/plain"; content = text; hashData = Data(text.utf8)
-        case .png(let png):
-            contentType = "image/png"; content = png.base64EncodedString(); hashData = png
-        case nil:
-            return
+        if record.typeURL == Self.clipboardPublishType {
+            let publish = try AnchorClipboardCodec.decodePublish(record.payload)
+            guard !AnchorClipboardCodec.isEcho(publish, localNodeID: localNodeId) else { return }
+            let content: ClipboardWireContent
+            switch publish.content {
+            case .textUtf8(let text): content = .text(text)
+            case .png(let png): content = .png(png)
+            case nil: return
+            }
+            broker.send(AnchorEvent(
+                target: .service("clipboard"),
+                message: .clipboard(.publishRemote(
+                    originNodeID: publish.originNodeID.value,
+                    revision: publish.revision,
+                    content: content
+                ))
+            ))
+        } else if record.typeURL == Self.clipboardClearType {
+            let clear = try AnchorClipboardCodec.decodeClear(record.payload)
+            guard clear.originNodeID.value != localNodeId else { return }
+            broker.send(AnchorEvent(
+                target: .service("clipboard"),
+                message: .clipboard(.clearRemote(
+                    originNodeID: clear.originNodeID.value,
+                    revision: clear.revision
+                ))
+            ))
+        } else {
+            NSLog("[anchor] Ignoring unknown clipboard record \(record.typeURL)")
         }
-        let hash = SHA256.hash(data: hashData).map { String(format: "%02x", $0) }.joined()
-        let packet: [String: Any] = [
-            "plugin_id": "clipboard", "type": "clipboard_content",
-            "content_type": contentType, "content": content,
-            "timestamp": Int64(Date().timeIntervalSince1970 * 1000), "hash": hash
-        ]
-        let data = try JSONSerialization.data(withJSONObject: packet)
-        broker.send(AnchorEvent(target: .service("clipboard"), message: .json(String(decoding: data, as: UTF8.self))))
+    }
+
+    static func decodeDesktopNotification(_ payload: Data, now: Date = Date()) throws -> DesktopNotification? {
+        guard payload.count <= AnchorV1.maxControlRecordBytes else {
+            throw AnchorFeatureCodecError.recordTooLarge
+        }
+        let posted = try ANCHNotificationsNotificationPosted(serializedBytes: payload)
+        guard !posted.notificationID.isEmpty,
+              !posted.applicationName.isEmpty,
+              !(posted.title.isEmpty && posted.body.isEmpty) else { return nil }
+        let postedAt = posted.postedAtUnixMs == 0
+            ? now
+            : Date(timeIntervalSince1970: TimeInterval(posted.postedAtUnixMs) / 1_000)
+        return DesktopNotification(
+            id: posted.notificationID,
+            applicationName: posted.applicationName,
+            title: posted.title,
+            body: posted.body,
+            postedAt: postedAt
+        )
+    }
+
+    static func decodeCommandList(_ payload: Data) throws -> [RemoteCommandDefinition] {
+        guard payload.count <= AnchorV1.maxControlRecordBytes else {
+            throw AnchorFeatureCodecError.recordTooLarge
+        }
+        let list = try ANCHCommandsCommandList(serializedBytes: payload)
+        return list.commands.compactMap { command in
+            guard !command.id.isEmpty else { return nil }
+            return RemoteCommandDefinition(
+                id: command.id,
+                name: command.name.isEmpty ? command.id : command.name,
+                description: command.description_p,
+                detached: command.detach
+            )
+        }
+    }
+
+    static func decodeCommandResult(_ payload: Data) throws -> RemoteCommandResult? {
+        guard payload.count <= AnchorV1.maxControlRecordBytes else {
+            throw AnchorFeatureCodecError.recordTooLarge
+        }
+        let result = try ANCHCommandsCommandResult(serializedBytes: payload)
+        guard let status = RemoteCommandResult.Status(rawValue: result.status) else { return nil }
+        return RemoteCommandResult(
+            commandID: result.commandID,
+            executionID: result.executionID,
+            status: status,
+            exitCode: result.exitCode,
+            error: result.error
+        )
     }
 
     private var localNodeId: Data {
@@ -569,8 +1040,8 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     private func iosEndpointAdvertisement() -> ANCHEndpointAdvertisement {
         var endpoint = ANCHEndpointAdvertisement()
         endpoint.endpointID = "io.anchor.ios"
-        // Advertise only schemas the migration will service; SMS and Android-
-        // style notification access are intentionally absent on iOS.
+        // This client consumes capabilities exposed by the desktop. It does
+        // not expose iPad notification capture or other server-side services.
         endpoint.capabilities = []
         return endpoint
     }
@@ -889,8 +1360,35 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     // MARK: - Outbound (Device target -> desktop)
 
     private func handleOutbound(_ event: AnchorEvent) {
+        if quicConnected, case .files(.send(let url)) = event.message {
+            v1OutboundQueue.enqueue { [weak self] in
+                await self?.sendV1File(url)
+            }
+            return
+        }
+        if quicConnected, case .media(.command(let command)) = event.message {
+            v1OutboundQueue.enqueue { [weak self] in
+                do { try await self?.sendV1Media(command) }
+                catch { NSLog("[anchor] v1 media send failed: \(error)") }
+            }
+            return
+        }
+        if quicConnected, case .clipboard(let message) = event.message {
+            v1OutboundQueue.enqueue { [weak self] in
+                do { try await self?.sendV1Clipboard(message) }
+                catch { NSLog("[anchor] v1 clipboard send failed: \(error)") }
+            }
+            return
+        }
+        if quicConnected, case .commands(let message) = event.message {
+            v1OutboundQueue.enqueue { [weak self] in
+                do { try await self?.sendV1Command(message) }
+                catch { NSLog("[anchor] v1 command send failed: \(error)") }
+            }
+            return
+        }
         if quicConnected, case .json(let payload) = event.message {
-            Task { [weak self] in
+            v1OutboundQueue.enqueue { [weak self] in
                 do { try await self?.sendV1Payload(payload) }
                 catch { NSLog("[anchor] v1 feature send failed: \(error)") }
             }
@@ -904,6 +1402,254 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             writeLengthPrefixed(conn, data: Data(text.utf8))
         case .binary:
             break
+        case .clipboard:
+            // Typed clipboard records are Protocol v1-only.
+            break
+        case .media:
+            break
+        case .notification:
+            // Desktop → iPad only. Notification records are never sent upstream.
+            break
+        case .commands:
+            break
+        case .files:
+            break
+        }
+    }
+
+    private func startV1FileStreamReceiver(transport: any AnchorNetworkQuicTransport) {
+        fileStreamTask?.cancel()
+        fileStreamTask = Task { [weak self] in
+            do {
+                while !Task.isCancelled {
+                    let stream = try await transport.receiveReliableStream()
+                    await self?.fileCoordinator.register(stream)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                NSLog("[anchor] Files inbound stream receiver stopped: \(error)")
+            }
+        }
+    }
+
+    private func acceptV1FileStream(
+        _ open: ANCHStreamOpen,
+        requestID: UInt64,
+        session: AnchorSession
+    ) async throws {
+        guard requestID != 0,
+              capabilitySessions[Self.filesCapability] == open.capabilitySessionID,
+              open.payloadTypeURL == AnchorV1.TypeURL.fileContent else {
+            throw AnchorNetworkTransportError.connectionFailed("invalid files stream binding")
+        }
+        var opened = ANCHStreamOpened()
+        opened.quicStreamID = open.quicStreamID
+        var response = ANCHControlEnvelope()
+        response.responseTo = requestID
+        response.streamOpened = opened
+        try await session.sendEnvelope(try response.serializedData())
+    }
+
+    private func sendV1File(_ url: URL) async {
+        let transferIDByteCount = AnchorFilesCodec.transferIDByteCount
+        var transferID = Data(count: transferIDByteCount)
+        let status = transferID.withUnsafeMutableBytes {
+            SecRandomCopyBytes(kSecRandomDefault, transferIDByteCount, $0.baseAddress!)
+        }
+        guard status == errSecSuccess else { return }
+        let id = FileTransferCoordinator.identifier(transferID)
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+
+        do {
+            guard let session = quicSession,
+                  let transport = quicTransport,
+                  let capabilityID = capabilitySessions[Self.filesCapability] else {
+                throw AnchorNetworkTransportError.connectionClosed
+            }
+            let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard values.isRegularFile == true else {
+                throw CocoaError(.fileReadUnsupportedScheme)
+            }
+            let byteLength = UInt64(values.fileSize ?? 0)
+            guard byteLength > 0 else { throw FileTransferError.emptyFile }
+            guard byteLength <= FileTransferCoordinator.maximumFileBytes else {
+                throw FileTransferError.fileTooLarge
+            }
+
+            broker.send(AnchorEvent(target: .service("files"), message: .files(.began(
+                FileTransferEntry(
+                    id: id,
+                    name: url.lastPathComponent,
+                    direction: .sent,
+                    totalBytes: byteLength,
+                    transferredBytes: 0,
+                    status: .transferring,
+                    localURL: url,
+                    startedAt: Date()
+                )
+            ))))
+
+            let hash = try Self.hashFile(url)
+            let offer = AnchorFileOffer(
+                transferID: transferID,
+                filename: url.lastPathComponent,
+                mimeType: "application/octet-stream",
+                byteLength: byteLength,
+                sha256: hash
+            )
+            try await sendV1Record(
+                capabilityID,
+                type: AnchorV1.TypeURL.fileOffer,
+                payload: try AnchorFilesCodec.offer(
+                    offer, maximumByteLength: FileTransferCoordinator.maximumFileBytes
+                ),
+                session: session
+            )
+            try await fileCoordinator.waitForDecision(transferID: transferID)
+
+            let stream = try await transport.openReliableStream()
+            let requestID = nextRequestId
+            nextRequestId += 1
+            let open = try AnchorStreamBindingCodec.openEnvelope(
+                requestID: requestID,
+                streamID: stream.streamIdentifier,
+                capabilitySessionID: capabilityID,
+                payloadTypeURL: AnchorV1.TypeURL.fileContent
+            )
+            try await session.sendEnvelope(try open.serializedData())
+            try await fileCoordinator.waitForOpened(
+                requestID: requestID,
+                streamID: stream.streamIdentifier
+            )
+            try await sendV1Record(
+                capabilityID,
+                type: AnchorV1.TypeURL.fileContentStart,
+                payload: try AnchorFilesCodec.contentStart(
+                    transferID: transferID,
+                    quicStreamID: stream.streamIdentifier
+                ),
+                session: session
+            )
+
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var sent: UInt64 = 0
+            while let chunk = try handle.read(upToCount: 256 * 1024), !chunk.isEmpty {
+                try await stream.send(chunk)
+                sent += UInt64(chunk.count)
+                broker.send(AnchorEvent(
+                    target: .service("files"),
+                    message: .files(.progress(id: id, transferredBytes: sent))
+                ))
+            }
+            guard sent == byteLength else { throw FileTransferError.unexpectedLength }
+            try await stream.finish()
+            try await sendV1Record(
+                capabilityID,
+                type: AnchorV1.TypeURL.fileComplete,
+                payload: try AnchorFilesCodec.complete(transferID: transferID, sha256: hash),
+                session: session
+            )
+            broker.send(AnchorEvent(
+                target: .service("files"), message: .files(.completed(id: id, localURL: url))
+            ))
+        } catch {
+            broker.send(AnchorEvent(
+                target: .service("files"),
+                message: .files(.failed(id: id, message: error.localizedDescription))
+            ))
+            NSLog("[anchor] File send failed for \(url.lastPathComponent): \(error)")
+        }
+    }
+
+    private static func hashFile(_ url: URL) throws -> Data {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while let chunk = try handle.read(upToCount: 256 * 1024), !chunk.isEmpty {
+            hasher.update(data: chunk)
+        }
+        return Data(hasher.finalize())
+    }
+
+    private func sendV1Media(_ command: AnchorMediaCommand) async throws {
+        guard let session = quicSession,
+              let capabilityID = capabilitySessions[Self.mediaCapability] else { return }
+        try await sendV1Record(
+            capabilityID,
+            type: AnchorV1.TypeURL.mediaCommand,
+            payload: try AnchorMediaCodec.command(command),
+            session: session
+        )
+    }
+
+    private func sendV1Command(_ message: CommandWireMessage) async throws {
+        guard let session = quicSession,
+              let capabilityID = capabilitySessions[Self.commandsCapability] else { return }
+        switch message {
+        case .run(let commandID):
+            guard !commandID.isEmpty else { return }
+            var run = ANCHCommandsCommandRun()
+            run.commandID = commandID
+            try await sendV1Record(
+                capabilityID,
+                type: AnchorV1.TypeURL.commandRun,
+                payload: try run.serializedData(),
+                session: session
+            )
+        case .kill(let executionID):
+            guard !executionID.isEmpty else { return }
+            var kill = ANCHCommandsCommandKill()
+            kill.executionID = executionID
+            try await sendV1Record(
+                capabilityID,
+                type: AnchorV1.TypeURL.commandKill,
+                payload: try kill.serializedData(),
+                session: session
+            )
+        case .availability, .list, .result:
+            break
+        }
+    }
+
+    private func sendV1Clipboard(_ message: ClipboardWireMessage) async throws {
+        guard let session = quicSession,
+              let capabilityID = capabilitySessions[Self.clipboardCapability] else { return }
+        clipboardRevision &+= 1
+        if clipboardRevision == 0 { clipboardRevision = 1 }
+        switch message {
+        case .publishLocal(.text(let text)):
+            try await sendV1Record(
+                capabilityID,
+                type: Self.clipboardPublishType,
+                payload: try AnchorClipboardCodec.publishText(
+                    originNodeID: localNodeId, revision: clipboardRevision, text: text
+                ),
+                session: session
+            )
+        case .publishLocal(.png(let png)):
+            try await sendV1Record(
+                capabilityID,
+                type: Self.clipboardPublishType,
+                payload: try AnchorClipboardCodec.publishPNG(
+                    originNodeID: localNodeId, revision: clipboardRevision, png: png
+                ),
+                session: session
+            )
+        case .clearLocal:
+            try await sendV1Record(
+                capabilityID,
+                type: Self.clipboardClearType,
+                payload: try AnchorClipboardCodec.clear(
+                    originNodeID: localNodeId, revision: clipboardRevision
+                ),
+                session: session
+            )
+        case .publishRemote, .clearRemote:
+            return
         }
     }
 
@@ -916,14 +1662,27 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         case "clipboard": try await sendV1Clipboard(json, session: session)
         case "input": try await sendV1Input(json, session: session)
         case "wayland":
-            guard json["command"] as? String == "request_keyframe",
+            guard let command = json["command"] as? String,
                   let capabilityID = capabilitySessions[Self.screenCapability] else { return }
-            try await sendV1Record(
-                capabilityID,
-                type: AnchorV1.TypeURL.screenRequestKeyframe,
-                payload: try AnchorScreenCodec.requestKeyframe(),
-                session: session
-            )
+            switch command {
+            case "request_keyframe":
+                try await sendV1Record(
+                    capabilityID,
+                    type: AnchorV1.TypeURL.screenRequestKeyframe,
+                    payload: try AnchorScreenCodec.requestKeyframe(),
+                    session: session
+                )
+            case "select_output":
+                guard let outputID = json["output_id"] as? String, !outputID.isEmpty else { return }
+                try await sendV1Record(
+                    capabilityID,
+                    type: AnchorV1.TypeURL.screenSelectOutput,
+                    payload: try AnchorScreenCodec.selectOutput(outputID),
+                    session: session
+                )
+            default:
+                return
+            }
         default: NSLog("[anchor] Feature \(plugin) has not migrated to Protocol v1 yet")
         }
     }
@@ -1085,21 +1844,46 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     }
 
     private func closeAll() {
+        if capabilitySessions[Self.mediaCapability] != nil {
+            broker.send(AnchorEvent(
+                target: .service("media"), message: .media(.availability(false))
+            ))
+        }
+        if capabilitySessions[Self.notificationsCapability] != nil {
+            broker.send(AnchorEvent(
+                target: .service("notifications"), message: .notification(.availability(false))
+            ))
+        }
+        if capabilitySessions[Self.commandsCapability] != nil {
+            broker.send(AnchorEvent(
+                target: .service("commands"), message: .commands(.availability(false))
+            ))
+        }
+        if capabilitySessions[Self.filesCapability] != nil {
+            broker.send(AnchorEvent(
+                target: .service("files"), message: .files(.availability(false))
+            ))
+        }
         stopLatencyPing()
         stopV1Latency()
+        v1OutboundQueue.cancelPending()
         quicConnected = false
         quicTransport?.close()
         quicTransport = nil
         quicSession = nil
         screenTask?.cancel()
         screenTask = nil
-        screenStream = nil
+        screenDatagramFlowID = nil
+        fileStreamTask?.cancel()
+        fileStreamTask = nil
+        Task { await fileCoordinator.reset() }
         videoPlugin.stop()
         quicTask?.cancel()
         quicTask = nil
         capabilitySessions.removeAll()
         nextRequestId = 1
         nextCapabilitySessionId = 1
+        nextDatagramFlowId = 1
         udpConnectionReady = false
         udpReadySent = false
         jsonConnection?.cancel()

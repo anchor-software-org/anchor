@@ -481,6 +481,12 @@ impl DatagramFlow {
         self.session.0.connection.datagram_send_buffer_space()
     }
 
+    /// Maximum application payload accepted by the peer on the current path.
+    /// This value can change after path-MTU discovery or network migration.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.session.0.connection.max_datagram_size()
+    }
+
     pub fn send(&self, payload: Bytes) -> Result<(), DatagramSendError> {
         self.session.send_datagram(payload)
     }

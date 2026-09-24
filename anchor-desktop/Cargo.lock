@@ -37,6 +37,7 @@ name = "anchor"
 version = "0.3.0"
 dependencies = [
  "anchor-sdk",
+ "anchor-topology-core",
  "anchor-wl-clipboard",
  "anyhow",
  "base64 0.22.1",
@@ -97,6 +98,10 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
 ]
+
+[[package]]
+name = "anchor-topology-core"
+version = "0.1.0"
 
 [[package]]
 name = "anchor-wl-clipboard"
