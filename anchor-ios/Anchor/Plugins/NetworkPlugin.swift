@@ -756,6 +756,8 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             flowID: flowID
         )
         let diagnostics = SideboatIngressDiagnostics()
+        let recoveryRequestIntervalNs: UInt64 = 500_000_000
+        var lastRecoveryRequestNs = DispatchTime.now().uptimeNanoseconds
         do {
             while !Task.isCancelled {
                 let packet = try await session.receiveDatagram()
@@ -767,7 +769,11 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 )
                 diagnostics.recordPacket(atNs: packetReceivedNs)
                 do {
-                    if let frame = try assembler.consume(packet) {
+                    let frames = try assembler.consume(
+                        packet,
+                        atNanoseconds: packetReceivedNs
+                    )
+                    for frame in frames {
                         let frameReceivedNs = DispatchTime.now().uptimeNanoseconds
                         let receiverWallClockUs = UInt64(Date().timeIntervalSince1970 * 1_000_000)
                         diagnostics.recordFrame(
@@ -780,6 +786,18 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                             frameId: frame.header.sequence,
                             sourcePresentationTimeUs: frame.header.presentationTimeUs
                         )
+                    }
+                    if assembler.takeKeyframeRequest(),
+                       packetReceivedNs >= lastRecoveryRequestNs,
+                       packetReceivedNs - lastRecoveryRequestNs >= recoveryRequestIntervalNs {
+                        lastRecoveryRequestNs = packetReceivedNs
+                        try await sendV1Record(
+                            capabilityID,
+                            type: AnchorV1.TypeURL.screenRequestKeyframe,
+                            payload: try AnchorScreenCodec.requestKeyframe(),
+                            session: session
+                        )
+                        NSLog("[anchor] Sideboat loss recovery requested an IDR")
                     }
                 } catch {
                     // Datagram loss, reordering, or another negotiated media
