@@ -74,6 +74,13 @@ public actor AnchorSession {
         try await transport.receiveDatagram()
     }
 
+    /// Register the receive channel before the peer is asked to send media.
+    /// This avoids losing the initial recovery IDR on transports where channel
+    /// creation also enables inbound datagram delivery.
+    public func prepareDatagramReceive() async throws {
+        try await transport.prepareDatagramReceive()
+    }
+
     public func close() {
         isConnected = false
         transport.close()

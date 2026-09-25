@@ -10,7 +10,14 @@ public protocol AnchorQuicTransport: AnyObject {
     func sendDatagram(_ bytes: Data) async throws
     func receiveControl() async throws -> Data
     func receiveDatagram() async throws -> Data
+    /// Make the connection accept inbound datagrams before a peer starts a
+    /// media flow. Implementations without an explicit channel use a no-op.
+    func prepareDatagramReceive() async throws
     func close()
+}
+
+public extension AnchorQuicTransport {
+    func prepareDatagramReceive() async throws {}
 }
 
 /// Type-erased ordered byte stream returned by a multiplexed QUIC transport.

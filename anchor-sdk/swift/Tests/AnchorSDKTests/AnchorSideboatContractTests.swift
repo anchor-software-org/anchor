@@ -169,6 +169,65 @@ final class AnchorSideboatContractTests: XCTestCase {
         XCTAssertEqual(frame.header.fragmentIndex, 0)
     }
 
+    func testDatagramAssemblerRecoversOneLostFragmentFromParity() throws {
+        // Seventeen fragments create two interleaved parity groups. Dropping
+        // the short final fragment checks both XOR data recovery and the XOR
+        // payload-length field.
+        let payload = Data((0..<(AnchorVideoFrameHeader.payloadBytes * 16 + 137)).map {
+            UInt8($0 % 241)
+        })
+        let packets = try AnchorVideoFrameCodec.fragmentWithParity(
+            kind: AnchorVideoFrameHeader.screenKind,
+            flags: AnchorVideoFrameHeader.keyframeFlag,
+            capabilitySessionID: 3,
+            flowID: 7,
+            sequence: 9,
+            presentationTimeUs: 11,
+            codecConfigID: 13,
+            payload: payload
+        )
+        let dataPackets = packets.filter {
+            (try? AnchorVideoFrameCodec.decodeValidated($0).header.kind) == AnchorVideoFrameHeader.screenKind
+        }
+        let targetParity = try XCTUnwrap(packets.first {
+            let header = try? AnchorVideoFrameCodec.decodeValidated($0).header
+            return header?.kind == AnchorVideoFrameHeader.parityKind && header?.fragmentIndex == 0
+        })
+        var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+
+        for packet in dataPackets.dropLast() {
+            XCTAssertTrue(try assembler.consume(packet).isEmpty)
+        }
+        let completed = try assembler.consume(targetParity)
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(completed.first?.payload, payload)
+    }
+
+    func testDatagramAssemblerRejectsParityWithAnUnsupportedWireVersion() throws {
+        let packets = try AnchorVideoFrameCodec.fragmentWithParity(
+            kind: AnchorVideoFrameHeader.screenKind,
+            capabilitySessionID: 3,
+            flowID: 7,
+            sequence: 9,
+            presentationTimeUs: 11,
+            codecConfigID: 13,
+            payload: Data(repeating: 1, count: AnchorVideoFrameHeader.payloadBytes + 1)
+        )
+        let dataPacket = try XCTUnwrap(packets.first {
+            (try? AnchorVideoFrameCodec.decodeValidated($0).header.kind) == AnchorVideoFrameHeader.screenKind
+        })
+        var invalidParity = try XCTUnwrap(packets.first {
+            (try? AnchorVideoFrameCodec.decodeValidated($0).header.kind) == AnchorVideoFrameHeader.parityKind
+        })
+        invalidParity[4] = 3
+        var assembler = AnchorScreenDatagramAssembler(capabilitySessionID: 3, flowID: 7)
+
+        XCTAssertTrue(try assembler.consume(dataPacket).isEmpty)
+        XCTAssertThrowsError(try assembler.consume(invalidParity)) {
+            XCTAssertEqual($0 as? AnchorWireError, .unsupportedFrameVersion(3))
+        }
+    }
+
     func testDatagramAssemblerWaitsForReorderedSequenceWithoutBreakingReferenceChain() throws {
         func packet(sequence: UInt64, flags: UInt16 = 0) throws -> Data {
             try XCTUnwrap(AnchorVideoFrameCodec.fragment(

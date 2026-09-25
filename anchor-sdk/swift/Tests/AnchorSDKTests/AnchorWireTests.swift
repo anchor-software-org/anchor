@@ -201,10 +201,20 @@ final class AnchorWireTests: XCTestCase {
         XCTAssertEqual(decodedPublish.revision, 7)
         XCTAssertEqual(decodedPublish.textUtf8, "Anchor clipboard")
     }
+
+    func testSessionPreparesDatagramReceiveBeforeMediaFlowStarts() async throws {
+        let transport = RecordingTransport()
+        let session = AnchorSession(transport: transport)
+
+        try await session.prepareDatagramReceive()
+
+        XCTAssertEqual(transport.datagramPrepareCount, 1)
+    }
 }
 
 private final class RecordingTransport: AnchorQuicTransport, @unchecked Sendable {
     private var writes = [Data]()
+    private(set) var datagramPrepareCount = 0
     var controlWrites: [Data] { get async { writes } }
 
     func connect(host: String, port: UInt16, serverName: String,
@@ -213,5 +223,6 @@ private final class RecordingTransport: AnchorQuicTransport, @unchecked Sendable
     func sendDatagram(_ bytes: Data) async throws {}
     func receiveControl() async throws -> Data { Data() }
     func receiveDatagram() async throws -> Data { Data() }
+    func prepareDatagramReceive() async throws { datagramPrepareCount += 1 }
     func close() {}
 }

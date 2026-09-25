@@ -241,6 +241,10 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
     private var quicTask: Task<Void, Never>?
     private var screenTask: Task<Void, Never>?
     private var screenDatagramFlowID: UInt64?
+    // Desktop can retain an output that was removed in an earlier session. Do
+    // one explicit selection after the initial output list arrives so a new
+    // session never remains on that zero-sized source.
+    private var didSelectInitialScreenOutput = false
     private var fileStreamTask: Task<Void, Never>?
     private var v1LatencyTask: Task<Void, Never>?
     private let v1PingLock = NSLock()
@@ -568,6 +572,15 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         return (UInt32(width), UInt32(height))
     }
 
+    /// Choose a source that can produce a frame. Output lists may still
+    /// contain stale or virtual entries with no dimensions, so do not select
+    /// those as the automatic initial source.
+    static func initialScreenOutputID(_ outputs: [ANCHScreenScreenOutput]) -> String? {
+        outputs.first(where: {
+            !$0.outputID.isEmpty && $0.width > 0 && $0.height > 0
+        })?.outputID
+    }
+
     static func makeDeviceState(
         deviceName: String,
         batteryPercent: UInt32,
@@ -723,6 +736,10 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             }
         }
 
+        // On iOS 26, accessing the QUIC datagram channel enables inbound
+        // delivery. This must finish before the desktop receives screenStart,
+        // or it can send and lose the only requested recovery IDR.
+        try await session.prepareDatagramReceive()
         screenDatagramFlowID = flowID
         screenTask = Task { [weak self] in
             await self?.readV1ScreenDatagrams(
@@ -891,6 +908,34 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 let outputs = try ANCHScreenScreenOutputList(serializedBytes: record.payload)
                 videoPlugin.handleOutputs(outputs.outputs)
                 NSLog("[anchor] Sideboat outputs received: \(outputs.outputs.count)")
+                if !didSelectInitialScreenOutput,
+                   let outputID = Self.initialScreenOutputID(outputs.outputs),
+                   let session = quicSession,
+                   let capabilityID = capabilitySessions[Self.screenCapability] {
+                    didSelectInitialScreenOutput = true
+                    try await sendV1Record(
+                        capabilityID,
+                        type: AnchorV1.TypeURL.screenSelectOutput,
+                        payload: try AnchorScreenCodec.selectOutput(outputID),
+                        session: session
+                    )
+                    // The first start used the desktop's default output. Send
+                    // a second, explicit start after selecting a known-good
+                    // source, then request its recovery IDR.
+                    try await sendV1Record(
+                        capabilityID,
+                        type: AnchorV1.TypeURL.screenStart,
+                        payload: try AnchorScreenCodec.start(outputID: outputID),
+                        session: session
+                    )
+                    try await sendV1Record(
+                        capabilityID,
+                        type: AnchorV1.TypeURL.screenRequestKeyframe,
+                        payload: try AnchorScreenCodec.requestKeyframe(),
+                        session: session
+                    )
+                    NSLog("[anchor] Sideboat selected initial output \(outputID)")
+                }
             } else {
                 NSLog("[anchor] Ignoring unknown screen record \(record.typeURL)")
             }
@@ -1892,6 +1937,7 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
         screenTask?.cancel()
         screenTask = nil
         screenDatagramFlowID = nil
+        didSelectInitialScreenOutput = false
         fileStreamTask?.cancel()
         fileStreamTask = nil
         Task { await fileCoordinator.reset() }

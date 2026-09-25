@@ -208,6 +208,10 @@ private struct FullscreenStreamControls: View {
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white)
                         .frame(width: 44, height: 44)
+                        .background(Color.black.opacity(0.44))
+                        .overlay {
+                            Rectangle().stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        }
                         .contentShape(Rectangle())
                 }
 
@@ -217,8 +221,14 @@ private struct FullscreenStreamControls: View {
 
                 Spacer(minLength: 12)
 
-                if videoPlugin.isReceiving {
+                if videoPlugin.isReceiving, videoPlugin.fps > 0 {
                     StreamMetrics(videoPlugin: videoPlugin, latencyMs: latencyMs)
+                        .padding(.horizontal, 8)
+                        .frame(height: 36)
+                        .background(Color.black.opacity(0.44))
+                        .overlay {
+                            Rectangle().stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        }
                 }
 
                 if touchInputEnabled {
@@ -226,8 +236,8 @@ private struct FullscreenStreamControls: View {
                 }
             }
             .padding(.horizontal, 10)
-            .padding(.top, 44)
-            .padding(.bottom, 28)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
 
             Spacer()
         }
@@ -260,6 +270,10 @@ private struct StreamInputModePicker: View {
             .foregroundColor(.white.opacity(0.78))
             .padding(.horizontal, 8)
             .frame(height: 30)
+            .background(Color.black.opacity(0.44))
+            .overlay {
+                Rectangle().stroke(Color.white.opacity(0.14), lineWidth: 1)
+            }
             .contentShape(Rectangle())
         }
         .accessibilityLabel("Stream input mode, \(inputMode.rawValue)")
@@ -652,6 +666,7 @@ private struct SideboatStreamSurface: View {
 private struct StreamOutputPicker: View {
     @ObservedObject var videoPlugin: VideoPlugin
     let compact: Bool
+    @State private var isPresentingOutputPicker = false
 
     private var selectedName: String {
         videoPlugin.availableOutputs.first(where: { $0.id == videoPlugin.selectedOutputID })?.name
@@ -659,18 +674,8 @@ private struct StreamOutputPicker: View {
     }
 
     var body: some View {
-        Menu {
-            ForEach(videoPlugin.availableOutputs) { output in
-                Button {
-                    videoPlugin.selectOutput(output.id)
-                } label: {
-                    if output.id == videoPlugin.selectedOutputID {
-                        Label(output.name, systemImage: "checkmark")
-                    } else {
-                        Text(output.name)
-                    }
-                }
-            }
+        Button {
+            isPresentingOutputPicker = true
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "display")
@@ -682,10 +687,34 @@ private struct StreamOutputPicker: View {
                     .font(.system(size: 8, weight: .semibold))
             }
             .font(.system(size: compact ? 11 : 10, weight: .medium))
-            .foregroundColor(.white.opacity(compact ? 0.72 : 0.52))
+            .foregroundColor(.white.opacity(compact ? 0.86 : 0.72))
+            .frame(minWidth: 44, minHeight: 36, alignment: .leading)
+            .padding(.horizontal, compact ? 8 : 6)
+            .background(Color.black.opacity(compact ? 0.44 : 0.18))
+            .overlay {
+                Rectangle().stroke(Color.white.opacity(compact ? 0.16 : 0.10), lineWidth: 1)
+            }
             .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel("Stream screen, \(selectedName)")
+        .confirmationDialog(
+            "Choose screen",
+            isPresented: $isPresentingOutputPicker,
+            titleVisibility: .visible
+        ) {
+            ForEach(videoPlugin.availableOutputs) { output in
+                Button {
+                    videoPlugin.selectOutput(output.id)
+                } label: {
+                    if output.id == videoPlugin.selectedOutputID {
+                        Label(output.name, systemImage: "checkmark")
+                    } else {
+                        Text(output.name)
+                    }
+                }
+            }
+        }
     }
 }
 
