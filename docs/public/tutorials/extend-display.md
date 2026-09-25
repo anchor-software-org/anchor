@@ -7,7 +7,7 @@ the phone as a touch or pointer surface.
 ## Requirements
 
 - A Linux desktop running Wayland.
-- Screen capture support from your compositor (`zwlr_screencopy_manager_v1`).
+- Screen capture support from your compositor (`zwlr_screencopy_manager_v1`), list of supported compositors can be found [here](https://wayland.app/protocols/wlr-screencopy-unstable-v1)
 - A connected Android phone or tablet. See [Installation](/docs/installation).
 - Sway for Anchor-managed virtual displays. Hyprland can stream its existing
   outputs, but Anchor does not currently size a new Hyprland virtual output.
