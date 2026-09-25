@@ -40,6 +40,7 @@ class InputPlugin: Plugin {
     }
 
     func sendButton(button: Int = BTN_LEFT, pressed: Bool) {
+        NSLog("[anchor] [input] button button=%d pressed=%d", button, pressed ? 1 : 0)
         send([
             "plugin_id": "input",
             "type": "anchor.input.button",

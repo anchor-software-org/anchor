@@ -10,8 +10,16 @@ let package = Package(
     products: [
         .library(name: "AnchorSDK", targets: ["AnchorSDK"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.38.0"),
+    ],
     targets: [
-        .target(name: "AnchorSDK"),
+        .target(
+            name: "AnchorSDK",
+            dependencies: [
+                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+            ]
+        ),
         .testTarget(name: "AnchorSDKTests", dependencies: ["AnchorSDK"]),
     ]
 )

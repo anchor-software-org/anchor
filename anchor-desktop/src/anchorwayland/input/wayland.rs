@@ -16,7 +16,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1, zwlr_virtual_pointer_v1,
 };
 
-use super::InputBackend;
+use super::{InputBackend, OutputGeometry};
 
 const MOD_SHIFT: u32 = 1;
 
@@ -37,6 +37,8 @@ struct InputWaylandState {
     xdg_output_manager: Option<zxdg_output_manager_v1::ZxdgOutputManagerV1>,
     /// All outputs, keyed by wl_output object id.
     outputs: HashMap<u32, OutputInfo>,
+    /// Bound output objects, retained so virtual pointers can target them.
+    output_objects: HashMap<u32, wl_output::WlOutput>,
     /// Map from xdg_output object id → wl_output object id, for routing xdg events.
     xdg_to_wl: HashMap<u32, u32>,
     /// Currently building output (accumulates geometry/mode/name events before Done).
@@ -46,7 +48,10 @@ struct InputWaylandState {
     stream_output_y: i32,
     stream_output_w: u32,
     stream_output_h: u32,
-    /// Total compositor extent.
+    /// Bounding box of the compositor layout. Wayland output coordinates may
+    /// be negative when an output is left of or above the primary output.
+    layout_min_x: i32,
+    layout_min_y: i32,
     total_w: u32,
     total_h: u32,
 }
@@ -54,16 +59,120 @@ struct InputWaylandState {
 /// Wayland-based pointer + keyboard injection.
 pub struct WaylandInput {
     conn: Connection,
+    /// Unbound fallback for compositors that do not expose virtual-pointer v2.
+    generic_virtual_pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
     virtual_pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    /// Output-bound virtual pointers keyed by stable Wayland output name.
+    output_virtual_pointers: HashMap<String, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1>,
+    /// True only when `virtual_pointer` is constrained to the streamed output.
+    pointer_is_output_bound: bool,
     virtual_keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
     char_to_keycode: HashMap<char, (u32, bool)>,
     outputs: HashMap<u32, OutputInfo>,
+    stream_output_name: String,
     stream_output_x: i32,
     stream_output_y: i32,
     stream_output_w: u32,
     stream_output_h: u32,
+    layout_min_x: i32,
+    layout_min_y: i32,
     total_w: u32,
     total_h: u32,
+}
+
+fn output_layout_bounds<'a>(outputs: impl Iterator<Item = &'a OutputInfo>) -> (i32, i32, u32, u32) {
+    let mut min_x = i64::MAX;
+    let mut min_y = i64::MAX;
+    let mut max_x = i64::MIN;
+    let mut max_y = i64::MIN;
+    let mut found = false;
+
+    for output in outputs {
+        found = true;
+        min_x = min_x.min(i64::from(output.x));
+        min_y = min_y.min(i64::from(output.y));
+        max_x = max_x.max(i64::from(output.x) + i64::from(output.width));
+        max_y = max_y.max(i64::from(output.y) + i64::from(output.height));
+    }
+
+    if !found {
+        return (0, 0, 1920, 1080);
+    }
+
+    (
+        min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        min_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        (max_x - min_x).clamp(1, i64::from(u32::MAX)) as u32,
+        (max_y - min_y).clamp(1, i64::from(u32::MAX)) as u32,
+    )
+}
+
+fn absolute_position_in_layout(
+    layout_min_x: i32,
+    layout_min_y: i32,
+    total_w: u32,
+    total_h: u32,
+    output_x: i32,
+    output_y: i32,
+    output_w: u32,
+    output_h: u32,
+    x_norm: f64,
+    y_norm: f64,
+) -> (u32, u32) {
+    let x = x_norm.clamp(0.0, 1.0);
+    let y = y_norm.clamp(0.0, 1.0);
+    let translated_x = (f64::from(output_x) - f64::from(layout_min_x)) + x * f64::from(output_w);
+    let translated_y = (f64::from(output_y) - f64::from(layout_min_y)) + y * f64::from(output_h);
+    (
+        translated_x.round().clamp(0.0, f64::from(total_w)) as u32,
+        translated_y.round().clamp(0.0, f64::from(total_h)) as u32,
+    )
+}
+
+/// Convert normalized stream coordinates into the selected output's local
+/// coordinate frame. This is used only by an output-bound virtual pointer.
+fn absolute_position_in_output(
+    output_w: u32,
+    output_h: u32,
+    x_norm: f64,
+    y_norm: f64,
+) -> (u32, u32) {
+    (
+        (x_norm.clamp(0.0, 1.0) * f64::from(output_w)).round() as u32,
+        (y_norm.clamp(0.0, 1.0) * f64::from(output_h)).round() as u32,
+    )
+}
+
+fn refreshed_stream_output<'a>(
+    outputs: &'a HashMap<u32, OutputInfo>,
+    current_name: &str,
+) -> Option<&'a OutputInfo> {
+    outputs
+        .values()
+        .find(|output| output.name == current_name)
+        .or_else(|| outputs.iter().min_by_key(|(index, _)| *index).map(|(_, output)| output))
+}
+
+/// Resolve the global origin for the output that is currently being streamed.
+///
+/// A display name is the only safe local identity. Width and height are not an
+/// identity: a virtual display and the built-in display often have the same
+/// mode. If the input connection has not discovered the named display yet,
+/// use the capture worker's explicit origin instead of guessing from its size.
+fn stream_output_origin(
+    outputs: &HashMap<u32, OutputInfo>,
+    output_name: &str,
+    reported_x: Option<i32>,
+    reported_y: Option<i32>,
+) -> (i32, i32) {
+    if let Some(output) = outputs.values().find(|output| output.name == output_name) {
+        return (output.x, output.y);
+    }
+
+    match (reported_x, reported_y) {
+        (Some(x), Some(y)) => (x, y),
+        _ => (0, 0),
+    }
 }
 
 impl WaylandInput {
@@ -82,12 +191,15 @@ impl WaylandInput {
             keyboard_manager: None,
             xdg_output_manager: None,
             outputs: HashMap::new(),
+            output_objects: HashMap::new(),
             xdg_to_wl: HashMap::new(),
             pending_output: None,
             stream_output_x: 0,
             stream_output_y: 0,
             stream_output_w: 1920,
             stream_output_h: 1080,
+            layout_min_x: 0,
+            layout_min_y: 0,
             total_w: 1920,
             total_h: 1080,
         };
@@ -116,22 +228,21 @@ impl WaylandInput {
                 info.y
             );
         }
-        wl_state.total_w = wl_state
-            .outputs
-            .values()
-            .map(|o| (o.x as u32).saturating_add(o.width))
-            .max()
-            .unwrap_or(1920);
-        wl_state.total_h = wl_state
-            .outputs
-            .values()
-            .map(|o| (o.y as u32).saturating_add(o.height))
-            .max()
-            .unwrap_or(1080);
-        log::info!("Input: total compositor extent {}x{}", wl_state.total_w, wl_state.total_h);
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(wl_state.outputs.values());
+        wl_state.layout_min_x = min_x;
+        wl_state.layout_min_y = min_y;
+        wl_state.total_w = total_w;
+        wl_state.total_h = total_h;
+        log::info!(
+            "Input: compositor bounds origin=({},{}) extent={}x{}",
+            min_x,
+            min_y,
+            total_w,
+            total_h
+        );
 
         // Virtual pointer
-        let virtual_pointer = match wl_state.pointer_manager.as_ref() {
+        let generic_virtual_pointer = match wl_state.pointer_manager.as_ref() {
             Some(m) => m.create_virtual_pointer(wl_state.seat.as_ref(), &qh, ()),
             None => {
                 return Err(
@@ -139,6 +250,24 @@ impl WaylandInput {
                 );
             }
         };
+        let mut output_virtual_pointers = HashMap::new();
+        if let Some(manager) =
+            wl_state.pointer_manager.as_ref().filter(|manager| manager.version() >= 2)
+        {
+            for (id, info) in &wl_state.outputs {
+                if let Some(output) = wl_state.output_objects.get(id) {
+                    let pointer = manager.create_virtual_pointer_with_output(
+                        wl_state.seat.as_ref(),
+                        Some(output),
+                        &qh,
+                        (),
+                    );
+                    output_virtual_pointers.insert(info.name.clone(), pointer);
+                }
+            }
+        } else {
+            log::warn!("Input: virtual-pointer v2 unavailable; absolute input uses global layout");
+        }
 
         // Virtual keyboard
         let virtual_keyboard = match (wl_state.keyboard_manager.as_ref(), wl_state.seat.as_ref()) {
@@ -228,14 +357,20 @@ impl WaylandInput {
 
         Ok(WaylandInput {
             conn,
-            virtual_pointer,
+            generic_virtual_pointer: generic_virtual_pointer.clone(),
+            virtual_pointer: generic_virtual_pointer,
+            output_virtual_pointers,
+            pointer_is_output_bound: false,
             virtual_keyboard,
             char_to_keycode,
             outputs: wl_state.outputs,
+            stream_output_name: String::new(),
             stream_output_x: wl_state.stream_output_x,
             stream_output_y: wl_state.stream_output_y,
             stream_output_w: wl_state.stream_output_w,
             stream_output_h: wl_state.stream_output_h,
+            layout_min_x: wl_state.layout_min_x,
+            layout_min_y: wl_state.layout_min_y,
             total_w: wl_state.total_w,
             total_h: wl_state.total_h,
         })
@@ -263,44 +398,110 @@ impl InputBackend for WaylandInput {
         output_x: Option<i32>,
         output_y: Option<i32>,
     ) {
+        self.stream_output_name = output_name.to_string();
         // Prefer local xdg_output positions (always correct) over what
         // the screencopy backend reports — wl_output::Geometry gives wrong
         // positions for virtual outputs like HEADLESS on Sway.
-        let (ox, oy) = if let Some(output) = self
-            .outputs
-            .values()
-            .find(|o| o.name == output_name)
-            .or_else(|| self.outputs.values().find(|o| o.width == width && o.height == height))
-        {
-            (output.x, output.y)
-        } else if let (Some(x), Some(y)) = (output_x, output_y) {
-            (x, y)
-        } else {
-            (0, 0)
-        };
+        let (ox, oy) = stream_output_origin(&self.outputs, output_name, output_x, output_y);
 
         self.stream_output_x = ox;
         self.stream_output_y = oy;
         self.stream_output_w = width;
         self.stream_output_h = height;
-        // Expand total extent to include this output if needed.
-        let needed_w = (ox as u32).saturating_add(width);
-        let needed_h = (oy as u32).saturating_add(height);
-        if needed_w > self.total_w {
-            self.total_w = needed_w;
+        if let Some(pointer) = self.output_virtual_pointers.get(output_name) {
+            self.virtual_pointer = pointer.clone();
+            self.pointer_is_output_bound = true;
+        } else {
+            self.virtual_pointer = self.generic_virtual_pointer.clone();
+            self.pointer_is_output_bound = false;
+            log::warn!(
+                "Input: no output-bound pointer for '{}'; using global-layout fallback",
+                output_name
+            );
         }
-        if needed_h > self.total_h {
-            self.total_h = needed_h;
-        }
+        // Expand the signed compositor bounding box to include a stream output
+        // that was not present during initial Wayland output discovery.
+        let current_max_x = i64::from(self.layout_min_x) + i64::from(self.total_w);
+        let current_max_y = i64::from(self.layout_min_y) + i64::from(self.total_h);
+        let min_x = i64::from(self.layout_min_x).min(i64::from(ox));
+        let min_y = i64::from(self.layout_min_y).min(i64::from(oy));
+        let max_x = current_max_x.max(i64::from(ox) + i64::from(width));
+        let max_y = current_max_y.max(i64::from(oy) + i64::from(height));
+        self.layout_min_x = min_x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        self.layout_min_y = min_y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+        self.total_w = (max_x - min_x).clamp(1, i64::from(u32::MAX)) as u32;
+        self.total_h = (max_y - min_y).clamp(1, i64::from(u32::MAX)) as u32;
         log::info!(
-            "Input: stream mapped to '{}' {}x{} at ({},{}) — total extent {}x{}",
+            "Input: stream mapped to '{}' {}x{} at ({},{}) — layout origin ({},{}) extent {}x{}",
             output_name,
             width,
             height,
             ox,
             oy,
+            self.layout_min_x,
+            self.layout_min_y,
             self.total_w,
             self.total_h,
+        );
+    }
+
+    fn set_output_layout(&mut self, outputs: &[OutputGeometry]) {
+        self.outputs = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                (
+                    index as u32,
+                    OutputInfo {
+                        name: output.name.clone(),
+                        x: output.x,
+                        y: output.y,
+                        width: output.width,
+                        height: output.height,
+                    },
+                )
+            })
+            .collect();
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(self.outputs.values());
+        self.layout_min_x = min_x;
+        self.layout_min_y = min_y;
+        self.total_w = total_w;
+        self.total_h = total_h;
+
+        // Capture and input must choose the same fallback. Both use the first
+        // output in the freshly published topology when the selected name is
+        // gone; HashMap iteration order must never decide the target.
+        let selected = refreshed_stream_output(&self.outputs, &self.stream_output_name);
+        if let Some(output) = selected {
+            if output.name != self.stream_output_name {
+                log::warn!(
+                    "Input: mapped output '{}' disappeared; falling back to '{}'",
+                    self.stream_output_name,
+                    output.name
+                );
+                self.stream_output_name = output.name.clone();
+            }
+            self.stream_output_x = output.x;
+            self.stream_output_y = output.y;
+            self.stream_output_w = output.width;
+            self.stream_output_h = output.height;
+        } else {
+            // Do not keep mapping input to geometry for an output that no
+            // longer exists. The default bounds keep any in-flight absolute
+            // event finite until a replacement topology arrives.
+            self.stream_output_name.clear();
+            self.stream_output_x = 0;
+            self.stream_output_y = 0;
+            self.stream_output_w = self.total_w;
+            self.stream_output_h = self.total_h;
+        }
+        log::info!(
+            "Input: refreshed output topology ({} outputs), layout origin ({},{}) extent {}x{}",
+            outputs.len(),
+            self.layout_min_x,
+            self.layout_min_y,
+            self.total_w,
+            self.total_h
         );
     }
 
@@ -310,13 +511,49 @@ impl InputBackend for WaylandInput {
     }
 
     fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64) {
-        // Map normalized stream coords to global compositor pixel coords.
-        let global_x = self.stream_output_x as f64 + x_norm * self.stream_output_w as f64;
-        let global_y = self.stream_output_y as f64 + y_norm * self.stream_output_h as f64;
-        let abs_x = global_x as u32;
-        let abs_y = global_y as u32;
+        if self.pointer_is_output_bound {
+            let (x, y) = absolute_position_in_output(
+                self.stream_output_w,
+                self.stream_output_h,
+                x_norm,
+                y_norm,
+            );
+            log::debug!(
+                "Input: abs norm=({:.3},{:.3}) -> output-local=({},{}) extent={}x{} output='{}'",
+                x_norm,
+                y_norm,
+                x,
+                y,
+                self.stream_output_w,
+                self.stream_output_h,
+                self.stream_output_name
+            );
+            self.virtual_pointer.motion_absolute(
+                time,
+                x,
+                y,
+                self.stream_output_w,
+                self.stream_output_h,
+            );
+            self.virtual_pointer.frame();
+            return;
+        }
+        // Translate signed global compositor coordinates into the unsigned
+        // layout coordinate space required by wlr-virtual-pointer.
+        let (abs_x, abs_y) = absolute_position_in_layout(
+            self.layout_min_x,
+            self.layout_min_y,
+            self.total_w,
+            self.total_h,
+            self.stream_output_x,
+            self.stream_output_y,
+            self.stream_output_w,
+            self.stream_output_h,
+            x_norm,
+            y_norm,
+        );
         log::debug!(
-            "Input: abs norm=({:.3},{:.3}) -> global=({},{}) extent={}x{} output_offset=({},{})",
+            "Input: abs norm=({:.3},{:.3}) -> layout=({},{}) extent={}x{} output_offset=({},{}) layout_origin=({},{})",
             x_norm,
             y_norm,
             abs_x,
@@ -324,7 +561,9 @@ impl InputBackend for WaylandInput {
             self.total_w,
             self.total_h,
             self.stream_output_x,
-            self.stream_output_y
+            self.stream_output_y,
+            self.layout_min_x,
+            self.layout_min_y
         );
         self.virtual_pointer.motion_absolute(time, abs_x, abs_y, self.total_w, self.total_h);
         self.virtual_pointer.frame();
@@ -622,6 +861,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputWaylandState {
                 "wl_output" => {
                     let output =
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
+                    state.output_objects.insert(output.id().protocol_id(), output.clone());
                     // Request xdg_output for this wl_output to get logical position.
                     if let Some(mgr) = &state.xdg_output_manager {
                         let wl_id = output.id().protocol_id();
@@ -690,27 +930,28 @@ impl Dispatch<wl_output::WlOutput, ()> for InputWaylandState {
                             info.y
                         );
                         state.outputs.insert(oid, info);
-                        // Recompute total extent so late-arriving outputs (HEADLESS, hotplug) are included.
-                        let new_w = state
-                            .outputs
-                            .values()
-                            .map(|o| (o.x as u32).saturating_add(o.width))
-                            .max()
-                            .unwrap_or(state.total_w);
-                        let new_h = state
-                            .outputs
-                            .values()
-                            .map(|o| (o.y as u32).saturating_add(o.height))
-                            .max()
-                            .unwrap_or(state.total_h);
-                        if new_w != state.total_w || new_h != state.total_h {
+                        // Recompute signed bounds so late-arriving outputs
+                        // (HEADLESS/hotplug) can extend left or above origin.
+                        let (min_x, min_y, new_w, new_h) =
+                            output_layout_bounds(state.outputs.values());
+                        if min_x != state.layout_min_x
+                            || min_y != state.layout_min_y
+                            || new_w != state.total_w
+                            || new_h != state.total_h
+                        {
                             log::info!(
-                                "Input: compositor extent updated {}x{} → {}x{}",
+                                "Input: compositor bounds updated ({},{}) {}x{} → ({},{}) {}x{}",
+                                state.layout_min_x,
+                                state.layout_min_y,
                                 state.total_w,
                                 state.total_h,
+                                min_x,
+                                min_y,
                                 new_w,
                                 new_h
                             );
+                            state.layout_min_x = min_x;
+                            state.layout_min_y = min_y;
                             state.total_w = new_w;
                             state.total_h = new_h;
                         }
@@ -754,6 +995,13 @@ impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for InputWaylandState {
             }
             _ => {}
         }
+        // xdg-output supplies the authoritative logical position/size after
+        // wl_output::Done, so every correction must refresh the signed bounds.
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(state.outputs.values());
+        state.layout_min_x = min_x;
+        state.layout_min_y = min_y;
+        state.total_w = total_w;
+        state.total_h = total_h;
     }
 }
 
@@ -763,3 +1011,192 @@ delegate_noop!(InputWaylandState: ignore zwlr_virtual_pointer_v1::ZwlrVirtualPoi
 delegate_noop!(InputWaylandState: ignore zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1);
 delegate_noop!(InputWaylandState: ignore zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1);
 delegate_noop!(InputWaylandState: ignore zxdg_output_manager_v1::ZxdgOutputManagerV1);
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+
+    fn output(x: i32, y: i32, width: u32, height: u32) -> OutputInfo {
+        OutputInfo { x, y, width, height, ..OutputInfo::default() }
+    }
+
+    #[test]
+    fn topology_refresh_preserves_name_or_uses_published_first_output() {
+        let outputs = HashMap::from([
+            (1, OutputInfo { name: "alpha".into(), ..output(100, 0, 800, 600) }),
+            (0, OutputInfo { name: "zeta".into(), ..output(0, 0, 100, 100) }),
+        ]);
+
+        assert_eq!(refreshed_stream_output(&outputs, "alpha").unwrap().name, "alpha");
+        assert_eq!(refreshed_stream_output(&outputs, "deleted").unwrap().name, "zeta");
+        assert!(refreshed_stream_output(&HashMap::new(), "deleted").is_none());
+    }
+
+    #[test]
+    fn unknown_virtual_output_uses_reported_origin_not_same_sized_primary() {
+        // Both displays are 1920x1080. Selecting by dimensions would map this
+        // event to eDP-1 instead of the selected HEADLESS-2 output.
+        let outputs =
+            HashMap::from([(1, OutputInfo { name: "eDP-1".into(), ..output(0, 0, 1920, 1080) })]);
+
+        assert_eq!(
+            stream_output_origin(&outputs, "HEADLESS-2", Some(1920), Some(-240)),
+            (1920, -240)
+        );
+    }
+
+    #[test]
+    fn known_output_position_overrides_capture_fallback() {
+        let outputs = HashMap::from([(
+            9,
+            OutputInfo { name: "HEADLESS-2".into(), ..output(-1600, 80, 1920, 1080) },
+        )]);
+
+        assert_eq!(stream_output_origin(&outputs, "HEADLESS-2", Some(0), Some(0)), (-1600, 80));
+    }
+
+    #[test]
+    fn output_bound_absolute_pointer_uses_only_the_selected_screen_extent() {
+        // The virtual output starts at x=1920 in a 3840px-wide layout. An
+        // output-bound pointer must receive local coordinates, not 2880/3840.
+        assert_eq!(absolute_position_in_output(1920, 1080, 0.5, 0.5), (960, 540));
+        assert_eq!(absolute_position_in_output(1920, 1080, -1.0, 2.0), (0, 1080));
+    }
+
+    #[test]
+    fn positive_origin_layout_maps_second_output_corners_and_center() {
+        let outputs = [output(0, 0, 1920, 1080), output(1920, 0, 2560, 1440)];
+        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+
+        assert_eq!((min_x, min_y, width, height), (0, 0, 4480, 1440));
+        assert_eq!(
+            absolute_position_in_layout(min_x, min_y, width, height, 1920, 0, 2560, 1440, 0.0, 0.0),
+            (1920, 0)
+        );
+        assert_eq!(
+            absolute_position_in_layout(min_x, min_y, width, height, 1920, 0, 2560, 1440, 0.5, 0.5),
+            (3200, 720)
+        );
+        assert_eq!(
+            absolute_position_in_layout(min_x, min_y, width, height, 1920, 0, 2560, 1440, 1.0, 1.0),
+            (4480, 1440)
+        );
+    }
+
+    #[test]
+    fn negative_left_output_is_translated_into_unsigned_layout_space() {
+        let outputs = [output(-1280, 56, 1280, 1024), output(0, 0, 1920, 1080)];
+        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+
+        assert_eq!((min_x, min_y, width, height), (-1280, 0, 3200, 1080));
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, -1280, 56, 1280, 1024, 0.0, 0.0
+            ),
+            (0, 56)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, -1280, 56, 1280, 1024, 0.5, 0.5
+            ),
+            (640, 568)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, -1280, 56, 1280, 1024, 1.0, 1.0
+            ),
+            (1280, 1080)
+        );
+    }
+
+    #[test]
+    fn output_above_primary_translates_negative_y() {
+        let outputs = [output(320, -900, 1600, 900), output(0, 0, 1920, 1080)];
+        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+
+        assert_eq!((min_x, min_y, width, height), (0, -900, 1920, 1980));
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, 320, -900, 1600, 900, 0.0, 0.0
+            ),
+            (320, 0)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, 320, -900, 1600, 900, 0.5, 0.5
+            ),
+            (1120, 450)
+        );
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x, min_y, width, height, 320, -900, 1600, 900, 1.0, 1.0
+            ),
+            (1920, 900)
+        );
+    }
+
+    #[test]
+    fn normalized_coordinates_are_clamped_to_streamed_output() {
+        assert_eq!(
+            absolute_position_in_layout(0, 0, 1920, 1080, 0, 0, 1920, 1080, -1.0, 2.0),
+            (0, 1080)
+        );
+        assert_eq!(
+            absolute_position_in_layout(0, 0, 1920, 1080, 0, 0, 1920, 1080, 0.5, 0.5),
+            (960, 540)
+        );
+    }
+
+    #[test]
+    fn removing_virtual_output_shrinks_refreshed_layout() {
+        let with_virtual = [output(0, 0, 1920, 1080), output(1920, 0, 1080, 2340)];
+        let after_removal = [output(0, 0, 1920, 1080)];
+
+        assert_eq!(output_layout_bounds(with_virtual.iter()), (0, 0, 3000, 2340));
+        assert_eq!(output_layout_bounds(after_removal.iter()), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn absolute_mapping_is_bounded_for_representative_hotplug_layouts() {
+        let layouts = [
+            vec![output(0, 0, 1920, 1080)],
+            vec![output(-2560, -200, 2560, 1440), output(0, 0, 1920, 1080)],
+            vec![output(0, 0, 1920, 1080), output(1920, 60, 1080, 2340)],
+        ];
+        let normalized = [-10.0, -0.01, 0.0, 0.25, 0.5, 1.0, 1.01, 10.0];
+
+        for outputs in layouts {
+            let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
+            for streamed in &outputs {
+                for x in normalized {
+                    for y in normalized {
+                        let (mapped_x, mapped_y) = absolute_position_in_layout(
+                            min_x,
+                            min_y,
+                            width,
+                            height,
+                            streamed.x,
+                            streamed.y,
+                            streamed.width,
+                            streamed.height,
+                            x,
+                            y,
+                        );
+                        assert!(mapped_x <= width);
+                        assert!(mapped_y <= height);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_valid_geometry_cannot_overflow_layout_bounds() {
+        let outputs = [
+            output(i32::MIN, i32::MIN, u32::MAX, u32::MAX),
+            output(i32::MAX, i32::MAX, u32::MAX, u32::MAX),
+        ];
+
+        assert_eq!(output_layout_bounds(outputs.iter()), (i32::MIN, i32::MIN, u32::MAX, u32::MAX));
+    }
+}

@@ -75,6 +75,8 @@ pub enum FrameError {
     InvalidFragments,
     #[error("frame exceeds the {0}-byte limit")]
     TooLarge(usize),
+    #[error("datagram limit {0} cannot contain the fixed frame header and payload")]
+    DatagramLimitTooSmall(usize),
 }
 
 impl FrameHeader {
@@ -203,6 +205,35 @@ pub fn fragment_frame_with_flags(
     codec_config_id: u64,
     frame: &[u8],
 ) -> Result<Vec<Bytes>, FrameError> {
+    fragment_frame_with_flags_and_limit(
+        kind,
+        flags,
+        capability_session_id,
+        flow_id,
+        sequence,
+        presentation_time_us,
+        codec_config_id,
+        frame,
+        FRAME_DATAGRAM_BYTES,
+    )
+}
+
+/// Split one access unit with a peer's application datagram limit.
+///
+/// The result still uses one shared arena and `Bytes` slices. This keeps the
+/// negotiated-limit path allocation-equivalent to the normal sender path.
+#[allow(clippy::too_many_arguments)]
+pub fn fragment_frame_with_flags_and_limit(
+    kind: u8,
+    flags: u16,
+    capability_session_id: u64,
+    flow_id: u64,
+    sequence: u64,
+    presentation_time_us: u64,
+    codec_config_id: u64,
+    frame: &[u8],
+    datagram_limit: usize,
+) -> Result<Vec<Bytes>, FrameError> {
     if !matches!(kind, FRAME_KIND_SCREEN | FRAME_KIND_CAMERA) {
         return Err(FrameError::InvalidKind(kind));
     }
@@ -212,11 +243,14 @@ pub fn fragment_frame_with_flags(
     if frame.len() > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(MAX_FRAME_BYTES));
     }
-    let count = frame.len().div_ceil(FRAME_PAYLOAD_BYTES);
+    let datagram_bytes = datagram_limit.min(FRAME_DATAGRAM_BYTES);
+    let payload_bytes = datagram_bytes
+        .checked_sub(FRAME_HEADER_BYTES)
+        .filter(|payload_bytes| *payload_bytes > 0)
+        .ok_or(FrameError::DatagramLimitTooSmall(datagram_limit))?;
+    let count = frame.len().div_ceil(payload_bytes);
     if count > MAX_FRAME_FRAGMENTS {
-        return Err(FrameError::TooLarge(
-            MAX_FRAME_FRAGMENTS * FRAME_PAYLOAD_BYTES,
-        ));
+        return Err(FrameError::TooLarge(MAX_FRAME_FRAGMENTS * payload_bytes));
     }
     let count = count as u16;
     // Pack every fragment into a single arena, then hand out zero-copy slice
@@ -224,7 +258,7 @@ pub fn fragment_frame_with_flags(
     // so the arena is freed only after the last fragment leaves the queue.
     let mut arena = Vec::with_capacity(frame.len() + usize::from(count) * FRAME_HEADER_BYTES);
     let mut packets = Vec::with_capacity(usize::from(count));
-    for (index, payload) in frame.chunks(FRAME_PAYLOAD_BYTES).enumerate() {
+    for (index, payload) in frame.chunks(payload_bytes).enumerate() {
         let start = arena.len();
         FrameHeader {
             kind,
@@ -899,6 +933,84 @@ mod tests {
             rebuilt.extend_from_slice(payload);
         }
         assert_eq!(rebuilt, frame);
+    }
+
+    #[test]
+    fn negotiated_datagram_limit_bounds_every_packet_and_preserves_frame() {
+        for limit in [53, 54, 127, 128, 255, 256, 1_085, 1_097, 1_100, 1_200] {
+            let payload_limit = limit.min(FRAME_DATAGRAM_BYTES) - FRAME_HEADER_BYTES;
+            for frame_len in [
+                1,
+                payload_limit,
+                payload_limit + 1,
+                payload_limit * 2,
+                payload_limit * 2 + 1,
+            ] {
+                let frame = (0..frame_len)
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<_>>();
+                let packets = fragment_frame_with_flags_and_limit(
+                    FRAME_KIND_SCREEN,
+                    FLAG_KEYFRAME,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    &frame,
+                    limit,
+                )
+                .unwrap();
+
+                let expected_count = (frame_len + payload_limit - 1) / payload_limit;
+                assert_eq!(
+                    packets.len(),
+                    expected_count,
+                    "limit={limit} frame={frame_len}"
+                );
+                assert!(packets.iter().all(|packet| packet.len() <= limit));
+                let rebuilt = packets
+                    .iter()
+                    .flat_map(|packet| &packet[FRAME_HEADER_BYTES..])
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_eq!(rebuilt, frame, "limit={limit} frame={frame_len}");
+            }
+        }
+    }
+
+    #[test]
+    fn negotiated_datagram_limit_requires_room_for_payload() {
+        for limit in [0, FRAME_HEADER_BYTES - 1, FRAME_HEADER_BYTES] {
+            assert_eq!(
+                fragment_frame_with_flags_and_limit(
+                    FRAME_KIND_SCREEN,
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    &[9],
+                    limit,
+                ),
+                Err(FrameError::DatagramLimitTooSmall(limit))
+            );
+        }
+
+        let packet = fragment_frame_with_flags_and_limit(
+            FRAME_KIND_SCREEN,
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            &[9],
+            FRAME_HEADER_BYTES + 1,
+        )
+        .unwrap();
+        assert_eq!(packet[0].len(), FRAME_HEADER_BYTES + 1);
     }
 
     #[test]
