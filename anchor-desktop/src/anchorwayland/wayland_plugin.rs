@@ -288,17 +288,15 @@ impl Plugin for AnchorPluginWayland {
                                         Some("select_output") => {
                                             if let Some(idx) =
                                                 json.get("index").and_then(|v| v.as_u64())
-                                            {
-                                                if let Some(output) =
+                                                && let Some(output) =
                                                     last_output_list.get(idx as usize)
-                                                {
-                                                    selected_output_index = idx as usize;
-                                                    selected_output_name = output.name.clone();
-                                                    log::info!(
-                                                        "select_output({}) from phone (idle)",
-                                                        idx
-                                                    );
-                                                }
+                                            {
+                                                selected_output_index = idx as usize;
+                                                selected_output_name = output.name.clone();
+                                                log::info!(
+                                                    "select_output({}) from phone (idle)",
+                                                    idx
+                                                );
                                             }
                                         }
                                         _ => {}
