@@ -107,6 +107,7 @@ fn output_layout_bounds<'a>(outputs: impl Iterator<Item = &'a OutputInfo>) -> (i
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn absolute_position_in_layout(
     layout_min_x: i32,
     layout_min_y: i32,
