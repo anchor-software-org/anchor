@@ -1,0 +1,2 @@
+[env]
+FFMPEG_SYS_NEXT_CONFIGURE_ARGS = "--disable-everything --enable-decoder=h264 --enable-parser=h264 --enable-encoder=libx264 --enable-encoder=h264_vaapi --enable-filter=buffer --enable-filter=buffersink --enable-filter=scale_vaapi"
