@@ -10,6 +10,11 @@ public struct AnchorVideoFrameHeader: Equatable {
     public static let maxFrameBytes = 8 * 1024 * 1024
     public static let screenKind: UInt8 = 1
     public static let cameraKind: UInt8 = 2
+    /// XOR redundancy for datagram fragments. Parity uses wire version 2 so
+    /// older receivers reject it rather than apply the wrong grouping rule.
+    public static let parityKind: UInt8 = 3
+    public static let parityWireVersion: UInt8 = 2
+    public static let parityGroupFragments = 16
     public static let keyframeFlag: UInt16 = 1
     public static let codecConfigFlag: UInt16 = 2
 
@@ -22,11 +27,12 @@ public struct AnchorVideoFrameHeader: Equatable {
     public let fragmentCount: UInt16
     public let presentationTimeUs: UInt64
     public let codecConfigID: UInt64
+    public let wireVersion: UInt8
 
     public init(kind: UInt8, flags: UInt16, capabilitySessionID: UInt64,
                 flowID: UInt64, sequence: UInt64, fragmentIndex: UInt16,
                 fragmentCount: UInt16, presentationTimeUs: UInt64,
-                codecConfigID: UInt64) {
+                codecConfigID: UInt64, wireVersion: UInt8 = 1) {
         self.kind = kind
         self.flags = flags
         self.capabilitySessionID = capabilitySessionID
@@ -36,6 +42,7 @@ public struct AnchorVideoFrameHeader: Equatable {
         self.fragmentCount = fragmentCount
         self.presentationTimeUs = presentationTimeUs
         self.codecConfigID = codecConfigID
+        self.wireVersion = wireVersion
     }
 }
 
@@ -80,6 +87,63 @@ public enum AnchorVideoFrameCodec {
         }
     }
 
+    /// Append interleaved XOR parity packets to a normal datagram frame.
+    ///
+    /// Each parity packet rebuilds exactly one lost fragment in its group. It
+    /// is emitted after data packets, so receivers without parity support can
+    /// discard it without affecting normal reassembly.
+    public static func fragmentWithParity(
+        kind: UInt8,
+        flags: UInt16 = 0,
+        capabilitySessionID: UInt64,
+        flowID: UInt64,
+        sequence: UInt64,
+        presentationTimeUs: UInt64,
+        codecConfigID: UInt64,
+        payload: Data
+    ) throws -> [Data] {
+        let packets = try fragment(
+            kind: kind,
+            flags: flags,
+            capabilitySessionID: capabilitySessionID,
+            flowID: flowID,
+            sequence: sequence,
+            presentationTimeUs: presentationTimeUs,
+            codecConfigID: codecConfigID,
+            payload: payload
+        )
+        let groupCount = (packets.count + AnchorVideoFrameHeader.parityGroupFragments - 1)
+            / AnchorVideoFrameHeader.parityGroupFragments
+        var result = packets
+        for group in 0..<groupCount {
+            var xorPayload = Data(repeating: 0, count: AnchorVideoFrameHeader.payloadBytes)
+            var lengthXor: UInt16 = 0
+            for index in stride(from: group, to: packets.count, by: groupCount) {
+                let packet = try decodeValidated(packets[index])
+                lengthXor ^= UInt16(packet.payload.count)
+                for offset in packet.payload.indices {
+                    xorPayload[offset] ^= packet.payload[offset]
+                }
+            }
+            result.append(encode(
+                header: AnchorVideoFrameHeader(
+                    kind: AnchorVideoFrameHeader.parityKind,
+                    flags: lengthXor,
+                    capabilitySessionID: capabilitySessionID,
+                    flowID: flowID,
+                    sequence: sequence,
+                    fragmentIndex: UInt16(group),
+                    fragmentCount: UInt16(packets.count),
+                    presentationTimeUs: presentationTimeUs,
+                    codecConfigID: codecConfigID,
+                    wireVersion: AnchorVideoFrameHeader.parityWireVersion
+                ),
+                payload: xorPayload
+            ))
+        }
+        return result
+    }
+
     public static func decode(_ datagram: Data) -> AnchorVideoFramePacket? {
         try? decodeValidated(datagram)
     }
@@ -91,11 +155,16 @@ public enum AnchorVideoFrameCodec {
             throw AnchorWireError.invalidFrameMagic
         }
         guard packet.prefix(4) == magic else { throw AnchorWireError.invalidFrameMagic }
-        guard packet[4] == version else {
-            throw AnchorWireError.unsupportedFrameVersion(packet[4])
-        }
         let kind = packet[5]
-        guard kind == AnchorVideoFrameHeader.screenKind || kind == AnchorVideoFrameHeader.cameraKind else {
+        let wireVersion = packet[4]
+        let validMediaPacket = wireVersion == version &&
+            (kind == AnchorVideoFrameHeader.screenKind || kind == AnchorVideoFrameHeader.cameraKind)
+        let validParityPacket = wireVersion == AnchorVideoFrameHeader.parityWireVersion &&
+            kind == AnchorVideoFrameHeader.parityKind
+        guard validMediaPacket || validParityPacket else {
+            if wireVersion != version && wireVersion != AnchorVideoFrameHeader.parityWireVersion {
+                throw AnchorWireError.unsupportedFrameVersion(wireVersion)
+            }
             throw AnchorWireError.invalidFrameKind(kind)
         }
         let fragmentIndex = readUInt16(packet, at: 32)
@@ -112,7 +181,8 @@ public enum AnchorVideoFrameCodec {
             fragmentIndex: fragmentIndex,
             fragmentCount: fragmentCount,
             presentationTimeUs: readUInt64(packet, at: 36),
-            codecConfigID: readUInt64(packet, at: 44)
+            codecConfigID: readUInt64(packet, at: 44),
+            wireVersion: wireVersion
         )
         return AnchorVideoFramePacket(
             header: header,
@@ -122,7 +192,7 @@ public enum AnchorVideoFrameCodec {
 
     private static func encode(header: AnchorVideoFrameHeader, payload: Data) -> Data {
         var result = magic
-        result.append(version)
+        result.append(header.wireVersion)
         result.append(header.kind)
         appendUInt16(header.flags, to: &result)
         appendUInt64(header.capabilitySessionID, to: &result)
@@ -310,7 +380,13 @@ public struct AnchorScreenDatagramAssembler {
         }
     }
 
+    private struct ParityPacket {
+        let header: AnchorVideoFrameHeader
+        let payload: Data
+    }
+
     private var pending: [UInt64: PendingFrame] = [:]
+    private var parityPackets: [UInt64: [UInt16: ParityPacket]] = [:]
     private var retainedBytes = 0
     private var lastDeliveredSequence: UInt64?
     private var waitingForKeyframe = true
@@ -333,8 +409,7 @@ public struct AnchorScreenDatagramAssembler {
     ) throws -> [AnchorVideoFrame] {
         let packet = try AnchorVideoFrameCodec.decodeValidated(bytes)
         let header = packet.header
-        guard header.kind == AnchorVideoFrameHeader.screenKind,
-              header.capabilitySessionID == capabilitySessionID,
+        guard header.capabilitySessionID == capabilitySessionID,
               header.flowID == flowID else {
             throw AnchorWireError.frameBindingMismatch
         }
@@ -343,6 +418,13 @@ public struct AnchorScreenDatagramAssembler {
         }
 
         expireIncompleteFrames(atNanoseconds: now)
+
+        if header.kind == AnchorVideoFrameHeader.parityKind {
+            return try consumeParity(packet, atNanoseconds: now)
+        }
+        guard header.kind == AnchorVideoFrameHeader.screenKind else {
+            throw AnchorWireError.frameBindingMismatch
+        }
 
         if let lastDeliveredSequence, header.sequence <= lastDeliveredSequence {
             return []
@@ -391,6 +473,7 @@ public struct AnchorScreenDatagramAssembler {
             current.completedAtNanoseconds = now
         }
         pending[header.sequence] = current
+        recoverOneLostFragment(sequence: header.sequence, atNanoseconds: now)
         return drainCompletedFrames(atNanoseconds: now)
     }
 
@@ -473,6 +556,79 @@ public struct AnchorScreenDatagramAssembler {
         return AnchorVideoFrame(header: canonicalHeader, payload: payload)
     }
 
+    private mutating func consumeParity(
+        _ packet: AnchorVideoFramePacket,
+        atNanoseconds now: UInt64
+    ) throws -> [AnchorVideoFrame] {
+        let header = packet.header
+        guard header.wireVersion == AnchorVideoFrameHeader.parityWireVersion,
+              packet.payload.count == AnchorVideoFrameHeader.payloadBytes else {
+            throw AnchorWireError.invalidFrameFragments
+        }
+        // Desktop sends data before parity. Ignoring an orphan packet keeps a
+        // hostile or stale sequence from retaining memory.
+        guard pending[header.sequence] != nil else { return [] }
+        let groupCount = (Int(header.fragmentCount) + AnchorVideoFrameHeader.parityGroupFragments - 1)
+            / AnchorVideoFrameHeader.parityGroupFragments
+        guard Int(header.fragmentIndex) < groupCount else {
+            throw AnchorWireError.invalidFrameFragments
+        }
+        parityPackets[header.sequence, default: [:]][header.fragmentIndex] = ParityPacket(
+            header: header,
+            payload: packet.payload
+        )
+        recoverOneLostFragment(sequence: header.sequence, atNanoseconds: now)
+        return drainCompletedFrames(atNanoseconds: now)
+    }
+
+    /// Recover one missing fragment in each interleaved XOR parity group.
+    /// Two losses in one group stay incomplete and use normal IDR recovery.
+    private mutating func recoverOneLostFragment(sequence: UInt64, atNanoseconds now: UInt64) {
+        guard var frame = pending[sequence], let groups = parityPackets[sequence] else { return }
+        let groupCount = (frame.fragments.count + AnchorVideoFrameHeader.parityGroupFragments - 1)
+            / AnchorVideoFrameHeader.parityGroupFragments
+
+        for (groupIndex, parity) in groups {
+            guard parity.header.fragmentCount == frame.header.fragmentCount,
+                  parity.header.presentationTimeUs == frame.header.presentationTimeUs,
+                  parity.header.codecConfigID == frame.header.codecConfigID,
+                  Int(groupIndex) < groupCount else { continue }
+            var missingIndex: Int?
+            var recovered = [UInt8](parity.payload)
+            var recoveredLength = parity.header.flags
+            for index in stride(from: Int(groupIndex), to: frame.fragments.count, by: groupCount) {
+                guard let fragment = frame.fragments[index] else {
+                    if missingIndex != nil {
+                        missingIndex = nil
+                        break
+                    }
+                    missingIndex = index
+                    continue
+                }
+                recoveredLength ^= UInt16(fragment.count)
+                for (offset, byte) in fragment.enumerated() {
+                    recovered[offset] ^= byte
+                }
+            }
+            guard let missingIndex,
+                  recoveredLength > 0,
+                  recoveredLength <= AnchorVideoFrameHeader.payloadBytes else { continue }
+            let fragment = Data(recovered.prefix(Int(recoveredLength)))
+            frame.fragments[missingIndex] = fragment
+            frame.receivedCount += 1
+            frame.receivedBytes += fragment.count
+            retainedBytes += fragment.count
+            parityPackets[sequence]?[groupIndex] = nil
+        }
+        if parityPackets[sequence]?.isEmpty == true {
+            parityPackets.removeValue(forKey: sequence)
+        }
+        if frame.isComplete {
+            frame.completedAtNanoseconds = now
+        }
+        pending[sequence] = frame
+    }
+
     private mutating func expireIncompleteFrames(atNanoseconds now: UInt64) {
         if pending.values.contains(where: {
             !$0.isComplete && now >= $0.firstSeenNanoseconds &&
@@ -486,6 +642,7 @@ public struct AnchorScreenDatagramAssembler {
         if let removed = pending.removeValue(forKey: sequence) {
             retainedBytes -= removed.receivedBytes
         }
+        parityPackets.removeValue(forKey: sequence)
     }
 
     private mutating func discardThrough(sequence: UInt64) {
@@ -496,6 +653,7 @@ public struct AnchorScreenDatagramAssembler {
 
     private mutating func enterRecovery() {
         pending.removeAll(keepingCapacity: true)
+        parityPackets.removeAll(keepingCapacity: true)
         retainedBytes = 0
         gapSinceNanoseconds = nil
         waitingForKeyframe = true
@@ -504,6 +662,7 @@ public struct AnchorScreenDatagramAssembler {
 
     public mutating func reset() {
         pending.removeAll(keepingCapacity: true)
+        parityPackets.removeAll(keepingCapacity: true)
         retainedBytes = 0
         lastDeliveredSequence = nil
         waitingForKeyframe = true

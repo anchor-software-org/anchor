@@ -203,6 +203,13 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
         return try await datagrams.receive().content
     }
 
+    public func prepareDatagramReceive() async throws {
+        // Accessing `connection.datagrams` installs the single connection-wide
+        // receive channel. Do this before the control record asks desktop to
+        // emit an IDR; otherwise the initial datagrams can arrive too early.
+        _ = try await resolvedDatagramChannel()
+    }
+
     public func close() {
         stateLock.lock()
         // The modern API ties channel lifetime to its owning references. Drop

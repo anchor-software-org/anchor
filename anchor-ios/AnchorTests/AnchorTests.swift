@@ -236,6 +236,22 @@ final class AnchorTests: XCTestCase {
         )
     }
 
+    func testInitialScreenOutputSkipsZeroSizedEntries() {
+        var stale = ANCHScreenScreenOutput()
+        stale.outputID = "stale"
+        stale.width = 0
+        stale.height = 0
+
+        var usable = ANCHScreenScreenOutput()
+        usable.outputID = "external"
+        usable.width = 2560
+        usable.height = 1440
+
+        XCTAssertEqual(NetworkPlugin.initialScreenOutputID([stale, usable]), "external")
+        XCTAssertEqual(NetworkPlugin.initialScreenOutputID([usable, stale]), "external")
+        XCTAssertNil(NetworkPlugin.initialScreenOutputID([stale]))
+    }
+
     func testOrderedAsyncQueuePreservesButtonEventSubmissionOrder() async {
         let queue = OrderedAsyncQueue()
         let recorded = EventRecorder()
