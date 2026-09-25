@@ -44,7 +44,7 @@ object ScreenProtocol {
         .addRecordTypeUrls(START_TYPE_URL).addRecordTypeUrls(STOP_TYPE_URL)
         .addRecordTypeUrls(SELECT_OUTPUT_TYPE_URL).addRecordTypeUrls(REQUEST_KEYFRAME_TYPE_URL)
         .addRecordTypeUrls(OUTPUT_LIST_TYPE_URL).addRecordTypeUrls(STATUS_TYPE_URL)
-        .addRecordTypeUrls(FRAME_TYPE_URL).setSupportsDatagrams(false).build()
+        .addRecordTypeUrls(FRAME_TYPE_URL).setSupportsDatagrams(true).build()
     fun endpointAdvertisement(): EndpointAdvertisement = EndpointAdvertisement.newBuilder().setEndpointId(ENDPOINT_ID).addCapabilities(advertisement()).build()
     fun encodeStart(maxFps: Int = 0, bitrateKbps: Int = 0, outputId: String = ""): ByteArray = ScreenStart.newBuilder().setMaxFps(maxFps).setTargetBitrateKbps(bitrateKbps).setOutputId(outputId).build().toByteArray()
     fun encodeStop(): ByteArray = ScreenStop.getDefaultInstance().toByteArray()

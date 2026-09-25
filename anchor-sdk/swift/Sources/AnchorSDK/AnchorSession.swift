@@ -41,6 +41,21 @@ public actor AnchorSession {
         try await transport.sendControl(frame)
     }
 
+    /// Sends an ordered batch in one QUIC write. SessionHello and SessionReady
+    /// use this so peers never observe a partial initial handshake batch.
+    public func sendEnvelopes(_ protobufs: [Data]) async throws {
+        var batch = Data()
+        for protobuf in protobufs {
+            if sentPreface {
+                batch.append(try AnchorControlFramer.encode(protobuf))
+            } else {
+                batch.append(try AnchorControlFramer.encodeFirst(protobuf))
+                sentPreface = true
+            }
+        }
+        try await transport.sendControl(batch)
+    }
+
     /// Receive and return the next complete serialized control envelope. QUIC
     /// stream reads may split or coalesce records, so callers must not decode a
     /// single transport callback directly as one protobuf message.
@@ -57,6 +72,13 @@ public actor AnchorSession {
 
     public func receiveDatagram() async throws -> Data {
         try await transport.receiveDatagram()
+    }
+
+    /// Register the receive channel before the peer is asked to send media.
+    /// This avoids losing the initial recovery IDR on transports where channel
+    /// creation also enables inbound datagram delivery.
+    public func prepareDatagramReceive() async throws {
+        try await transport.prepareDatagramReceive()
     }
 
     public func close() {

@@ -45,6 +45,7 @@
     updateCommand,
     type DesktopState,
     type Media,
+    type PairedDevice,
     type SavedCommand,
   } from './lib/anchor';
 
@@ -93,7 +94,8 @@
   let windowFocused = true;
   let previewTimer = 0;
   let virtualDisplayOpen = false;
-  let virtualSizeMode: 'phone' | 'custom' = 'phone';
+  let virtualSizeMode: 'device' | 'custom' = 'device';
+  let virtualDeviceId = '';
   let virtualOrientation: 'portrait' | 'landscape' = 'portrait';
   let virtualScale = 1;
   let virtualWidth = 1920;
@@ -196,6 +198,12 @@
       const shouldScrollLogs = logRenderKey !== '' && logRenderKey !== lastLogRenderKey;
       if (section === 'logs') lastLogRenderKey = logRenderKey;
       desktop = state;
+      const displayDevices = state.devices
+        .filter((device) => device.online && device.displayWidth && device.displayHeight)
+        .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+      if (!displayDevices.some((device) => device.id === virtualDeviceId)) {
+        virtualDeviceId = displayDevices[0]?.id ?? '';
+      }
       appVersion = state.version;
       sectionLoading = false;
       if (section === 'sideboat') schedulePreview();
@@ -357,10 +365,22 @@
     void runAction(() => selectOutput(Number(value)));
   };
 
-  const phoneDisplay = () => desktop?.devices.find((device) => device.online && device.displayWidth && device.displayHeight);
+  const displayDevices = () => (desktop?.devices ?? [])
+    .filter((device) => device.online && device.displayWidth && device.displayHeight)
+    .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+  const selectedDisplayDevice = () => displayDevices().find((device) => device.id === virtualDeviceId);
+  const selectedDisplayDeviceOption = () => {
+    const device = selectedDisplayDevice();
+    return device ? { value: device.id, label: device.name, detail: `${device.displayWidth} × ${device.displayHeight}` } : undefined;
+  };
+  const displayDeviceOption = (device: PairedDevice) => ({
+    value: device.id,
+    label: device.name,
+    detail: `${device.displayWidth} × ${device.displayHeight}`,
+  });
   const virtualDimensions = () => {
     if (virtualSizeMode === 'custom') return { width: Number(virtualWidth), height: Number(virtualHeight) };
-    const display = phoneDisplay();
+    const display = selectedDisplayDevice();
     if (!display) return undefined;
     const shortEdge = Math.min(display.displayWidth!, display.displayHeight!);
     const longEdge = Math.max(display.displayWidth!, display.displayHeight!);
@@ -589,12 +609,24 @@
             {#if virtualDisplayOpen}
               <div class="virtual-display-form">
                 <div class="virtual-mode-buttons" role="group" aria-label="Virtual display size">
-                  <button class:active={virtualSizeMode === 'phone'} disabled={!phoneDisplay()} onclick={() => virtualSizeMode = 'phone'}>Match phone</button>
+                  <button class:active={virtualSizeMode === 'device'} disabled={!selectedDisplayDevice()} onclick={() => virtualSizeMode = 'device'}>Match {selectedDisplayDevice()?.name ?? 'device'}</button>
                   <button class:active={virtualSizeMode === 'custom'} onclick={() => virtualSizeMode = 'custom'}>Custom size</button>
                 </div>
-                {#if virtualSizeMode === 'phone'}
-                  {#if phoneDisplay()}
-                    <div class="virtual-phone-options">
+                {#if virtualSizeMode === 'device'}
+                  {#if selectedDisplayDevice()}
+                    <div class="virtual-device-options">
+                      <div class="virtual-option-row">
+                        <span>Device</span>
+                        <div class="virtual-device-select">
+                          <Select
+                            ariaLabel="Device display to match"
+                            value={virtualDeviceId}
+                            selected={selectedDisplayDeviceOption()}
+                            options={displayDevices().map(displayDeviceOption)}
+                            onselect={(value) => virtualDeviceId = value}
+                          />
+                        </div>
+                      </div>
                       <div class="virtual-option-row">
                         <span>Orientation</span>
                         <div class="virtual-orientation-options" role="group" aria-label="Virtual display orientation">
@@ -612,7 +644,7 @@
                       </div>
                     </div>
                   {:else}
-                    <p class="setting-note">Reconnect the phone after updating Anchor to use its display dimensions. Custom size is available now.</p>
+                    <p class="setting-note">Reconnect a device after updating Anchor to use its display dimensions. Custom size is available now.</p>
                   {/if}
                 {:else}
                   <div class="virtual-custom-size">

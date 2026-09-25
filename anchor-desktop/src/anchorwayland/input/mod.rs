@@ -8,6 +8,15 @@ pub mod wayland;
 
 pub use wayland::WaylandInput;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputGeometry {
+    pub name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Injects pointer and keyboard events into the host system.
 ///
 /// Coordinates for `pointer_motion_absolute` are normalized stream coordinates
@@ -32,6 +41,9 @@ pub trait InputBackend {
         output_x: Option<i32>,
         output_y: Option<i32>,
     );
+
+    /// Replace the compositor topology used for absolute-pointer mapping.
+    fn set_output_layout(&mut self, outputs: &[OutputGeometry]);
 
     fn pointer_motion(&mut self, time: u32, dx: f64, dy: f64);
     fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64);

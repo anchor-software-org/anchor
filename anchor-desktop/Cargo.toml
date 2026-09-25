@@ -52,6 +52,7 @@ notify-rust = "4"
 rfd = "0.15"
 anchor-wl-clipboard = { git = "https://github.com/anchor-software-org/anchor-wl-clipboard", rev = "a76c760f6abc057d04662da8cc9a8bb28f3de13e" }
 anchor-sdk = { path = "../anchor-sdk/rust" }
+anchor-topology-core = { path = "topology-core" }
 prost = "0.14.4"
 bytes = "1"
 quinn = "0.11.9"

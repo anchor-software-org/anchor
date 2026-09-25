@@ -32,6 +32,21 @@ fn frame_sampled(sequence: u64, keyframe: bool) -> bool {
     keyframe || sequence.is_multiple_of(PERIODIC_SAMPLE_FRAMES)
 }
 
+/// Return the media-packet limit negotiated for this QUIC path. The sender's
+/// fixed 1,100-byte packet is only safe when the peer accepts that full size.
+fn negotiated_screen_datagram_limit(limit: Option<usize>) -> Option<usize> {
+    limit
+        .map(|value| value.min(video_frame::FRAME_DATAGRAM_BYTES))
+        .filter(|value| *value > video_frame::FRAME_HEADER_BYTES)
+}
+
+/// XOR parity has a fixed 1,100-byte payload. Do not emit it on a smaller
+/// negotiated path; the media fragments still fit, and avoiding parity is
+/// better than rejecting the whole access unit.
+fn can_use_fixed_size_parity(fec_enabled: bool, datagram_limit: usize) -> bool {
+    fec_enabled && datagram_limit >= video_frame::FRAME_DATAGRAM_BYTES
+}
+
 #[derive(Clone)]
 enum ScreenMessage {
     Outputs(Vec<ScreenOutput>),
@@ -61,8 +76,8 @@ pub struct SdkScreenSender {
     frame_target: Arc<Mutex<Option<FrameTarget>>>,
     keyframe_request: Arc<Mutex<Option<Arc<FrameBroadcaster>>>>,
     last_keyframe_request: Arc<Mutex<Option<Instant>>>,
-    /// Reliable H.264 streams cannot safely skip a predictive access unit:
-    /// every following P-frame references it. Once the replaceable-frame
+    /// H.264 cannot safely skip a predictive access unit on either transport:
+    /// every following P-frame can reference it. Once the replaceable-frame
     /// queue coalesces anything, hold P-frames until the next IDR arrives.
     /// This keeps the receiver from displaying a stale/broken reference chain.
     waiting_for_keyframe: Arc<AtomicBool>,
@@ -291,20 +306,41 @@ impl SdkScreenSender {
         if keyframe {
             self.waiting_for_keyframe.store(false, Ordering::Release);
         }
-        let fragment_result = if self.fec_enabled && matches!(target, FrameTarget::Datagram(_)) {
+        let fragment_result = if let FrameTarget::Datagram(flow) = &target {
+            let Some(datagram_limit) = negotiated_screen_datagram_limit(flow.max_datagram_size())
+            else {
+                log::warn!(
+                    "SDK screen datagram path has no usable peer limit; dropping frame before send"
+                );
+                return false;
+            };
             // Datagrams are lossy — append XOR parity so receivers can rebuild
             // a singly-lost fragment instead of corrupting the whole access
             // unit and stalling until the next keyframe.
-            video_frame::fragment_frame_with_parity(
-                video_frame::FRAME_KIND_SCREEN,
-                flags,
-                self.capability_session_id,
-                flow_id,
-                sequence,
-                timestamp,
-                0,
-                frame,
-            )
+            if can_use_fixed_size_parity(self.fec_enabled, datagram_limit) {
+                video_frame::fragment_frame_with_parity(
+                    video_frame::FRAME_KIND_SCREEN,
+                    flags,
+                    self.capability_session_id,
+                    flow_id,
+                    sequence,
+                    timestamp,
+                    0,
+                    frame,
+                )
+            } else {
+                video_frame::fragment_frame_with_flags_and_limit(
+                    video_frame::FRAME_KIND_SCREEN,
+                    flags,
+                    self.capability_session_id,
+                    flow_id,
+                    sequence,
+                    timestamp,
+                    0,
+                    frame,
+                    datagram_limit,
+                )
+            }
         } else {
             video_frame::fragment_frame_with_flags(
                 video_frame::FRAME_KIND_SCREEN,
@@ -483,7 +519,7 @@ impl SdkScreenSender {
                     // creates an IDR storm and makes the terminal view steadily
                     // worse. Only predictive-frame failures schedule recovery.
                     if should_schedule_keyframe_recovery(keyframe) {
-                        self.request_keyframe_recovery();
+                        self.mark_frame_gap();
                     }
                     log::warn!(
                         "SDK screen datagram send failed (flow={} source_frame_id={} sequence={} bytes={} fragments={} keyframe={} pacing_wait_us={} pacing_percent={} admission_us={} rtt_ms={} cwnd={} lost_packets={} congestion_events={} available={} required={}): {error}",
@@ -768,11 +804,18 @@ impl SdkScreenBinding {
         };
         let subscription_id = frame_subscription_id(&device_id);
         broadcaster.unsubscribe(&subscription_id);
-        let rx = broadcaster.subscribe_traced(subscription_id.clone(), 2);
+        let (rx, queue_gap) = broadcaster.subscribe_traced(subscription_id.clone(), 2);
         thread::Builder::new()
             .name(format!("anchor-sdk-screen-frames-{device_id}"))
             .spawn(move || {
                 while let Ok(mut frame) = rx.recv() {
+                    if queue_gap.swap(false, Ordering::AcqRel) {
+                        // The broadcaster rejected an earlier access unit
+                        // because this viewer fell behind. This gap is not
+                        // visible in ANFR sequence numbers, so recover before
+                        // sending another predictive H.264 frame.
+                        sender.mark_frame_gap();
+                    }
                     let mut coalesced = false;
                     // The screen is replaceable state, not a work queue. If
                     // capture outruns QUIC, discard every buffered older
@@ -830,11 +873,14 @@ impl SdkScreenBinding {
         };
         let subscription_id = frame_subscription_id(&device_id);
         broadcaster.unsubscribe(&subscription_id);
-        let rx = broadcaster.subscribe_traced(subscription_id.clone(), 2);
+        let (rx, queue_gap) = broadcaster.subscribe_traced(subscription_id.clone(), 2);
         thread::Builder::new()
             .name(format!("anchor-sdk-screen-stream-{device_id}"))
             .spawn(move || {
                 while let Ok(mut frame) = rx.recv() {
+                    if queue_gap.swap(false, Ordering::AcqRel) {
+                        sender.mark_frame_gap();
+                    }
                     let mut coalesced = false;
                     while let Ok(newer) = rx.try_recv() {
                         frame = newer;
@@ -949,5 +995,15 @@ mod tests {
         assert!(should_drop_predictive_frame(true, false));
         assert!(!should_drop_predictive_frame(true, true));
         assert!(!should_drop_predictive_frame(false, false));
+    }
+
+    #[test]
+    fn smaller_peer_limit_disables_fixed_size_parity_but_keeps_media_usable() {
+        let smaller = video_frame::FRAME_DATAGRAM_BYTES - 1;
+        assert_eq!(negotiated_screen_datagram_limit(Some(smaller)), Some(smaller));
+        assert!(!can_use_fixed_size_parity(true, smaller));
+        assert!(can_use_fixed_size_parity(true, video_frame::FRAME_DATAGRAM_BYTES));
+        assert_eq!(negotiated_screen_datagram_limit(Some(video_frame::FRAME_HEADER_BYTES)), None);
+        assert_eq!(negotiated_screen_datagram_limit(None), None);
     }
 }

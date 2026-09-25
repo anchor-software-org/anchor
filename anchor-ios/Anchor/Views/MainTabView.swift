@@ -1,7 +1,8 @@
 import SwiftUI
+import AnchorSDK
 
 enum Screen {
-    case main, settings, notifications, remoteInput, sideboat, clipboard
+    case main, settings, notifications, remoteInput, sideboat, clipboard, media, commands, files
 }
 
 private let streamTouchMotionInterval: CFTimeInterval = 1.0 / 30.0
@@ -11,6 +12,41 @@ enum StreamInputMode: String, CaseIterable {
     case pointer = "Pointer"
     case scroll = "Scroll"
     case draw = "Draw"
+}
+
+enum DrawerSwipePolicy {
+    static let maximumStartX: CGFloat = 32
+    static let minimumTravelX: CGFloat = 120
+    static let horizontalDominance: CGFloat = 1.5
+
+    static func shouldOpen(start: CGPoint, translation: CGSize) -> Bool {
+        guard start.x <= maximumStartX,
+              translation.width >= minimumTravelX else { return false }
+        return translation.width >= abs(translation.height) * horizontalDominance
+    }
+}
+
+private struct DrawerSwipeModifier: ViewModifier {
+    let enabled: Bool
+    let onOpen: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.simultaneousGesture(
+                DragGesture(minimumDistance: 24, coordinateSpace: .global)
+                    .onEnded { value in
+                        guard DrawerSwipePolicy.shouldOpen(
+                            start: value.startLocation,
+                            translation: value.translation
+                        ) else { return }
+                        onOpen()
+                    }
+            )
+        } else {
+            content
+        }
+    }
 }
 
 struct MainTabView: View {
@@ -45,71 +81,16 @@ struct MainTabView: View {
                         FullscreenTouchOverlay(viewModel: viewModel, mode: streamInputMode)
                     }
 
-                    // Top bar: exit + mode picker + FPS — single row, no overlap
-                    VStack {
-                        HStack(spacing: 12) {
-                            // Exit button
-                            Button { isFullscreen = false } label: {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 32, height: 32)
-                                    .background(Color.black.opacity(0.5))
-                                    .clipShape(Circle())
-                            }
-
-                            // Mode selector (only when touch input enabled)
-                            if viewModel.touchInputOnStream {
-                                HStack(spacing: 0) {
-                                    ForEach(StreamInputMode.allCases, id: \.self) { mode in
-                                        Button {
-                                            streamInputMode = mode
-                                        } label: {
-                                            Text(mode.rawValue)
-                                                .font(.system(size: 11, weight: streamInputMode == mode ? .semibold : .regular))
-                                                .foregroundColor(streamInputMode == mode ? .white : .white.opacity(0.5))
-                                                .padding(.horizontal, 12)
-                                                .padding(.vertical, 6)
-                                                .background(streamInputMode == mode ? Color.anchorBlue40.opacity(0.5) : Color.clear)
-                                        }
-                                    }
-                                }
-                                .background(Color.black.opacity(0.4))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                            }
-
-                            Spacer()
-
-                            // FPS + latency
-                            if viewModel.videoPlugin.isReceiving {
-                                HStack(spacing: 8) {
-                                    Text("\(viewModel.videoPlugin.fps) fps")
-                                        .font(.system(size: 11, design: .monospaced))
-                                    if viewModel.latencyMs > 0 {
-                                        Text("\(viewModel.latencyMs)ms")
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .foregroundColor(.seaGreen40)
-                                    }
-                                }
-                                .foregroundColor(.white.opacity(0.7))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(Color.black.opacity(0.4))
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.top, 48)
-                        Spacer()
-                    }
+                    FullscreenStreamControls(
+                        videoPlugin: viewModel.videoPlugin,
+                        latencyMs: viewModel.latencyMs,
+                        touchInputEnabled: viewModel.touchInputOnStream,
+                        inputMode: $streamInputMode,
+                        onExit: { isFullscreen = false }
+                    )
                 }
                 .ignoresSafeArea()
                 .statusBarHidden(true)
-                .onTapGesture {
-                    if !viewModel.touchInputOnStream {
-                        isFullscreen = false
-                    }
-                }
             } else {
                 // Drawer + content
                 ZStack(alignment: .leading) {
@@ -138,12 +119,25 @@ struct MainTabView: View {
                 .animation(.easeOut(duration: 0.2), value: showDrawer)
             }
         }
+        .modifier(DrawerSwipeModifier(enabled: drawerSwipeEnabled) {
+            withAnimation(.easeOut(duration: 0.2)) { showDrawer = true }
+        })
         .preferredColorScheme(.dark)
         .sheet(isPresented: Binding(
             get: { if case .requested = viewModel.pairingState { return true }; return false },
             set: { if !$0 { viewModel.respondToPairing(accepted: false) } }
         )) {
             PairingDialogView(viewModel: viewModel)
+        }
+    }
+
+    private var drawerSwipeEnabled: Bool {
+        guard !isFullscreen, !showDrawer else { return false }
+        switch currentScreen {
+        case .remoteInput, .sideboat:
+            return false
+        case .main, .settings, .notifications, .clipboard, .media, .commands, .files:
+            return true
         }
     }
 
@@ -163,11 +157,15 @@ struct MainTabView: View {
             }
         case .notifications:
             ScreenWithTopBar(title: "Notifications", onMenu: { withAnimation(.easeOut(duration: 0.2)) { showDrawer = true } }) {
-                PlaceholderContent(title: "Notifications", icon: "bell.fill")
+                NotificationsView(notificationPlugin: viewModel.notificationPlugin)
             }
         case .remoteInput:
             ScreenWithTopBar(title: "Remote Input", onMenu: { withAnimation(.easeOut(duration: 0.2)) { showDrawer = true } }) {
-                TouchpadView(inputPlugin: viewModel.inputPlugin, sensitivity: viewModel.touchpadSensitivity)
+                TouchpadView(
+                    inputPlugin: viewModel.inputPlugin,
+                    videoPlugin: viewModel.videoPlugin,
+                    sensitivity: viewModel.touchpadSensitivity
+                )
             }
         case .sideboat:
             SideboatScreen(
@@ -179,7 +177,106 @@ struct MainTabView: View {
             ScreenWithTopBar(title: "Clipboard", onMenu: { withAnimation(.easeOut(duration: 0.2)) { showDrawer = true } }) {
                 ClipboardView(clipboardPlugin: viewModel.clipboardPlugin)
             }
+        case .media:
+            ScreenWithTopBar(title: "Media", onMenu: { withAnimation(.easeOut(duration: 0.2)) { showDrawer = true } }) {
+                MediaView(mediaPlugin: viewModel.mediaPlugin)
+            }
+        case .commands:
+            ScreenWithTopBar(title: "Commands", onMenu: { withAnimation(.easeOut(duration: 0.2)) { showDrawer = true } }) {
+                CommandsView(commandsPlugin: viewModel.commandsPlugin)
+            }
+        case .files:
+            ScreenWithTopBar(title: "Files", onMenu: { withAnimation(.easeOut(duration: 0.2)) { showDrawer = true } }) {
+                FilesView(filesPlugin: viewModel.filesPlugin)
+            }
         }
+    }
+}
+
+private struct FullscreenStreamControls: View {
+    @ObservedObject var videoPlugin: VideoPlugin
+    let latencyMs: Int
+    let touchInputEnabled: Bool
+    @Binding var inputMode: StreamInputMode
+    let onExit: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                Button(action: onExit) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 44, height: 44)
+                        .background(Color.black.opacity(0.44))
+                        .overlay {
+                            Rectangle().stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        }
+                        .contentShape(Rectangle())
+                }
+
+                if videoPlugin.availableOutputs.count > 1 {
+                    StreamOutputPicker(videoPlugin: videoPlugin, compact: true)
+                }
+
+                Spacer(minLength: 12)
+
+                if videoPlugin.isReceiving, videoPlugin.fps > 0 {
+                    StreamMetrics(videoPlugin: videoPlugin, latencyMs: latencyMs)
+                        .padding(.horizontal, 8)
+                        .frame(height: 36)
+                        .background(Color.black.opacity(0.44))
+                        .overlay {
+                            Rectangle().stroke(Color.white.opacity(0.14), lineWidth: 1)
+                        }
+                }
+
+                if touchInputEnabled {
+                    StreamInputModePicker(inputMode: $inputMode)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+
+            Spacer()
+        }
+    }
+}
+
+private struct StreamInputModePicker: View {
+    @Binding var inputMode: StreamInputMode
+
+    var body: some View {
+        Menu {
+            ForEach(StreamInputMode.allCases, id: \.self) { mode in
+                Button {
+                    inputMode = mode
+                } label: {
+                    if inputMode == mode {
+                        Label(mode.rawValue, systemImage: "checkmark")
+                    } else {
+                        Text(mode.rawValue)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(inputMode.rawValue)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(.white.opacity(0.78))
+            .padding(.horizontal, 8)
+            .frame(height: 30)
+            .background(Color.black.opacity(0.44))
+            .overlay {
+                Rectangle().stroke(Color.white.opacity(0.14), lineWidth: 1)
+            }
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Stream input mode, \(inputMode.rawValue)")
     }
 }
 
@@ -207,7 +304,10 @@ struct ScreenWithTopBar<Content: View>: View {
             }
             .padding(.top, 52)
             .padding(.bottom, 12)
-            .background(Color.deepOcean)
+            .background(Color.charcoalBlack)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
+            }
 
             content
         }
@@ -226,22 +326,6 @@ struct MainScreen: View {
 
     var isConnected: Bool { viewModel.connectionState.status == .connected }
 
-    var statusColor: Color {
-        switch viewModel.connectionState.status {
-        case .connected: return .seaGreen40
-        case .connecting: return .anchorBlue40
-        case .disconnected: return .coralRed40
-        }
-    }
-
-    var statusText: String {
-        switch viewModel.connectionState.status {
-        case .connected: return "Connected"
-        case .connecting: return "Connecting..."
-        case .disconnected: return "Disconnected"
-        }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             // Top bar
@@ -259,12 +343,6 @@ struct MainScreen: View {
                     .padding(.leading, 8)
 
                 Spacer()
-
-                HStack(spacing: 5) {
-                    Circle().fill(statusColor).frame(width: 6, height: 6)
-                    Text(statusText).font(.system(size: 12)).foregroundColor(statusColor)
-                }
-                .padding(.trailing, 16)
             }
             .padding(.top, 52)
             .padding(.bottom, 12)
@@ -279,9 +357,6 @@ struct MainScreen: View {
                             Text("Connection")
                                 .font(.system(size: 16, weight: .semibold))
                                 .foregroundColor(.offWhite)
-                            Text(UIDevice.current.name)
-                                .font(.system(size: 12))
-                                .foregroundColor(.anchorGray)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
@@ -299,30 +374,31 @@ struct MainScreen: View {
 
                     if isConnected {
                         // Connected card
-                        VStack(spacing: 12) {
-                            HStack(spacing: 12) {
-                                RoundedRectangle(cornerRadius: 10)
-                                    .fill(Color.deepOcean)
-                                    .frame(width: 38, height: 38)
-                                    .overlay(Text("PC").font(.system(size: 11, weight: .bold)).foregroundColor(.white))
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(viewModel.connectionState.host.isEmpty ? "Desktop" : viewModel.connectionState.host)
-                                        .font(.system(size: 14, weight: .medium))
-                                        .foregroundColor(.offWhite)
-                                    Text("Connected")
-                                        .font(.system(size: 11))
-                                        .foregroundColor(.seaGreen40)
-                                }
-                                Spacer()
-                                Circle().fill(Color.seaGreen40).frame(width: 8, height: 8)
+                        HStack(spacing: 12) {
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color.deepOcean)
+                                .frame(width: 38, height: 38)
+                                .overlay(
+                                    Image("MaterialComputer")
+                                        .renderingMode(.template)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 20, height: 20)
+                                        .foregroundColor(.white)
+                                )
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(viewModel.connectionState.host.isEmpty ? "Desktop" : viewModel.connectionState.host)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundColor(.offWhite)
+                                Text("Connected")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.anchorGray)
                             }
-
-                            Button(role: .destructive) { viewModel.disconnect() } label: {
-                                Text("Disconnect")
-                                    .font(.system(size: 13))
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .buttonStyle(.bordered)
+                            Spacer()
+                            Button("Disconnect", role: .destructive) { viewModel.disconnect() }
+                                .font(.system(size: 12, weight: .medium))
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
                         }
                         .padding(14)
                         .background(Color.darkGray.opacity(0.4))
@@ -355,20 +431,17 @@ struct MainScreen: View {
 
                 // Right: Dashboard
                 VStack(spacing: 16) {
-                    // Stats
-                    HStack(spacing: 12) {
-                        StatCard(value: viewModel.videoPlugin.isReceiving ? "\(viewModel.videoPlugin.fps)" : "--", label: "FPS", color: .anchorBlue40)
-                        StatCard(value: viewModel.latencyMs > 0 ? "\(viewModel.latencyMs)ms" : "--", label: "Latency", color: .seaGreen40)
-                    }
-
                     Button(action: onSideboat) {
                         HStack(spacing: 14) {
                             RoundedRectangle(cornerRadius: 12)
                                 .fill(Color.anchorBlue40.opacity(0.15))
                                 .frame(width: 42, height: 42)
                                 .overlay(
-                                    Image(systemName: "ferry.fill")
-                                        .font(.system(size: 18, weight: .semibold))
+                                    Image("AndroidSailboat")
+                                        .renderingMode(.template)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: 20, height: 20)
                                         .foregroundColor(.anchorBlue40)
                                 )
 
@@ -382,6 +455,11 @@ struct MainScreen: View {
                             }
 
                             Spacer()
+
+                            StreamMetrics(
+                                videoPlugin: viewModel.videoPlugin,
+                                latencyMs: viewModel.latencyMs
+                            )
 
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 12, weight: .semibold))
@@ -406,9 +484,6 @@ struct MainScreen: View {
                         } else {
                             ForEach(viewModel.pairedDevices) { device in
                                 HStack(spacing: 10) {
-                                    Circle()
-                                        .fill(device.isOnline ? Color.seaGreen40 : Color.mediumGray)
-                                        .frame(width: 6, height: 6)
                                     VStack(alignment: .leading, spacing: 1) {
                                         Text(device.deviceName)
                                             .font(.system(size: 13))
@@ -436,17 +511,17 @@ struct MainScreen: View {
                     .background(Color.darkGray.opacity(0.4))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
 
-                    // Quick settings
-                    VStack(spacing: 12) {
-                        HStack {
-                            Text("Touch on stream")
-                                .font(.system(size: 13))
-                                .foregroundColor(.offWhite)
-                            Spacer()
-                            Toggle("", isOn: $viewModel.touchInputOnStream)
-                                .labelsHidden()
-                                .scaleEffect(0.8)
-                        }
+                    // Stream status and quick setting share one compact row.
+                    HStack(spacing: 12) {
+                        Text("Touch on stream")
+                            .font(.system(size: 13))
+                            .foregroundColor(.offWhite)
+
+                        Spacer()
+
+                        Toggle("", isOn: $viewModel.touchInputOnStream)
+                            .labelsHidden()
+                            .scaleEffect(0.8)
                     }
                     .padding(14)
                     .background(Color.darkGray.opacity(0.4))
@@ -471,74 +546,13 @@ struct SideboatScreen: View {
     let onFullscreen: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Button(action: onMenu) {
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 20))
-                        .foregroundColor(.anchorGray)
-                }
-                .padding(.leading, 16)
-                Text("Sideboat")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundColor(.offWhite)
-                    .padding(.leading, 12)
-                Spacer()
-            }
-            .padding(.top, 52)
-            .padding(.bottom, 8)
-            .background(Color.deepOcean)
-
-            ZStack {
-                Color.anchorSurface
-
-                VideoDisplayView(videoPlugin: viewModel.videoPlugin)
-
-                if viewModel.videoPlugin.isReceiving {
-                    VStack {
-                        Spacer()
-                        Text("Tap for fullscreen")
-                            .font(.system(size: 12))
-                            .foregroundColor(.anchorBlue40)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 6)
-                            .background(Color.anchorBlue40.opacity(0.15))
-                            .clipShape(RoundedRectangle(cornerRadius: 20))
-                            .padding(.bottom, 12)
-                    }
-                } else if viewModel.connectionState.status == .connected {
-                    VStack(spacing: 12) {
-                        Image(systemName: "tv.slash")
-                            .font(.system(size: 36))
-                            .foregroundColor(.anchorGray.opacity(0.5))
-                        Text("Waiting for stream...")
-                            .font(.system(size: 14))
-                            .foregroundColor(.anchorGray)
-                    }
-                } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "ferry.fill")
-                            .font(.system(size: 36))
-                            .foregroundColor(.anchorGray.opacity(0.5))
-                        Text("Connect a desktop to view stream")
-                            .font(.system(size: 14))
-                            .foregroundColor(.anchorGray)
-                    }
-                }
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { if viewModel.connectionState.status == .connected { onFullscreen() } }
-            .frame(maxHeight: .infinity)
-
-            // Stats bar
-            HStack {
-                StatCard(value: viewModel.videoPlugin.isReceiving ? "\(viewModel.videoPlugin.fps)" : "--", label: "FPS", color: .anchorBlue40)
-                StatCard(value: viewModel.latencyMs > 0 ? "\(viewModel.latencyMs)ms" : "--", label: "Latency", color: .seaGreen40)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-        }
-        .background(Color.charcoalBlack)
+        SideboatStreamSurface(
+            videoPlugin: viewModel.videoPlugin,
+            connectionStatus: viewModel.connectionState.status,
+            latencyMs: viewModel.latencyMs,
+            onMenu: onMenu,
+            onFullscreen: onFullscreen
+        )
         .ignoresSafeArea(edges: .top)
         .onAppear {
             viewModel.ensureAutoConnect()
@@ -546,10 +560,197 @@ struct SideboatScreen: View {
     }
 }
 
+/// Owns observation of the video plugin so frame state and FPS updates redraw the
+/// stream UI independently of unrelated MainViewModel changes.
+private struct SideboatStreamSurface: View {
+    @ObservedObject var videoPlugin: VideoPlugin
+    let connectionStatus: ConnectionStatus
+    let latencyMs: Int
+    let onMenu: () -> Void
+    let onFullscreen: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+
+            Rectangle()
+                .fill(Color.white.opacity(0.09))
+                .frame(height: 1)
+
+            ZStack {
+                Color.black
+
+                VideoDisplayView(videoPlugin: videoPlugin)
+
+                if !videoPlugin.isReceiving {
+                    streamPlaceholder
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if connectionStatus == .connected, videoPlugin.isReceiving {
+                    onFullscreen()
+                }
+            }
+        }
+        .background(Color.charcoalBlack)
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Button(action: onMenu) {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.white)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Sideboat")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.white)
+                if videoPlugin.availableOutputs.count > 1 {
+                    StreamOutputPicker(videoPlugin: videoPlugin, compact: false)
+                } else {
+                    Text(videoPlugin.availableOutputs.first?.name ?? "Desktop display")
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.46))
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            if videoPlugin.isReceiving {
+                StreamMetrics(videoPlugin: videoPlugin, latencyMs: latencyMs)
+            }
+
+            Button(action: onFullscreen) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(videoPlugin.isReceiving ? .white : .white.opacity(0.35))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .disabled(!videoPlugin.isReceiving)
+        }
+        .padding(.horizontal, 8)
+        .padding(.top, 48)
+        .padding(.bottom, 8)
+        .background(Color.charcoalBlack)
+    }
+
+    @ViewBuilder
+    private var streamPlaceholder: some View {
+        if connectionStatus == .connected {
+            VStack(spacing: 10) {
+                ProgressView()
+                    .tint(.white.opacity(0.7))
+                Text("Waiting for desktop video")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white.opacity(0.7))
+            }
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "display")
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundColor(.white.opacity(0.38))
+                Text("Connect to a desktop to start Sideboat")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white.opacity(0.58))
+            }
+        }
+    }
+}
+
+private struct StreamOutputPicker: View {
+    @ObservedObject var videoPlugin: VideoPlugin
+    let compact: Bool
+    @State private var isPresentingOutputPicker = false
+
+    private var selectedName: String {
+        videoPlugin.availableOutputs.first(where: { $0.id == videoPlugin.selectedOutputID })?.name
+            ?? "Choose screen"
+    }
+
+    var body: some View {
+        Button {
+            isPresentingOutputPicker = true
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "display")
+                if !compact {
+                    Text(selectedName)
+                        .lineLimit(1)
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .font(.system(size: compact ? 11 : 10, weight: .medium))
+            .foregroundColor(.white.opacity(compact ? 0.86 : 0.72))
+            .frame(minWidth: 44, minHeight: 36, alignment: .leading)
+            .padding(.horizontal, compact ? 8 : 6)
+            .background(Color.black.opacity(compact ? 0.44 : 0.18))
+            .overlay {
+                Rectangle().stroke(Color.white.opacity(compact ? 0.16 : 0.10), lineWidth: 1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Stream screen, \(selectedName)")
+        .confirmationDialog(
+            "Choose screen",
+            isPresented: $isPresentingOutputPicker,
+            titleVisibility: .visible
+        ) {
+            ForEach(videoPlugin.availableOutputs) { output in
+                Button {
+                    videoPlugin.selectOutput(output.id)
+                } label: {
+                    if output.id == videoPlugin.selectedOutputID {
+                        Label(output.name, systemImage: "checkmark")
+                    } else {
+                        Text(output.name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct StreamMetrics: View {
+    @ObservedObject var videoPlugin: VideoPlugin
+    let latencyMs: Int
+
+    var body: some View {
+        Group {
+            if videoPlugin.isReceiving, videoPlugin.fps > 0 {
+                HStack(spacing: 6) {
+                    Text("\(videoPlugin.fps) FPS")
+                    if latencyMs > 0 {
+                        Text("·")
+                            .foregroundColor(.white.opacity(0.3))
+                        Text("\(latencyMs) ms")
+                    }
+                }
+            }
+        }
+        .font(.system(size: 11, weight: .medium, design: .monospaced))
+        .foregroundColor(.white.opacity(0.68))
+    }
+}
+
 // MARK: - Components
 
 struct SwingingAnchorLogo: View {
-    @State private var swing = false
+    let animateOnAppear: Bool
+    @State private var rotation = 0.0
+    @State private var isSwinging = false
+    @State private var swingTask: Task<Void, Never>?
+
+    init(animateOnAppear: Bool = false) {
+        self.animateOnAppear = animateOnAppear
+    }
 
     var body: some View {
         Image("AnchorLogo")
@@ -557,30 +758,27 @@ struct SwingingAnchorLogo: View {
             .aspectRatio(contentMode: .fit)
             .frame(width: 50, height: 50)
             .opacity(0.15)
-            .rotationEffect(.degrees(swing ? 0 : 20), anchor: UnitPoint(x: 0.25, y: 0.13))
-            .animation(
-                .interpolatingSpring(stiffness: 15, damping: 3)
-                .repeatForever(autoreverses: true),
-                value: swing
-            )
-            .onAppear { swing = true }
+            .rotationEffect(.degrees(rotation), anchor: UnitPoint(x: 0.25, y: 0.13))
+            .contentShape(Rectangle())
+            .onTapGesture { swing() }
+            .onAppear { if animateOnAppear { swing() } }
+            .onDisappear { swingTask?.cancel() }
     }
-}
 
-struct StatCard: View {
-    let value: String
-    let label: String
-    let color: Color
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(value).font(.system(size: 20, weight: .semibold)).foregroundColor(color)
-            Text(label).font(.system(size: 10)).foregroundColor(.mediumGray)
+    private func swing() {
+        guard !isSwinging else { return }
+        isSwinging = true
+        swingTask = Task { @MainActor in
+            withAnimation(.easeInOut(duration: 0.16)) { rotation = 16 }
+            try? await Task.sleep(nanoseconds: 160_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.22)) { rotation = -10 }
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) { rotation = 0 }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            isSwinging = false
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(Color.darkGray.opacity(0.4))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -602,7 +800,7 @@ struct FullscreenTouchOverlay: UIViewRepresentable {
     func updateUIView(_ uiView: FullscreenTouchUIView, context: Context) {
         uiView.inputPlugin = viewModel.inputPlugin
         uiView.videoPlugin = viewModel.videoPlugin
-        uiView.mode = mode
+        uiView.updateMode(mode)
     }
 }
 
@@ -617,6 +815,8 @@ class FullscreenTouchUIView: UIView {
     private var lastSentPoint: (Float, Float)?
     private var latestPoint: (Float, Float)?
     private var touchInProgress = false
+    private var ignoreCurrentTouch = false
+    private var buttonIsDown = false
     private var ignoreNextHoverEvent = false
     private var hoverSuppressedUntil: CFTimeInterval = 0
 
@@ -628,6 +828,29 @@ class FullscreenTouchUIView: UIView {
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         installPencilHoverRecognizer()
+    }
+
+    func updateMode(_ newMode: StreamInputMode) {
+        if mode != newMode {
+            releasePressedButton(reason: "mode_change", force: true)
+            resetTouchState()
+            mode = newMode
+        }
+    }
+
+    override func willMove(toWindow newWindow: UIWindow?) {
+        if newWindow == nil {
+            releasePressedButton(reason: "overlay_removed", force: true)
+            resetTouchState()
+        }
+        super.willMove(toWindow: newWindow)
+    }
+
+    private func releasePressedButton(reason: String, force: Bool = false) {
+        guard inputPlugin != nil, force || buttonIsDown else { return }
+        NSLog("[anchor] [input] button_release reason=%@ forced=%d", reason, force ? 1 : 0)
+        inputPlugin.sendButton(pressed: false)
+        buttonIsDown = false
     }
 
     private func installPencilHoverRecognizer() {
@@ -649,48 +872,23 @@ class FullscreenTouchUIView: UIView {
         switch recognizer.state {
         case .began, .changed:
             let pos = recognizer.location(in: self)
-            let (nx, ny) = mapToStream(pos)
+            guard let (nx, ny) = mapToStream(pos) else { return }
             inputPlugin.sendMotionAbsolute(x: nx, y: ny)
         default:
             break
         }
     }
 
-    private func mapToStream(_ pos: CGPoint) -> (Float, Float) {
-        let viewW = bounds.width
-        let viewH = bounds.height
-        guard viewW > 0, viewH > 0 else { return (0, 0) }
-
-        let streamW = CGFloat(videoPlugin.streamWidth)
-        let streamH = CGFloat(videoPlugin.streamHeight)
-        guard streamW > 0, streamH > 0 else {
-            return (Float(pos.x / viewW), Float(pos.y / viewH))
-        }
-
-        let streamAspect = streamW / streamH
-        let viewAspect = viewW / viewH
-        let contentW: CGFloat
-        let contentH: CGFloat
-        let offsetX: CGFloat
-        let offsetY: CGFloat
-
-        if viewAspect > streamAspect {
-            contentH = viewH
-            contentW = viewH * streamAspect
-            offsetX = (viewW - contentW) / 2
-            offsetY = 0
-        } else {
-            contentW = viewW
-            contentH = viewW / streamAspect
-            offsetX = 0
-            offsetY = (viewH - contentH) / 2
-        }
-
-        let rawX = (pos.x - offsetX) / contentW
-        let rawY = (pos.y - offsetY) / contentH
-        let nx = Float(rawX < 0 ? 0 : rawX > 1 ? 1 : rawX)
-        let ny = Float(rawY < 0 ? 0 : rawY > 1 ? 1 : rawY)
-        return (nx, ny)
+    private func mapToStream(_ pos: CGPoint) -> (Float, Float)? {
+        guard let point = AnchorAspectFitCoordinates.mapIfInside(
+            x: Double(pos.x),
+            y: Double(pos.y),
+            viewWidth: Double(bounds.width),
+            viewHeight: Double(bounds.height),
+            streamWidth: Double(videoPlugin.streamWidth),
+            streamHeight: Double(videoPlugin.streamHeight)
+        ) else { return nil }
+        return (Float(point.x), Float(point.y))
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -700,11 +898,17 @@ class FullscreenTouchUIView: UIView {
         dragging = false
         prevTouch = pos
         touchInProgress = true
+        ignoreCurrentTouch = false
+        buttonIsDown = false
         lastMotionSendTime = downTime
 
         switch mode {
         case .pointer:
-            let (nx, ny) = mapToStream(pos)
+            guard let (nx, ny) = mapToStream(pos) else {
+                ignoreCurrentTouch = true
+                touchInProgress = false
+                return
+            }
             lastSentPoint = (nx, ny)
             latestPoint = (nx, ny)
             inputPlugin.sendMotionAbsolute(x: nx, y: ny)
@@ -713,22 +917,32 @@ class FullscreenTouchUIView: UIView {
             latestPoint = nil
             break // just record start position
         case .draw:
-            let (nx, ny) = mapToStream(pos)
+            guard let (nx, ny) = mapToStream(pos) else {
+                ignoreCurrentTouch = true
+                touchInProgress = false
+                return
+            }
             lastSentPoint = (nx, ny)
             latestPoint = (nx, ny)
             inputPlugin.sendMotionAbsolute(x: nx, y: ny)
             inputPlugin.sendButton(pressed: true)
+            buttonIsDown = true
             // TODO: forward pressure via tablet events when desktop supports it
         }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first, let prev = prevTouch else { return }
+        guard !ignoreCurrentTouch else { return }
         let pos = touch.location(in: self)
 
         switch mode {
         case .pointer:
-            let (nx, ny) = mapToStream(pos)
+            guard let (nx, ny) = mapToStream(pos) else {
+                releasePressedButton(reason: "left_video")
+                ignoreCurrentTouch = true
+                return
+            }
             latestPoint = (nx, ny)
             let now = CACurrentMediaTime()
             if now - lastMotionSendTime >= streamTouchMotionInterval {
@@ -741,6 +955,7 @@ class FullscreenTouchUIView: UIView {
                 dragging = true
                 NSLog("[anchor] [input] drag_start after_ms=%.0f", (CACurrentMediaTime() - downTime) * 1000)
                 inputPlugin.sendButton(pressed: true)
+                buttonIsDown = true
             }
         case .scroll:
             let dy = Float(pos.y - prev.y)
@@ -751,7 +966,11 @@ class FullscreenTouchUIView: UIView {
                 inputPlugin.sendAxis(axis: InputPlugin.AXIS_HORIZONTAL, value: dx * 0.5)
             }
         case .draw:
-            let (nx, ny) = mapToStream(pos)
+            guard let (nx, ny) = mapToStream(pos) else {
+                releasePressedButton(reason: "left_video")
+                ignoreCurrentTouch = true
+                return
+            }
             inputPlugin.sendMotionAbsolute(x: nx, y: ny)
         }
         prevTouch = pos
@@ -774,12 +993,17 @@ class FullscreenTouchUIView: UIView {
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         let elapsed = CACurrentMediaTime() - downTime
 
+        if ignoreCurrentTouch {
+            resetTouchState()
+            return
+        }
+
         switch mode {
         case .pointer:
             if dragging {
                 flushLatestPointIfNeeded()
                 NSLog("[anchor] [input] drag_end duration_ms=%.0f", elapsed * 1000)
-                inputPlugin.sendButton(pressed: false)
+                releasePressedButton(reason: "drag_end")
             } else if elapsed < 0.2 {
                 inputPlugin.sendButton(pressed: true)
                 inputPlugin.sendButton(pressed: false)
@@ -787,28 +1011,25 @@ class FullscreenTouchUIView: UIView {
         case .scroll:
             break
         case .draw:
-            inputPlugin.sendButton(pressed: false)
+            releasePressedButton(reason: "draw_end")
         }
+        resetTouchState()
+    }
+
+    private func resetTouchState() {
         touchInProgress = false
         ignoreNextHoverEvent = true
         hoverSuppressedUntil = CACurrentMediaTime() + 0.01
         dragging = false
+        ignoreCurrentTouch = false
         prevTouch = nil
         lastSentPoint = nil
         latestPoint = nil
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if dragging || mode == .draw {
-            inputPlugin.sendButton(pressed: false)
-        }
-        touchInProgress = false
-        ignoreNextHoverEvent = true
-        hoverSuppressedUntil = CACurrentMediaTime() + 0.01
-        dragging = false
-        prevTouch = nil
-        lastSentPoint = nil
-        latestPoint = nil
+        releasePressedButton(reason: "touch_cancelled", force: true)
+        resetTouchState()
     }
 }
 
@@ -830,7 +1051,7 @@ struct DrawerView: View {
                     Text("Anchor")
                         .font(.system(size: 24, weight: .bold))
                         .foregroundColor(.offWhite)
-                    Text("\(UIDevice.current.name) · This device")
+                    Text(UIDevice.current.name)
                         .font(.system(size: 12))
                         .foregroundColor(.anchorGray)
                 }
@@ -839,11 +1060,11 @@ struct DrawerView: View {
                 .padding(.bottom, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                SwingingAnchorLogo()
+                SwingingAnchorLogo(animateOnAppear: true)
                     .padding(.trailing, 16)
                     .padding(.top, 44)
             }
-            .background(LinearGradient(colors: [.deepOcean, .charcoalBlack], startPoint: .top, endPoint: .bottom))
+            .background(Color.charcoalBlack)
 
             // Device card
             DeviceCard(isConnected: isConnected, host: viewModel.connectionState.host)
@@ -851,18 +1072,21 @@ struct DrawerView: View {
                 .padding(12)
 
             SectionLabel("SYNC")
-            DrawerItem(icon: "bell.fill", label: "Notifications", tint: .coralRed40) { onNavigate(.notifications) }
-            DrawerItem(icon: "doc.on.clipboard.fill", label: "Clipboard", tint: .seaGreen40) { onNavigate(.clipboard) }
+            DrawerItem(icon: "MaterialNotifications", label: "Notifications", tint: .anchorGray) { onNavigate(.notifications) }
+            DrawerItem(icon: "AndroidClipboard", label: "Clipboard", tint: .anchorGray) { onNavigate(.clipboard) }
+            DrawerItem(icon: "MaterialMusicNote", label: "Media", tint: .anchorGray) { onNavigate(.media) }
+            DrawerItem(icon: "MaterialFolder", label: "Files", tint: .anchorGray) { onNavigate(.files) }
 
             Divider().padding(.horizontal, 20).padding(.vertical, 4)
 
             SectionLabel("CONTROL")
-            DrawerItem(icon: "hand.tap.fill", label: "Remote Input", tint: .anchorGray) { onNavigate(.remoteInput) }
-            DrawerItem(icon: "ferry.fill", label: "Sideboat", tint: .anchorBlue40) { onNavigate(.sideboat) }
+            DrawerItem(icon: "AndroidMousePointer", label: "Remote Input", tint: .anchorGray) { onNavigate(.remoteInput) }
+            DrawerItem(icon: "MaterialTerminal", label: "Commands", tint: .anchorGray) { onNavigate(.commands) }
+            DrawerItem(icon: "AndroidSailboat", label: "Sideboat", tint: .anchorBlue40) { onNavigate(.sideboat) }
 
             Divider().padding(.horizontal, 20).padding(.vertical, 4)
 
-            DrawerItem(icon: "gear", label: "Settings", tint: .anchorGray) { onNavigate(.settings) }
+            DrawerItem(icon: "MaterialSettings", label: "Settings", tint: .anchorGray) { onNavigate(.settings) }
 
             Spacer()
         }
@@ -880,8 +1104,19 @@ struct DeviceCard: View {
                 .fill(isConnected ? Color.deepOcean : Color.coralRed40.opacity(0.3))
                 .frame(width: 38, height: 38)
                 .overlay(
-                    Text(isConnected ? "PC" : "?")
-                        .font(.system(size: 11, weight: .bold))
+                    Group {
+                        if isConnected {
+                            Image("MaterialComputer")
+                                .renderingMode(.template)
+                                .resizable()
+                                .scaledToFit()
+                        } else {
+                            Image(systemName: "questionmark.circle")
+                                .resizable()
+                                .scaledToFit()
+                        }
+                    }
+                        .frame(width: 20, height: 20)
                         .foregroundColor(isConnected ? .white : .coralRed40)
                 )
             VStack(alignment: .leading, spacing: 2) {
@@ -893,7 +1128,6 @@ struct DeviceCard: View {
                     .foregroundColor(isConnected ? .seaGreen40 : .coralRed40)
             }
             Spacer()
-            Circle().fill(isConnected ? Color.seaGreen40 : Color.coralRed40).frame(width: 8, height: 8)
         }
         .padding(14)
         .background(Color.darkGray.opacity(0.5))
@@ -927,7 +1161,14 @@ struct DrawerItem: View {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(tint.opacity(0.15))
                     .frame(width: 30, height: 30)
-                    .overlay(Image(systemName: icon).font(.system(size: 14)).foregroundColor(tint))
+                    .overlay(
+                        Image(icon)
+                            .renderingMode(.template)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 16, height: 16)
+                            .foregroundColor(tint)
+                    )
                 Text(label).font(.system(size: 14)).foregroundColor(.offWhite)
                 Spacer()
             }

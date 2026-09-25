@@ -73,9 +73,10 @@ h2, h3, p { margin-top: 0; }
 .virtual-display-heading p { margin: 4px 0 0; color: var(--rock-highlight); font-size: 11px; }
 .virtual-display-form { display: grid; gap: 12px; padding: 0 18px 16px; }
 .virtual-mode-buttons, .virtual-scale-options, .virtual-orientation-options { display: flex; gap: 6px; }
-.virtual-phone-options { display: grid; gap: 8px; }
+.virtual-device-options { display: grid; gap: 8px; }
 .virtual-option-row { display: flex; align-items: center; gap: 12px; }
 .virtual-option-row > span { width: 62px; color: var(--rock); font-size: 10px; }
+.virtual-device-select { flex: 1; max-width: 360px; }
 .virtual-mode-buttons button, .virtual-scale-options button, .virtual-orientation-options button { min-height: 30px; padding: 5px 9px; border: 1px solid var(--rock-stroke); color: var(--rock-highlight); background: var(--ink); font-size: 11px; }
 .virtual-mode-buttons button:hover:not(:disabled), .virtual-scale-options button:hover:not(:disabled), .virtual-orientation-options button:hover:not(:disabled), .virtual-mode-buttons button.active, .virtual-scale-options button.active, .virtual-orientation-options button.active { border-color: var(--sky); color: var(--splash); background: var(--water-deep); }
 .virtual-custom-size { display: flex; max-width: 360px; align-items: end; gap: 9px; color: var(--rock); font-size: 15px; }

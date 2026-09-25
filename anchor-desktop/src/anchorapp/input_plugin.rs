@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::anchorapp::event::{AnchorEvent, AnchorMessage, AnchorTarget};
 use crate::anchorapp::plugin::{Plugin, SharedFrameBuffer};
-use crate::anchorwayland::input::{InputBackend, WaylandInput};
+use crate::anchorwayland::input::{InputBackend, OutputGeometry, WaylandInput};
 
 pub struct AnchorPluginInput {
     pub plugin_rx: Option<Receiver<AnchorEvent>>,
@@ -205,6 +205,13 @@ fn run_input_loop(rx: Receiver<AnchorEvent>, broker_tx: Sender<AnchorEvent>) {
         let event_started = Instant::now();
 
         match msg_type {
+            "output_layout" => {
+                if let Some(outputs) = parse_output_layout(&payload) {
+                    backend.set_output_layout(&outputs);
+                } else {
+                    log::warn!("Input: ignoring malformed output_layout message");
+                }
+            }
             "stream_info" => {
                 if let (Some(w), Some(h)) = (
                     payload.get("width").and_then(|v| v.as_u64()),
@@ -298,5 +305,82 @@ fn run_input_loop(rx: Receiver<AnchorEvent>, broker_tx: Sender<AnchorEvent>) {
             );
         }
         perf.maybe_log_and_reset(Instant::now());
+    }
+}
+
+fn parse_output_layout(payload: &serde_json::Value) -> Option<Vec<OutputGeometry>> {
+    let outputs = payload.get("outputs")?.as_array()?;
+    outputs
+        .iter()
+        .map(|output| {
+            let width = u32::try_from(output.get("width")?.as_u64()?).ok()?;
+            let height = u32::try_from(output.get("height")?.as_u64()?).ok()?;
+            if width == 0 || height == 0 {
+                return None;
+            }
+            Some(OutputGeometry {
+                name: output.get("name")?.as_str()?.to_string(),
+                x: i32::try_from(output.get("x")?.as_i64()?).ok()?,
+                y: i32::try_from(output.get("y")?.as_i64()?).ok()?,
+                width,
+                height,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_output_topology() {
+        let payload = serde_json::json!({
+            "outputs": [
+                {"name": "eDP-1", "x": 0, "y": 0, "width": 1920, "height": 1200},
+                {"name": "HEADLESS-1", "x": 1920, "y": 40, "width": 1080, "height": 2340}
+            ]
+        });
+
+        assert_eq!(
+            parse_output_layout(&payload),
+            Some(vec![
+                OutputGeometry { name: "eDP-1".into(), x: 0, y: 0, width: 1920, height: 1200 },
+                OutputGeometry {
+                    name: "HEADLESS-1".into(),
+                    x: 1920,
+                    y: 40,
+                    width: 1080,
+                    height: 2340,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_topology_does_not_look_like_an_empty_layout() {
+        assert_eq!(parse_output_layout(&serde_json::json!({})), None);
+        assert_eq!(parse_output_layout(&serde_json::json!({"outputs": null})), None);
+        assert_eq!(parse_output_layout(&serde_json::json!({"outputs": []})), Some(Vec::new()));
+    }
+
+    #[test]
+    fn one_invalid_entry_rejects_the_entire_topology_snapshot() {
+        let invalid_entries = [
+            serde_json::json!({"name": "zero", "x": 0, "y": 0, "width": 0, "height": 600}),
+            serde_json::json!({"name": "x-overflow", "x": 2147483648_i64, "y": 0, "width": 800, "height": 600}),
+            serde_json::json!({"name": "width-overflow", "x": 0, "y": 0, "width": 4294967296_u64, "height": 600}),
+            serde_json::json!({"name": "missing-height", "x": 0, "y": 0, "width": 800}),
+        ];
+
+        for invalid in invalid_entries {
+            let payload = serde_json::json!({
+                "outputs": [
+                    {"name": "valid", "x": -100, "y": 25, "width": 800, "height": 600},
+                    invalid
+                ]
+            });
+            assert_eq!(parse_output_layout(&payload), None);
+        }
     }
 }
