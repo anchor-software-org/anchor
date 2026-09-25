@@ -26,8 +26,8 @@ ffmpeg-prebuilt = []
 drm = "0.14.1"
 gbm = "0.18.0"
 log = { version = "0.4.29", features = ["std"] }
-ffmpeg-next = { version = "8.1" }
-ffmpeg-sys-next = { version = "8.1" }
+ffmpeg-next = { git = "https://github.com/zmwangx/rust-ffmpeg", rev = "3751e2800d5d2f0215d69031285aadebac5db8fc", default-features = false, features = ["codec", "filter", "format", "software-scaling"] }
+ffmpeg-sys-next = { git = "https://github.com/anchor-software-org/rust-ffmpeg-sys", rev = "8bb5358f19acd12447ee1f8ea773046d95ed87aa", default-features = false, features = ["avcodec", "avfilter", "avformat", "swscale"] }
 serde_json = "1.0.149"
 wayland-client = "0.31.11"
 wayland-protocols = "0.32.9"
@@ -71,6 +71,9 @@ tauri-plugin-single-instance = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[patch.crates-io]
+ffmpeg-sys-next = { git = "https://github.com/anchor-software-org/rust-ffmpeg-sys", rev = "8bb5358f19acd12447ee1f8ea773046d95ed87aa" }
 
 [profile.release]
 debug = false
