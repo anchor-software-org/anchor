@@ -1,13 +1,24 @@
 ## Summary
 
-Describe the user-visible or internal change and why it is needed.
+What are you doing? 
 
-## Validation
+## Approach 
 
-- [ ] I ran the relevant tests/checks.
-- [ ] I updated generated files only when their source changed.
-- [ ] I did not add credentials, private keys, personal data, or build artifacts.
-- [ ] I kept public API/protocol compatibility in mind, or called out the break.
+How are you making the change
+
+## Testing
+
+What steps can be taken to reliably test this change on other machines
+Did you test this on your machine? 
+
+What devices does this affect? 
+[ ] Android
+[ ] Ipad/Iphone
+[ ] Linux
+
+## Reviewers
+
+Any notes for the reviewers? 
 
 ## Release notes
 
