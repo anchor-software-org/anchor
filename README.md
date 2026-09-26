@@ -63,4 +63,4 @@ Anchor is licensed under the [GPL-3.0](LICENSE).
 
 ## Disclaimer 
 
-This project was made with assistance from agentic dev tools
+This project was made with assistance from agentic dev tools. See my policy on its usage [here](https://github.com/anchor-software-org/anchor/blob/main/CONTRIBUTING.md#ai-assisted-development)
