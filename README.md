@@ -1,6 +1,6 @@
 # Anchor
 
-Anchor is software for connecting Android, IOS and Linux devices together. I'm making this software as I find current alternatives for software connectivity to be lacking, clunk, or fragmented. I would rather not use 20 apps to get an equivalent ecosystem, when I can just have one.
+Anchor is software for connecting Android, IOS and Linux devices together. I'm making this software as I find current alternatives for software connectivity to be lacking, clunky, or fragmented. I would rather not use 20 apps to get an equivalent ecosystem, when I can just have one. 
 
 Anchor currently supports:
 - extending or mirroring the phone screen
