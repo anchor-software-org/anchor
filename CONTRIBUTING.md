@@ -23,10 +23,11 @@ git submodule update --init --recursive
 Create a branch from `main`. Keep changes focused and explain the reason for
 the change in your pull request.
 
-Use the existing code style. Format Rust changes before committing:
+Use the existing code style. Format Rust changes from the desktop devenv shell:
 
 ```bash
 cd anchor-desktop
+devenv shell
 cargo fmt --all
 ```
 
@@ -36,44 +37,42 @@ generation step also changed.
 
 ## Run checks
 
-Run the checks for the area you changed.
-
-Linux desktop:
-
-```bash
-cd anchor-desktop
-cargo fmt --all --check
-cargo clippy --all-targets
-cargo test -- --nocapture
-```
-
-The desktop frontend has its own checks:
+Run CI jobs with the `ci` command inside either devenv shell. It selects the
+environment for each job, so you can run the default local CI jobs from the
+repository root:
 
 ```bash
-cd anchor-desktop/frontend
-pnpm install --frozen-lockfile
-pnpm run check
-pnpm run build
+devenv shell
+ci all
 ```
 
-Rust SDK:
+Run an individual job when you only need checks for one area:
 
 ```bash
-cd anchor-sdk/rust
-cargo test
+ci check    # desktop Rust and frontend checks
+ci sdk      # Rust and Kotlin SDK source conformance
+ci android  # Android tests and debug APK
+ci desktop  # Linux desktop release binary
 ```
 
-Android app and Kotlin SDK:
+The Android job needs an installed Android SDK and NDK. The AppImage job is
+optional and builds in its Ubuntu container:
 
 ```bash
-cd anchor
-./gradlew :anchorSdk:testDebugUnitTest :app:testDebugUnitTest
+ci appimage
 ```
 
-For Android builds, emulator tests, MsQuic, and native dependencies, use the
+On macOS, run the iOS CI checks inside the repository-root devenv shell:
+
+```bash
+ios-verify
+```
+
+For environment setup and job details, see the
 [development environment guide](docs/developer/development-environment.md).
+
 For SDK and protocol changes, also read the [transport contract](docs/developer/protocol/transport-contract.md)
-and [`anchor-sdk/protocol/VERSIONING.md`](anchor-sdk/protocol/VERSIONING.md), which explains which
+and [`anchor-sdk/protocol/VERSIONING.md`](anchor-sdk/protocol/VERSIONING.md), which explains which 
 of the three version numbers (protocol major/minor, a capability's major, or an SDK's own package
 version) a given change should bump.
 
@@ -108,3 +107,16 @@ Use GitHub issues for public bugs and feature requests. Email
 `devs@anchor-software.org` for private feedback, support, or security reports.
 Do not post credentials, private keys, certificate pins, or other sensitive
 information in an issue or pull request.
+
+## AI Assisted Development
+
+I'm not looking for slop PRs, for each PR you should know what it is doing. 
+Main guideline is to not be lazy
+
+Also do not specify the tag of the AI being used, thats just noise. 
+
+You should be able to answer questions about the code, and be willing to find out the answers
+
+Don't throw code over the wall 
+
+Adopted from [here](https://community.kde.org/Guidelines_and_HOWTOs/Maintainers_and_Contributions)
