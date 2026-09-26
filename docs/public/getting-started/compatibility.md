@@ -38,26 +38,21 @@ encoding when hardware encoding is unavailable.
 
 The Android app requires Android 11 or newer (API level 30).
 
-It connects to a Linux desktop over Wi-Fi on the same local network. USB
-connections use an ADB reverse tunnel and require ADB access to the device.
+It connects to a Linux desktop over Wi-Fi on the same local network or 
+can be relayed through the likes of Tailscale or other similar services. 
 
-Screen and camera video travel over QUIC datagrams with parity recovery when
-both devices support them. Pairing a newer build with an older one still
-works — the connection falls back to ordered QUIC streams automatically.
-
-Android restricts background clipboard access. To send the current phone
-clipboard to the desktop, open Anchor and use **Send to Desktop**.
+To send the current phone clipboard to the desktop, open Anchor and use **Send to Desktop**.
+The desktop -> android clipboard sync happens automatically.
 
 ## iOS and iPadOS
 
 iOS support is preview-only and is not part of the supported release target.
-The app project targets iOS 17, but it still uses the legacy network plugin and
-has not completed the Protocol v1 and Network.framework transport migration.
-The Swift SDK is also preview-only.
+
+For now there is a working version for Ipad, but it is still very much experimental 
+and needing development.
 
 ## Not supported
 
 - Windows or macOS desktop hosts
 - Linux X11 desktop sessions
 - Screen sharing on Wayland compositors without `zwlr_screencopy_manager_v1`
-- Anchor-managed virtual displays outside Sway
