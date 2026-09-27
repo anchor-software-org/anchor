@@ -44,6 +44,10 @@ struct SettingsView: View {
         Section("Connection Status") {
             Text(statusText)
             SettingsRow(label: "Endpoint", value: endpointText)
+            SettingsRow(
+                label: "Wired link",
+                value: viewModel.usbTetherActive ? "Available" : "Plug in USB and enable Personal Hotspot"
+            )
             if let error = viewModel.connectionState.error {
                 Text(error).font(.caption).foregroundColor(.red)
             }

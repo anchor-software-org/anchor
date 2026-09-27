@@ -22,8 +22,11 @@ object DeviceListMerger {
     ): List<DeviceListEntry> {
         val matchedIds = mutableSetOf<String>()
 
+        // When the same device is reachable over both Wi-Fi and USB, prefer
+        // the wired address — it has lower latency and frees Wi-Fi bandwidth.
         val savedEntries = saved.map { entry ->
-            val online = discovered.firstOrNull { it.deviceId == entry.deviceId }
+            val matches = discovered.filter { it.deviceId == entry.deviceId }
+            val online = matches.firstOrNull { it.wired } ?: matches.firstOrNull()
             if (online != null) matchedIds.add(entry.deviceId)
             DeviceListEntry(
                 deviceId = entry.deviceId,
@@ -37,11 +40,20 @@ object DeviceListMerger {
                 isOnline = online != null,
                 port = online?.port ?: 5027,
                 certificateDer = online?.certificateDer,
+                wired = online?.wired ?: false,
             )
         }
 
+        // A device can be discovered on several paths at once (Wi-Fi and USB);
+        // collapse those to a single row, again preferring the wired address.
         val unpaired = discovered
             .filter { it.deviceId == null || it.deviceId !in matchedIds }
+            .groupBy { it.deviceId }
+            .flatMap { (deviceId, group) ->
+                if (deviceId == null) group else listOf(
+                    group.firstOrNull { it.wired } ?: group.first()
+                )
+            }
             .map { d ->
                 DeviceListEntry(
                     deviceId = d.deviceId,
@@ -51,6 +63,7 @@ object DeviceListMerger {
                     isOnline = true,
                     port = d.port,
                     certificateDer = d.certificateDer,
+                    wired = d.wired,
                 )
             }
 

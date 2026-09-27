@@ -22,8 +22,8 @@ class DeviceListMergerTest {
             lastIp = lastIp
         )
 
-    private fun dev(id: String?, ip: String, name: String = id ?: "?") =
-        DiscoveredDevice(deviceId = id, name = name, ip = ip, port = 5027)
+    private fun dev(id: String?, ip: String, name: String = id ?: "?", wired: Boolean = false) =
+        DiscoveredDevice(deviceId = id, name = name, ip = ip, port = 5027, wired = wired)
 
     @Test
     fun savedDeviceOnlineUsesFreshMdnsIp() {
@@ -129,6 +129,44 @@ class DeviceListMergerTest {
             discovered = listOf(dev("A", "10.0.0.50"))
         )
         assertEquals(1, out.size) // not 2
+    }
+
+    @Test
+    fun savedDeviceReachableOnBothPathsPrefersWiredIp() {
+        val out = DeviceListMerger.merge(
+            saved = listOf(saved("A", "alpha", lastIp = "10.0.0.1")),
+            discovered = listOf(
+                dev("A", "10.0.0.50"),                          // Wi-Fi
+                dev("A", "192.168.42.10", wired = true),        // USB tethering
+            )
+        )
+        val entry = out.single()
+        assertEquals("192.168.42.10", entry.ip)
+        assertTrue(entry.wired)
+    }
+
+    @Test
+    fun unpairedDeviceOnBothPathsCollapsesToOneWiredRow() {
+        val out = DeviceListMerger.merge(
+            saved = emptyList(),
+            discovered = listOf(
+                dev("X", "10.0.0.7", name = "newbox"),
+                dev("X", "192.168.42.9", name = "newbox", wired = true),
+            )
+        )
+        val entry = out.single()
+        assertEquals("192.168.42.9", entry.ip)
+        assertTrue(entry.wired)
+        assertFalse(entry.isPaired)
+    }
+
+    @Test
+    fun twoNullIdDevicesAreNotCollapsedTogether() {
+        val out = DeviceListMerger.merge(
+            saved = emptyList(),
+            discovered = listOf(dev(null, "10.0.0.7"), dev(null, "10.0.0.8"))
+        )
+        assertEquals(2, out.size)
     }
 
     @Test

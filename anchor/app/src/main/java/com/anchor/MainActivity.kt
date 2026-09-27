@@ -147,6 +147,7 @@ import com.anchor.ui.VideoSurface
 import com.anchor.ui.rememberHaptics
 import com.anchor.ui.theme.*
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
@@ -797,6 +798,7 @@ fun MainContent(viewModel: MainViewModel, onMenuClick: () -> Unit, onSideboat: (
     val selectedDisplayIndex by viewModel.videoPlugin.selectedDisplayIndex.collectAsState()
     val deviceList by viewModel.deviceList.collectAsState()
     val isConnected = connectionState.status == ConnectionStatus.CONNECTED
+    val context = LocalContext.current
 
     Column(modifier = Modifier.fillMaxSize().background(CharcoalBlack)) {
         // Top bar
@@ -1011,6 +1013,24 @@ private fun StreamControls(
 private fun ActionButton(text: String, color: Color, onClick: () -> Unit) {
     TextButton(onClick = onClick) {
         Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** Deep-link to tethering settings; OEMs place it under different activities. */
+private fun openTetherSettings(context: Context) {
+    val intents = listOf(
+        Intent("android.settings.TETHER_SETTINGS"),
+        Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.Settings\$TetherSettingsActivity")),
+        Intent().setComponent(ComponentName("com.android.settings", "com.android.settings.TetherSettings")),
+        Intent(Settings.ACTION_WIRELESS_SETTINGS),
+    )
+    for (intent in intents) {
+        try {
+            context.startActivity(intent)
+            return
+        } catch (_: ActivityNotFoundException) {
+        } catch (_: Exception) {
+        }
     }
 }
 
@@ -1298,7 +1318,11 @@ private fun DeviceRow(
         Spacer(Modifier.weight(1f))
         Spacer(Modifier.width(8.dp))
         Text(
-            if (device.ip.isNotEmpty()) device.ip else "no address",
+            when {
+                device.ip.isEmpty() -> "no address"
+                device.wired -> "wired · ${device.ip}"
+                else -> device.ip
+            },
             color = MediumGray,
             fontSize = 11.sp
         )
@@ -1966,6 +1990,7 @@ fun SettingsScreen(
     val connectionState by viewModel.connectionState.collectAsState()
     val pairedDevices by viewModel.pairedDevices.collectAsState()
     val autoReconnect by viewModel.autoReconnectEnabled.collectAsState()
+    val usbTetherActive by viewModel.usbTetherActive.collectAsState()
 
     val statusColor = when (connectionState.status) {
         ConnectionStatus.CONNECTED -> MaterialTheme.colorScheme.secondary
@@ -2029,6 +2054,25 @@ fun SettingsScreen(
                     if (connectionState.error != null) {
                         Spacer(Modifier.height(8.dp))
                         Text(connectionState.error!!, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { openTetherSettings(context) }
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("USB tethering")
+                            Text(
+                                if (usbTetherActive) "On — wired link available"
+                                else "Enable for a lower-latency wired link",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = AnchorGray
+                            )
+                        }
+                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
                     }
                 }
             }
@@ -3099,9 +3143,10 @@ private fun MainDisconnectedPreview() {
                     com.anchor.data.DeviceListEntry(
                         deviceId = "def456",
                         name = "living-room-pc",
-                        ip = "192.168.1.77",
+                        ip = "192.168.42.10",
                         isPaired = false,
-                        isOnline = true
+                        isOnline = true,
+                        wired = true
                     )
                 ),
                 onDesktopIpChange = {},

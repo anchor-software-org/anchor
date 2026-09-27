@@ -419,6 +419,12 @@ struct MainScreen: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .disabled(viewModel.connectionState.status == .connecting)
+
+                            Text(viewModel.usbTetherActive
+                                 ? "Wired link detected"
+                                 : "Plug in USB and enable Personal Hotspot for a wired link")
+                                .font(.system(size: 11))
+                                .foregroundColor(.mediumGray)
                         }
                         .padding(14)
                         .background(Color.darkGray.opacity(0.4))
@@ -464,6 +470,37 @@ struct MainScreen: View {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 12, weight: .semibold))
                                 .foregroundColor(.anchorGray)
+                        }
+                        .padding(14)
+                        .background(Color.darkGray.opacity(0.4))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+
+                    if !viewModel.discoveredDesktops.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Nearby")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.anchorGray)
+
+                            ForEach(viewModel.discoveredDesktops) { device in
+                                HStack(spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(device.deviceName)
+                                            .font(.system(size: 13))
+                                            .foregroundColor(.offWhite)
+                                        Text(device.wired ? "wired · \(device.ip)" : device.ip)
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.mediumGray)
+                                    }
+                                    Spacer()
+                                    Button("Connect") {
+                                        viewModel.connectToDiscovered(device)
+                                    }
+                                    .font(.system(size: 11))
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
+                            }
                         }
                         .padding(14)
                         .background(Color.darkGray.opacity(0.4))

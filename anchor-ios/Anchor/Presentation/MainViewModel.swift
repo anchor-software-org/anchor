@@ -31,6 +31,7 @@ class MainViewModel: ObservableObject {
     let notificationPlugin: NotificationPlugin
     let commandsPlugin: CommandsPlugin
     let filesPlugin: FilesPlugin
+    private let wiredDiscovery = WiredDiscovery()
 
     // Device identity
     private let myDeviceId: String
@@ -51,6 +52,8 @@ class MainViewModel: ObservableObject {
     @Published var pairingState: PairingState = .idle
     @Published var pairedDevices: [PairedDeviceDisplay] = []
     @Published var latencyMs: Int = 0
+    @Published var discoveredDesktops: [WiredDiscovery.DiscoveredDesktop] = []
+    @Published var usbTetherActive = false
 
     // Input settings
     @Published var touchInputOnStream: Bool {
@@ -143,6 +146,15 @@ class MainViewModel: ObservableObject {
         )
         clipboardPlugin.autoSyncEnabled = autoSyncClipboard
 
+        wiredDiscovery.$devices
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.discoveredDesktops = $0 }
+            .store(in: &cancellables)
+        wiredDiscovery.$tetherActive
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.usbTetherActive = $0 }
+            .store(in: &cancellables)
+
         guard case .live = mode else { return }
 
         // Start plugins
@@ -154,6 +166,9 @@ class MainViewModel: ObservableObject {
         notificationPlugin.start()
         commandsPlugin.start()
         filesPlugin.start()
+
+        // iOS has no mDNS here; probe every broadcast-capable interface.
+        wiredDiscovery.start()
 
         // Refresh paired devices
         refreshPairedDevices()
@@ -322,12 +337,14 @@ class MainViewModel: ObservableObject {
                 UserDefaults.standard.set(host, forKey: "last_connected_ip")
                 connectionState = ConnectionState(status: .connected, host: host, port: port)
                 refreshPairedDevices()
+                wiredDiscovery.stop()
             default:
                 connectionTimeoutTask?.cancel()
                 connectionTimeoutTask = nil
                 connectedDeviceId = nil
                 connectionState = ConnectionState(status: .disconnected, host: host, port: port, error: error ?? reason)
                 refreshPairedDevices()
+                wiredDiscovery.start()
             }
         }
     }
@@ -346,20 +363,48 @@ class MainViewModel: ObservableObject {
     }
 
     func connectToDevice(_ device: PairedDeviceDisplay) {
+        // Prefer the wired reply; its fresh IP won't match the stored
+        // `lastKnownIp`, so the advertised id must ride along.
+        if let wired = discoveredDesktops
+            .first(where: { $0.deviceId == device.deviceId && $0.wired }) {
+            desktopIp = wired.ip
+            connectToIp(
+                wired.ip,
+                port: wired.port,
+                expectedDeviceId: wired.deviceId,
+                expectedCertificate: wired.certificateDer
+            )
+            return
+        }
         guard let ip = device.lastKnownIp, !ip.isEmpty else { return }
         desktopIp = ip
         connectToIp(ip)
     }
 
-    func connectToIp(_ ip: String) {
+    /// The advertised identity rides along so a pairing approval that comes
+    /// back with a different identity is rejected before anything is trusted.
+    func connectToDiscovered(_ device: WiredDiscovery.DiscoveredDesktop) {
+        connectToIp(
+            device.ip,
+            port: device.port,
+            expectedDeviceId: device.deviceId,
+            expectedCertificate: device.certificateDer
+        )
+    }
+
+    func connectToIp(_ ip: String, port: Int = 5027,
+                     expectedDeviceId: String? = nil,
+                     expectedCertificate: Data? = nil) {
         guard !isPreviewMode else { return }
         guard connectionState.status == .disconnected, !ip.isEmpty else { return }
         desktopIp = ip
         lastConnectedIp = ip
         networkPlugin.connect(
             ip: ip,
-            port: 5027,
-            displayPixelSize: Self.currentDisplayPixelSize()
+            port: port,
+            displayPixelSize: Self.currentDisplayPixelSize(),
+            expectedDeviceId: expectedDeviceId,
+            expectedCertificate: expectedCertificate
         )
 
         // QUIC includes TLS 1.3 and may also wait for a desktop pairing prompt.
@@ -411,6 +456,20 @@ class MainViewModel: ObservableObject {
     func ensureAutoConnect() {
         guard !isPreviewMode else { return }
         guard connectionState.status == .disconnected, !networkPlugin.isConnected else { return }
+        // A trusted desktop answering on a wired link wins over any stored IP.
+        let trustedIds = Set(trustedStore.devices.keys)
+        if let wired = discoveredDesktops.first(where: {
+            $0.wired && trustedIds.contains($0.deviceId)
+        }) {
+            NSLog("[anchor] Auto-connect attempting wired \(wired.ip)")
+            connectToIp(
+                wired.ip,
+                port: wired.port,
+                expectedDeviceId: wired.deviceId,
+                expectedCertificate: wired.certificateDer
+            )
+            return
+        }
         guard let ip = preferredAutoConnectIp() else { return }
         NSLog("[anchor] Auto-connect attempting \(ip)")
         connectToIp(ip)

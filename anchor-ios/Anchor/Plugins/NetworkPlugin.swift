@@ -334,7 +334,8 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
 
     // MARK: - Connect
 
-    func connect(ip: String, port: Int = 5027, displayPixelSize: CGSize) {
+    func connect(ip: String, port: Int = 5027, displayPixelSize: CGSize,
+                 expectedDeviceId: String? = nil, expectedCertificate: Data? = nil) {
         guard quicTask == nil, !quicConnected else { return }
         let dimensions = Self.validatedDisplayDimensions(
             width: Double(displayPixelSize.width),
@@ -347,17 +348,31 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             message: .json(#"{"type":"connection_status","status":"connecting","host":"\#(ip)","port":\#(port)}"#)
         ))
         quicTask = Task { [weak self] in
-            await self?.connectV1(ip: ip, port: UInt16(port))
+            await self?.connectV1(
+                ip: ip,
+                port: UInt16(port),
+                expectedDeviceId: expectedDeviceId,
+                expectedCertificate: expectedCertificate
+            )
         }
     }
 
-    private func connectV1(ip: String, port: UInt16) async {
+    private func connectV1(ip: String, port: UInt16,
+                           expectedDeviceId: String? = nil,
+                           expectedCertificate: Data? = nil) async {
         do {
             guard let identity = ensureIdentity() else {
                 throw AnchorNetworkTransportError.connectionFailed("client identity is unavailable")
             }
 
-            let trusted = trustedStore.devices.values.first { $0.lastKnownIp == ip }
+            // With an advertised device id, match trust by identity — the
+            // wired IP won't equal the stored `lastKnownIp`.
+            let trusted = trustedStore.devices.values.first { entry in
+                if let expectedDeviceId {
+                    return entry.deviceId == expectedDeviceId
+                }
+                return entry.lastKnownIp == ip
+            }
             let paired: TrustedStore.TrustedDeviceEntry
             if let trusted, let certificate = certificateDER(fromPEM: trusted.certificatePem) {
                 paired = trusted
@@ -369,6 +384,17 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 )
             } else {
                 paired = try await pairV1(ip: ip, port: port, identity: identity)
+                // pairV1 already persisted this entry; a discovered-desktop
+                // mismatch must not leave it trusted.
+                if let expectedDeviceId, paired.deviceId != expectedDeviceId {
+                    trustedStore.removeDevice(paired.deviceId)
+                    throw AnchorNetworkTransportError.certificatePinMismatch
+                }
+                if let expectedCertificate,
+                   certificateDER(fromPEM: paired.certificatePem) != expectedCertificate {
+                    trustedStore.removeDevice(paired.deviceId)
+                    throw AnchorNetworkTransportError.certificatePinMismatch
+                }
                 try await establishV1(
                     ip: ip,
                     port: port,
