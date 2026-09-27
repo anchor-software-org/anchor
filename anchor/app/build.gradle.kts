@@ -46,13 +46,17 @@ android {
     compileSdk {
         version = release(36)
     }
+    // Keep the native source build reproducible across local CI and source
+    // distributors. The same revision is declared in the F-Droid handoff
+    // instructions under docs/maintainers/releases.
+    ndkVersion = "30.0.16138531"
 
     defaultConfig {
         applicationId = "com.anchor.software"
         minSdk = 30
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 100
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

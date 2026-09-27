@@ -1,6 +1,6 @@
 # Maintainer: Anchor Software <devs@anchor-software.org>
 pkgname='anchor-desktop'
-pkgver=0.3.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="Wayland monitor extension and other functionality"
 arch=('x86_64')
