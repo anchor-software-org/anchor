@@ -27,12 +27,11 @@ if [[ "$missing" == "1" ]]; then
         ndk=$(find "$sdk/ndk" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort -V | tail -n 1)
     fi
     [[ -n "$ndk" && -d "$ndk" ]] || { echo "ci: no Android NDK under $sdk/ndk" >&2; exit 66; }
-    for abi in $abis; do
-        if [[ ! -f "$kotlin/src/main/jniLibs/$abi/libmsquic.so" ]]; then
-            echo "==> ci: building MsQuic for $abi"
-            "$kotlin/scripts/build-msquic-android.sh" "$ndk" "$abi"
-        fi
-    done
+    echo "==> ci: building MsQuic for $abis"
+    # CI_MSQUIC_ABIS is a space-separated list so each ABI remains an
+    # individual argument to the reusable native-build entry point.
+    # shellcheck disable=SC2086
+    "$repo_root/scripts/build-android-native.sh" "$ndk" $abis
 fi
 
 cd "$repo_root/anchor"

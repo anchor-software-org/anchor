@@ -1,0 +1,6 @@
+Anchor 1.0.0 aligns the Android app with the stable Anchor SDK and Protocol v1.
+
+• Direct Android-to-Linux pairing with authenticated encrypted transport
+• Optional SMS/MMS and contact sync with clear consent controls
+• Notification, clipboard, file, camera, media, display, and remote-input tools
+• In-app privacy and terms links

@@ -72,7 +72,36 @@ elif [ ! -x "$APPIMAGETOOL" ]; then
     exit 1
 fi
 
+if [ -n "${APPIMAGE_EMULATOR:-}" ]; then
+    if [ ! -x "$APPIMAGE_EMULATOR" ]; then
+        echo "APPIMAGE_EMULATOR is not executable: $APPIMAGE_EMULATOR" >&2
+        exit 1
+    fi
+fi
+
+# qemu-user binaries built for binfmt run in preserve-argv0 mode (kernel flag
+# P): the argument after the program path becomes the guest argv[0], so it
+# must be repeated when invoking a program explicitly.
+run_appimage_tool() {
+    if [ -n "${APPIMAGE_EMULATOR:-}" ]; then
+        "$APPIMAGE_EMULATOR" "$1" "$@"
+    else
+        "$@"
+    fi
+}
+
 echo "==> Building $ARCH AppImage on $HOST_ARCH host"
+
+if [ "${APPIMAGE_PACKAGE_ONLY:-0}" = "1" ]; then
+    for required in "$APPDIR/AppRun" "$APPDIR/usr/bin/anchor"; do
+        if [ ! -e "$required" ]; then
+            echo "APPIMAGE_PACKAGE_ONLY=1 but $required is missing." >&2
+            echo "Run a full build first to produce the AppDir." >&2
+            exit 1
+        fi
+    done
+    echo "==> Reusing existing AppDir (APPIMAGE_PACKAGE_ONLY=1)"
+else
 
 # -- Build release application --------------------------------------------
 if ! command -v pnpm >/dev/null 2>&1; then
@@ -213,8 +242,10 @@ chmod +x "$APPDIR/AppRun"
 LD_LIBRARY_PATH="$APPDIR/usr/lib" ldd "$APPDIR/usr/bin/anchor" \
     | grep "libx264.*$APPDIR/usr/lib"
 
+fi
+
 cd "$APPIMAGE_DIR"
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$APPIMAGETOOL" \
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" run_appimage_tool "$APPIMAGETOOL" \
     AppDir "Anchor-$ARCH.AppImage"
 
 # Verify the image actually works: extract it (no FUSE needed), confirm the
@@ -224,7 +255,8 @@ echo "==> Verifying AppImage contents..."
 VERIFY_DIR="$APPIMAGE_DIR/verify"
 rm -rf "$VERIFY_DIR"
 mkdir -p "$VERIFY_DIR"
-(cd "$VERIFY_DIR" && APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGE_DIR/Anchor-$ARCH.AppImage" --appimage-extract >/dev/null)
+(cd "$VERIFY_DIR" && APPIMAGE_EXTRACT_AND_RUN=1 run_appimage_tool \
+    "$APPIMAGE_DIR/Anchor-$ARCH.AppImage" --appimage-extract >/dev/null)
 SQFS="$VERIFY_DIR/squashfs-root"
 
 for required in "$SQFS/AppRun" "$SQFS/usr/bin/anchor" "$SQFS/usr/bin/adb" \
