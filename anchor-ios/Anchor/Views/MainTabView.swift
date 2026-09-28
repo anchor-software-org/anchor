@@ -829,6 +829,7 @@ struct FullscreenTouchOverlay: UIViewRepresentable {
         let view = FullscreenTouchUIView()
         view.inputPlugin = viewModel.inputPlugin
         view.videoPlugin = viewModel.videoPlugin
+        view.selectedOutputName = viewModel.videoPlugin.selectedOutputName
         view.mode = mode
         view.backgroundColor = .clear
         return view
@@ -837,6 +838,7 @@ struct FullscreenTouchOverlay: UIViewRepresentable {
     func updateUIView(_ uiView: FullscreenTouchUIView, context: Context) {
         uiView.inputPlugin = viewModel.inputPlugin
         uiView.videoPlugin = viewModel.videoPlugin
+        uiView.selectedOutputName = viewModel.videoPlugin.selectedOutputName
         uiView.updateMode(mode)
     }
 }
@@ -844,6 +846,7 @@ struct FullscreenTouchOverlay: UIViewRepresentable {
 class FullscreenTouchUIView: UIView {
     var inputPlugin: InputPlugin!
     var videoPlugin: VideoPlugin!
+    var selectedOutputName: String?
     var mode: StreamInputMode = .pointer
     private var downTime: TimeInterval = 0
     private var dragging = false
@@ -910,7 +913,7 @@ class FullscreenTouchUIView: UIView {
         case .began, .changed:
             let pos = recognizer.location(in: self)
             guard let (nx, ny) = mapToStream(pos) else { return }
-            inputPlugin.sendMotionAbsolute(x: nx, y: ny)
+            sendMappedMotion(x: nx, y: ny)
         default:
             break
         }
@@ -948,7 +951,7 @@ class FullscreenTouchUIView: UIView {
             }
             lastSentPoint = (nx, ny)
             latestPoint = (nx, ny)
-            inputPlugin.sendMotionAbsolute(x: nx, y: ny)
+            sendMappedMotion(x: nx, y: ny)
         case .scroll:
             lastSentPoint = nil
             latestPoint = nil
@@ -961,7 +964,7 @@ class FullscreenTouchUIView: UIView {
             }
             lastSentPoint = (nx, ny)
             latestPoint = (nx, ny)
-            inputPlugin.sendMotionAbsolute(x: nx, y: ny)
+            sendMappedMotion(x: nx, y: ny)
             inputPlugin.sendButton(pressed: true)
             buttonIsDown = true
             // TODO: forward pressure via tablet events when desktop supports it
@@ -983,7 +986,7 @@ class FullscreenTouchUIView: UIView {
             latestPoint = (nx, ny)
             let now = CACurrentMediaTime()
             if now - lastMotionSendTime >= streamTouchMotionInterval {
-                inputPlugin.sendMotionAbsolute(x: nx, y: ny)
+                sendMappedMotion(x: nx, y: ny)
                 lastSentPoint = (nx, ny)
                 lastMotionSendTime = now
             }
@@ -1008,7 +1011,7 @@ class FullscreenTouchUIView: UIView {
                 ignoreCurrentTouch = true
                 return
             }
-            inputPlugin.sendMotionAbsolute(x: nx, y: ny)
+            sendMappedMotion(x: nx, y: ny)
         }
         prevTouch = pos
     }
@@ -1016,13 +1019,13 @@ class FullscreenTouchUIView: UIView {
     private func flushLatestPointIfNeeded() {
         guard let latest = latestPoint else { return }
         guard let lastSent = lastSentPoint else {
-            inputPlugin.sendMotionAbsolute(x: latest.0, y: latest.1)
+            sendMappedMotion(x: latest.0, y: latest.1)
             lastSentPoint = latest
             return
         }
         if abs(latest.0 - lastSent.0) > streamTouchFlushEpsilon || abs(latest.1 - lastSent.1) > streamTouchFlushEpsilon {
             NSLog("[anchor] [input] drag_end_flush x=%.3f y=%.3f", latest.0, latest.1)
-            inputPlugin.sendMotionAbsolute(x: latest.0, y: latest.1)
+            sendMappedMotion(x: latest.0, y: latest.1)
             lastSentPoint = latest
         }
     }
@@ -1062,6 +1065,14 @@ class FullscreenTouchUIView: UIView {
         prevTouch = nil
         lastSentPoint = nil
         latestPoint = nil
+    }
+
+    private func sendMappedMotion(x: Float, y: Float) {
+        guard let selectedOutputName else {
+            NSLog("[anchor] [input] dropping mapped motion without selected output")
+            return
+        }
+        inputPlugin.sendMotionAbsolute(x: x, y: y, outputName: selectedOutputName)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {

@@ -1806,7 +1806,10 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
             let message = AnchorInputCodec.relative(dx: number("dx"), dy: number("dy"))
             try await sendV1Record(capabilityId, type: Self.inputRelativeType, payload: try message.serializedData(), session: session)
         case "anchor.input.motion_absolute":
-            let message = try AnchorInputCodec.absolute(x: number("x"), y: number("y"))
+            let message = try AnchorInputCodec.absolute(
+                x: number("x"), y: number("y"),
+                targetOutputName: json["output_name"] as? String ?? ""
+            )
             try await sendV1Record(capabilityId, type: Self.inputAbsoluteType, payload: try message.serializedData(), session: session)
         case "anchor.input.button":
             let button: AnchorPointerButton

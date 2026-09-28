@@ -47,6 +47,17 @@ pub trait InputBackend {
 
     fn pointer_motion(&mut self, time: u32, dx: f64, dy: f64);
     fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64);
+    /// Route a mapped absolute point to the named output. The default retains
+    /// legacy behavior for clients that do not provide an output name.
+    fn pointer_motion_absolute_targeted(
+        &mut self,
+        time: u32,
+        x_norm: f64,
+        y_norm: f64,
+        _output_name: Option<&str>,
+    ) {
+        self.pointer_motion_absolute(time, x_norm, y_norm);
+    }
     fn pointer_button(&mut self, time: u32, button: u32, pressed: bool);
     fn pointer_axis(&mut self, time: u32, horizontal: bool, value: f64);
     fn pointer_frame(&mut self);

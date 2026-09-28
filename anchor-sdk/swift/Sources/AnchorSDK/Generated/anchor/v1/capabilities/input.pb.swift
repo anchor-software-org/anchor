@@ -107,6 +107,10 @@ public nonisolated struct ANCHInputInputPointerAbsolute: Sendable {
 
   public var y: UInt32 = 0
 
+  /// Stable Wayland output name selected by the sender. Empty preserves the
+  /// legacy desktop-selected mapping for older clients.
+  public var targetOutputName: String = String()
+
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
@@ -233,7 +237,7 @@ nonisolated extension ANCHInputInputText: SwiftProtobuf.Message, SwiftProtobuf._
 
 nonisolated extension ANCHInputInputPointerAbsolute: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".InputPointerAbsolute"
-  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}x\0\u{1}y\0")
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}x\0\u{1}y\0\u{3}target_output_name\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -243,6 +247,7 @@ nonisolated extension ANCHInputInputPointerAbsolute: SwiftProtobuf.Message, Swif
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self.x) }()
       case 2: try { try decoder.decodeSingularUInt32Field(value: &self.y) }()
+      case 3: try { try decoder.decodeSingularStringField(value: &self.targetOutputName) }()
       default: break
       }
     }
@@ -255,12 +260,16 @@ nonisolated extension ANCHInputInputPointerAbsolute: SwiftProtobuf.Message, Swif
     if self.y != 0 {
       try visitor.visitSingularUInt32Field(value: self.y, fieldNumber: 2)
     }
+    if !self.targetOutputName.isEmpty {
+      try visitor.visitSingularStringField(value: self.targetOutputName, fieldNumber: 3)
+    }
     try unknownFields.traverse(visitor: &visitor)
   }
 
   public static func ==(lhs: ANCHInputInputPointerAbsolute, rhs: ANCHInputInputPointerAbsolute) -> Bool {
     if lhs.x != rhs.x {return false}
     if lhs.y != rhs.y {return false}
+    if lhs.targetOutputName != rhs.targetOutputName {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }

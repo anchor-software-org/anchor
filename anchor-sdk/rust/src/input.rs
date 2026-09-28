@@ -92,4 +92,15 @@ mod tests {
         assert_eq!(message.dx_1000ths, -1250);
         assert_eq!(message.dy_1000ths, 875);
     }
+
+    #[test]
+    fn absolute_motion_round_trip_preserves_selected_output_name() {
+        let expected = v1::capabilities::input::InputPointerAbsolute {
+            x: 12_345,
+            y: 54_321,
+            target_output_name: "HEADLESS-3".into(),
+        };
+        let decoded = decode_pointer_absolute(&expected.encode_to_vec()).unwrap();
+        assert_eq!(decoded, expected);
+    }
 }

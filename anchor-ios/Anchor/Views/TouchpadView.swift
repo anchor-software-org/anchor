@@ -45,7 +45,12 @@ struct TouchpadView: View {
         VStack(spacing: 0) {
             configurationBar
 
-            TouchpadGestureArea(inputPlugin: inputPlugin, sensitivity: sensitivity, mode: pointerMode)
+            TouchpadGestureArea(
+                inputPlugin: inputPlugin,
+                sensitivity: sensitivity,
+                mode: pointerMode,
+                selectedOutputName: videoPlugin.selectedOutputName
+            )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay {
                     ZStack {
@@ -266,12 +271,14 @@ struct TouchpadGestureArea: UIViewRepresentable {
     let inputPlugin: InputPlugin
     let sensitivity: Float
     let mode: TouchpadPointerMode
+    let selectedOutputName: String?
 
     func makeUIView(context: Context) -> TouchpadUIView {
         let view = TouchpadUIView()
         view.inputPlugin = inputPlugin
         view.sensitivity = sensitivity
         view.mode = mode
+        view.selectedOutputName = selectedOutputName
         view.isMultipleTouchEnabled = true
         view.backgroundColor = UIColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1)
         return view
@@ -279,6 +286,7 @@ struct TouchpadGestureArea: UIViewRepresentable {
 
     func updateUIView(_ uiView: TouchpadUIView, context: Context) {
         uiView.sensitivity = sensitivity
+        uiView.selectedOutputName = selectedOutputName
         uiView.updateMode(mode)
     }
 }
@@ -287,6 +295,7 @@ final class TouchpadUIView: UIView {
     var inputPlugin: InputPlugin!
     var sensitivity: Float = 1.5
     var mode: TouchpadPointerMode = .relative
+    var selectedOutputName: String?
     private var prevTouch: CGPoint?
     private var startTouch: CGPoint?
     private var touchDownTime: TimeInterval = 0
@@ -433,7 +442,8 @@ final class TouchpadUIView: UIView {
         guard let point = TouchpadCoordinateMapper.absolute(
             x: position.x, y: position.y, width: bounds.width, height: bounds.height
         ) else { return }
-        inputPlugin.sendMotionAbsolute(x: point.x, y: point.y)
+        guard let selectedOutputName else { return }
+        inputPlugin.sendMotionAbsolute(x: point.x, y: point.y, outputName: selectedOutputName)
     }
 
     private func resetTouch() {

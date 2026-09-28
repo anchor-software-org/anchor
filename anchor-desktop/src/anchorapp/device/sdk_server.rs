@@ -878,7 +878,7 @@ async fn handle_session(
                     && type_url == input::POINTER_ABSOLUTE_TYPE_URL =>
             {
                 if let Ok(message) = input::decode_pointer_absolute(&payload) {
-                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.motion_absolute", "x": message.x as f64 / 65535.0, "y": message.y as f64 / 65535.0, "time": now_ms()});
+                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.motion_absolute", "x": message.x as f64 / 65535.0, "y": message.y as f64 / 65535.0, "output_name": message.target_output_name, "time": now_ms()});
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
                         message: AnchorMessage::Json(packet.to_string()),

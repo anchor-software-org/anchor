@@ -236,7 +236,11 @@ fn run_input_loop(rx: Receiver<AnchorEvent>, broker_tx: Sender<AnchorEvent>) {
                 perf.record_motion_absolute(event_started);
                 let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                backend.pointer_motion_absolute(time, x, y);
+                let output_name = payload
+                    .get("output_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|name| !name.is_empty());
+                backend.pointer_motion_absolute_targeted(time, x, y, output_name);
             }
             "anchor.input.button" => {
                 perf.record_button(event_started);

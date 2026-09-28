@@ -197,9 +197,12 @@ final class AnchorFeatureCodecTests: XCTestCase {
         XCTAssertEqual(relative.dx1000Ths, -1250)
         XCTAssertEqual(relative.dy1000Ths, 875)
 
-        let absolute = try AnchorInputCodec.absolute(x: -1, y: 1.5)
+        let absolute = try AnchorInputCodec.absolute(
+            x: -1, y: 1.5, targetOutputName: "HEADLESS-3"
+        )
         XCTAssertEqual(absolute.x, 0)
         XCTAssertEqual(absolute.y, 65_535)
+        XCTAssertEqual(absolute.targetOutputName, "HEADLESS-3")
         XCTAssertThrowsError(try AnchorInputCodec.absolute(x: .nan, y: 0))
     }
 
