@@ -9,8 +9,8 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 desktop="$repo_root/anchor-desktop"
 frontend="$desktop/frontend"
 
-FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-13-14-50/ffmpeg-n8.1.2-52-g5a03dfa0f6-linux64-gpl-shared-8.1.tar.xz"
-FFMPEG_SHA256="8621a28ecbbe87df59b571e2709f4d5492c7c87c11455028f10b2f6324578160"
+FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-09-28-13-06/ffmpeg-n8.1.3-6-gff48edd8b2-linux64-gpl-shared-8.1.tar.xz"
+FFMPEG_SHA256="57523ecdd62e78eda9a7571e431be6c40e39cd371a8c6e7ddfbf3c2676487d58"
 
 features=()
 if [[ "${VENDOR_FFMPEG:-0}" == "1" ]]; then
