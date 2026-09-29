@@ -103,7 +103,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
 
       - name: Build debug APK
         working-directory: .
