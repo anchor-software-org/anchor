@@ -365,8 +365,8 @@ final class NetworkPlugin: Plugin, ObservableObject, @unchecked Sendable {
                 throw AnchorNetworkTransportError.connectionFailed("client identity is unavailable")
             }
 
-            // With an advertised device id, match trust by identity — the
-            // wired IP won't equal the stored `lastKnownIp`.
+            // With an advertised device id, match trust by identity instead
+            // of requiring its saved address to match this connection.
             let trusted = trustedStore.devices.values.first { entry in
                 if let expectedDeviceId {
                     return entry.deviceId == expectedDeviceId

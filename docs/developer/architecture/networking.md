@@ -18,18 +18,14 @@ Anchor sessions.
 On Android a wired link uses USB tethering (RNDIS/NCM): the user enables
 tethering while the phone is plugged in, Android runs a DHCP server on the
 new `rndis*`/`usb*`/`ncm*` interface, the desktop receives a lease, and port
-`5027` is immediately reachable over the wire. On iOS the equivalent is
-Personal Hotspot over USB (a `bridge100` interface on the phone) or a Mac
-sharing its connection to the device over USB (`en2`+). In every case the
-session transport is unchanged.
+`5027` is immediately reachable over the wire. iOS/iPadOS does not use its
+device USB cable as an Anchor transport.
 
-Neither Android's NSD nor iOS can see the tethered downstream link, so wired
-discovery uses a directed UDP probe instead of mDNS:
+Android's NSD cannot see the tethered downstream link, so wired discovery
+uses a directed UDP probe instead of mDNS:
 
 - The phone sends `ANCHOR_PROBE_V1` to the subnet's broadcast address on UDP
-  port `5028`. Android probes only tethered interfaces; iOS — which has no
-  mDNS discovery at all — probes every broadcast-capable interface and marks
-  replies from tethered ones as wired.
+  port `5028` through tethered interfaces.
 - The desktop probe responder (`device/probe.rs`) answers with
   `ANCHOR_HERE_V1\n` followed by a JSON object carrying the same public
   identity the mDNS advertisement publishes: `device_id`, `device_name`,
@@ -37,7 +33,7 @@ discovery uses a directed UDP probe instead of mDNS:
 - Replies are trusted by packet source address. Certificate material is public
   and still verified against the pairing pin before a session is trusted.
 
-When a desktop is reachable over both Wi-Fi and USB, the clients prefer the
+When a desktop is reachable over both Wi-Fi and USB, Android prefers the
 wired address for new connections and reconnects. Wired discovery does not
 migrate an already-established session.
 

@@ -65,18 +65,9 @@ iOS support is preview-only and is not part of the supported release target.
 For now there is a working version for Ipad, but it is still very much experimental 
 and needing development.
 
-The iOS app can reach the desktop over a cable too. Plug the device in and
-either enable **Personal Hotspot** on it (Settings → Personal Hotspot → Allow
-Others to Join), or share the desktop's connection to the device over USB
-(macOS: System Settings → General → Sharing → Internet Sharing). Both give
-the link an address automatically; the app probes local interfaces and lists
-answering desktops under Nearby, preferring the wired path for new
-connections.
-
-As with Android tethering, enabling Personal Hotspot can make the desktop
-route its own internet traffic through the phone's mobile data — configure
-the new wired connection to not be a default route if that is unwanted
-(NetworkManager: `nmcli connection modify <connection> ipv4.never-default yes`).
+The iOS app connects over the network using the desktop address. A normal USB
+cable is for pairing, installation, and debugging only; it is not an Anchor
+network transport on iPadOS.
 
 ## Not supported
 
