@@ -340,11 +340,14 @@ public enum AnchorInputCodec {
         return message
     }
 
-    public static func absolute(x: Double, y: Double) throws -> ANCHInputInputPointerAbsolute {
+    public static func absolute(
+        x: Double, y: Double, targetOutputName: String = ""
+    ) throws -> ANCHInputInputPointerAbsolute {
         guard x.isFinite, y.isFinite else { throw AnchorFeatureCodecError.invalidCoordinate }
         var message = ANCHInputInputPointerAbsolute()
         message.x = UInt32(max(0, min(65_535, (x * 65_535).rounded())))
         message.y = UInt32(max(0, min(65_535, (y * 65_535).rounded())))
+        message.targetOutputName = targetOutputName
         return message
     }
 

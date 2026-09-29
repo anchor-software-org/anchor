@@ -570,6 +570,49 @@ impl InputBackend for WaylandInput {
         self.virtual_pointer.frame();
     }
 
+    fn pointer_motion_absolute_targeted(
+        &mut self,
+        time: u32,
+        x_norm: f64,
+        y_norm: f64,
+        output_name: Option<&str>,
+    ) {
+        let Some(output_name) = output_name else {
+            self.pointer_motion_absolute(time, x_norm, y_norm);
+            return;
+        };
+        let Some(output) = self.outputs.values().find(|output| output.name == output_name) else {
+            log::warn!("Input: rejecting absolute motion for missing output '{output_name}'");
+            return;
+        };
+        let Some(pointer) = self.output_virtual_pointers.get(output_name).cloned() else {
+            log::warn!(
+                "Input: rejecting absolute motion; no output-bound pointer for '{output_name}'"
+            );
+            return;
+        };
+        let (x, y) = absolute_position_in_output(output.width, output.height, x_norm, y_norm);
+        log::debug!(
+            "Input: targeted abs norm=({:.3},{:.3}) -> output-local=({},{}) extent={}x{} output='{}'",
+            x_norm,
+            y_norm,
+            x,
+            y,
+            output.width,
+            output.height,
+            output_name
+        );
+        // A stroke is sent as a targeted absolute motion followed by button
+        // transitions. Keep the selected output's virtual pointer active so
+        // those transitions use the same Wayland device as the motion. Using
+        // `pointer` only here would move one output-bound pointer and press
+        // whichever pointer was selected by an earlier stream update.
+        self.virtual_pointer = pointer;
+        self.pointer_is_output_bound = true;
+        self.virtual_pointer.motion_absolute(time, x, y, output.width, output.height);
+        self.virtual_pointer.frame();
+    }
+
     fn pointer_button(&mut self, time: u32, button: u32, pressed: bool) {
         let btn_state = if pressed {
             wl_pointer::ButtonState::Pressed

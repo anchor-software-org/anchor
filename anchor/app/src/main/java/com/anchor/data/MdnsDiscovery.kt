@@ -11,7 +11,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** A desktop discovered on the local network via mDNS. */
+/** A desktop discovered on the local network via mDNS or a wired USB probe. */
 data class DiscoveredDevice(
     val deviceId: String?,
     val name: String,
@@ -19,6 +19,8 @@ data class DiscoveredDevice(
     val port: Int,
     /** Public desktop certificate used only to pin a pairing-only connection. */
     val certificateDer: ByteArray? = null,
+    /** True when discovered over USB tethering (see [WiredDiscovery]). */
+    val wired: Boolean = false,
 )
 
 /** Reassembles the bounded TXT chunks emitted by the desktop mDNS advertiser. */

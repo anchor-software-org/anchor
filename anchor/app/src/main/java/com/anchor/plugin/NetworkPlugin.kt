@@ -204,12 +204,6 @@ class NetworkPlugin(
                 Log.w(TAG, "SDK identity could not be created for pairing: ${error.message}")
                 return@launch
             }
-            val identityDir = File(context.filesDir, "sdk-identity")
-            val pendingCertificate = File(identityDir, "pairing-${invitation.inviterDeviceId}.pem")
-            val pem = "-----BEGIN CERTIFICATE-----\n" +
-                android.util.Base64.encodeToString(invitation.inviterCertificateDer, android.util.Base64.NO_WRAP) +
-                "\n-----END CERTIFICATE-----\n"
-            pendingCertificate.writeText(pem)
             val transcriptHash = AnchorProtocol.pairingTranscriptHash(invitation, identity.certificateFingerprint)
             val hello = PairingHello(
                 invitationId = invitation.invitationId,
@@ -219,15 +213,19 @@ class NetworkPlugin(
                 transcriptHash = transcriptHash,
             )
             try {
+                // The SDK only permits an unpinned bootstrap for pairing, so
+                // the advertised certificate cannot pin TLS — the approval is
+                // checked against the advertised identity below instead.
                 val pairing = AnchorPairingSession.connect(
                     MsQuicTransport(),
                     QuicConnectRequest(
                         host = host,
                         port = port,
                         serverName = "anchor.local",
-                        expectedCertificateFingerprint = invitation.inviterCertificateFingerprint,
+                        expectedCertificateFingerprint = ByteArray(0),
                         localIdentity = QuicClientIdentity(identity.certificatePemPath, identity.privateKeyPemPath),
-                        trustedPeerCertificatePemPath = pendingCertificate.path,
+                        trustedPeerCertificatePemPath = "",
+                        pairingBootstrap = true,
                     ),
                     hello,
                 )
@@ -243,7 +241,19 @@ class NetworkPlugin(
                         if (!resolution.transcriptHash.contentEquals(transcriptHash)) {
                             throw IllegalStateException("desktop pairing approval did not match this invitation")
                         }
-                        trustedStore.addDevice(invitation.inviterDeviceId, "Anchor Desktop", pem)
+                        // Refuse to trust a responder that does not match the
+                        // advertised identity.
+                        require(resolution.approverDeviceId == invitation.inviterDeviceId &&
+                            resolution.approverCertificateDer.contentEquals(invitation.inviterCertificateDer)) {
+                            "paired desktop identity does not match the advertised device"
+                        }
+                        CertificateFactory.getInstance("X.509").generateCertificate(
+                            ByteArrayInputStream(resolution.approverCertificateDer)
+                        )
+                        val pem = "-----BEGIN CERTIFICATE-----\n" +
+                            android.util.Base64.encodeToString(resolution.approverCertificateDer, android.util.Base64.NO_WRAP) +
+                            "\n-----END CERTIFICATE-----\n"
+                        trustedStore.addDevice(resolution.approverDeviceId, "Anchor Desktop", pem)
                         Log.i(TAG, "SDK pairing approved for ${invitation.inviterDeviceId}")
                         pairing.close()
                         // This coroutine owns the pairing session. Release
@@ -271,8 +281,10 @@ class NetworkPlugin(
 
     /**
      * Starts the normal nearby-device pairing flow. Discovery supplies public
-     * certificate material only so TLS can be pinned before the pairing stream
-     * opens; it grants no access and is not saved unless the desktop approves.
+     * certificate material that is bound into the pairing transcript and then
+     * checked against the identity the desktop returns on approval; nothing is
+     * saved unless the desktop approves and its identity matches the
+     * advertisement.
      */
     fun pairNearby(device: DeviceListEntry) {
         val id = device.deviceId

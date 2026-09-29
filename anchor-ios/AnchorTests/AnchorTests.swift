@@ -236,6 +236,42 @@ final class AnchorTests: XCTestCase {
         )
     }
 
+    func testMappedInputUsesTheCurrentPickerSelectionImmediately() {
+        let outputs = [
+            VideoPlugin.StreamOutput(id: "0", name: "eDP-1", width: 1920, height: 1080),
+            VideoPlugin.StreamOutput(id: "1", name: "HEADLESS-3", width: 1180, height: 820),
+        ]
+
+        // The picker has already selected HEADLESS-3. It is authoritative;
+        // Sideboat must not wait for another desktop status message.
+        XCTAssertEqual(
+            VideoPlugin.resolveOutputName(outputID: "1", outputs: outputs),
+            "HEADLESS-3"
+        )
+    }
+
+    func testMappedInputHasNoTargetAfterItsSelectedOutputIsDeleted() {
+        let remainingOutputs = [
+            VideoPlugin.StreamOutput(id: "0", name: "eDP-1", width: 1920, height: 1080),
+        ]
+
+        XCTAssertNil(VideoPlugin.resolveOutputName(outputID: "1", outputs: remainingOutputs))
+        XCTAssertNil(VideoPlugin.resolveOutputName(outputID: "", outputs: remainingOutputs))
+    }
+
+    func testMappedInputPayloadCarriesTheExactOutputNameAndRejectsNoTarget() {
+        let payload = try? XCTUnwrap(InputPlugin.mappedMotionPayload(
+            x: 0.875, y: 0.125, outputName: " HEADLESS-3 "
+        ))
+
+        XCTAssertEqual(payload?["plugin_id"] as? String, "input")
+        XCTAssertEqual(payload?["type"] as? String, "anchor.input.motion_absolute")
+        XCTAssertEqual(payload?["output_name"] as? String, "HEADLESS-3")
+        XCTAssertEqual(payload?["x"] as? Float, 0.875)
+        XCTAssertEqual(payload?["y"] as? Float, 0.125)
+        XCTAssertNil(InputPlugin.mappedMotionPayload(x: 0.5, y: 0.5, outputName: " \n "))
+    }
+
     func testInitialScreenOutputSkipsZeroSizedEntries() {
         var stale = ANCHScreenScreenOutput()
         stale.outputID = "stale"
@@ -614,6 +650,7 @@ final class AnchorTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return directory.appendingPathComponent("payload.part")
     }
+
 }
 
 private actor EventRecorder {

@@ -227,6 +227,11 @@ impl DeviceManager {
             let _mdns_daemon =
                 super::mdns::start_advertising(&identity_device_id, &identity_certificate_pem);
 
+            // Answers wired-subnet probes mDNS cannot reach.
+            // Kept alive for the thread's lifetime.
+            let _probe_socket =
+                super::probe::start_responder(identity_device_id, identity_certificate_pem);
+
             SdkServer::new(
                 sdk_identity,
                 registry.clone(),

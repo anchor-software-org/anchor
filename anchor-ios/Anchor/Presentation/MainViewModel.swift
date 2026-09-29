@@ -351,26 +351,31 @@ class MainViewModel: ObservableObject {
         connectToIp(ip)
     }
 
-    func connectToIp(_ ip: String) {
+    func connectToIp(_ ip: String, port: Int = 5027,
+                     expectedDeviceId: String? = nil,
+                     expectedCertificate: Data? = nil) {
         guard !isPreviewMode else { return }
         guard connectionState.status == .disconnected, !ip.isEmpty else { return }
         desktopIp = ip
         lastConnectedIp = ip
         networkPlugin.connect(
             ip: ip,
-            port: 5027,
-            displayPixelSize: Self.currentDisplayPixelSize()
+            port: port,
+            displayPixelSize: Self.currentDisplayPixelSize(),
+            expectedDeviceId: expectedDeviceId,
+            expectedCertificate: expectedCertificate
         )
 
-        // QUIC includes TLS 1.3 and may also wait for a desktop pairing prompt.
+        // A user-initiated connection must fail promptly when the host is not
+        // reachable. Pairing occurs only after a transport connection exists.
         connectionTimeoutTask?.cancel()
         connectionTimeoutTask = Task {
-            try? await Task.sleep(nanoseconds: 65_000_000_000)
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
             if connectionState.status == .connecting {
                 disconnect()
                 connectionState = ConnectionState(
                     status: .disconnected,
-                    error: "Connection or pairing timed out after 65s"
+                    error: "Connection timed out after 5s"
                 )
             }
         }

@@ -29,14 +29,28 @@ class InputPlugin: Plugin {
         ])
     }
 
-    func sendMotionAbsolute(x: Float, y: Float) {
-        send([
+    /// Sends a position that is mapped to one desktop output. Unlike relative
+    /// pointer motion, an absolute position is unsafe without its output name:
+    /// the desktop must never guess a different screen from coordinates alone.
+    func sendMotionAbsolute(x: Float, y: Float, outputName: String) {
+        guard var payload = Self.mappedMotionPayload(x: x, y: y, outputName: outputName) else {
+            NSLog("[anchor] [input] dropping absolute motion without streamed output")
+            return
+        }
+        payload["time"] = timestamp()
+        send(payload)
+    }
+
+    static func mappedMotionPayload(x: Float, y: Float, outputName: String) -> [String: Any]? {
+        let target = outputName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return nil }
+        return [
             "plugin_id": "input",
             "type": "anchor.input.motion_absolute",
             "x": x,
             "y": y,
-            "time": timestamp()
-        ])
+            "output_name": target,
+        ]
     }
 
     func sendButton(button: Int = BTN_LEFT, pressed: Bool) {

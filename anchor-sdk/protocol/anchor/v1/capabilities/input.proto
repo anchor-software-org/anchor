@@ -25,6 +25,9 @@ message InputPointerAbsolute {
   // Coordinates are normalized to [0, 65535] across the selected target.
   uint32 x = 1;
   uint32 y = 2;
+  // Stable Wayland output name selected by the sender. Empty preserves the
+  // legacy desktop-selected mapping for older clients.
+  string target_output_name = 3;
 }
 
 message InputPointerRelative {

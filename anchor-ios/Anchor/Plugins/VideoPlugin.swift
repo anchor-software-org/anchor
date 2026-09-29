@@ -334,6 +334,20 @@ class VideoPlugin: Plugin, ObservableObject {
         ))
     }
 
+    /// Sideboat's local selection is the authority for mapped input. The
+    /// picker already has the desktop's output list, so touch must not wait
+    /// for a later stream-status message before it follows a new selection.
+    var selectedOutputName: String? {
+        Self.resolveOutputName(outputID: selectedOutputID, outputs: availableOutputs)
+    }
+
+    static func resolveOutputName(outputID: String, outputs: [StreamOutput]) -> String? {
+        guard !outputID.isEmpty,
+              let output = outputs.first(where: { $0.id == outputID }) else { return nil }
+        let name = output.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
     func requestKeyframe() {
         broker.send(AnchorEvent(target: .device, message: .json(#"{"plugin_id":"wayland","command":"request_keyframe"}"#)))
     }
