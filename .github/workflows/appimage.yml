@@ -30,7 +30,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The runner image ships a stale apt index; without an update the cache
       # action downloads superseded package versions and the mirror 404s.
