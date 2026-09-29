@@ -602,8 +602,15 @@ impl InputBackend for WaylandInput {
             output.height,
             output_name
         );
-        pointer.motion_absolute(time, x, y, output.width, output.height);
-        pointer.frame();
+        // A stroke is sent as a targeted absolute motion followed by button
+        // transitions. Keep the selected output's virtual pointer active so
+        // those transitions use the same Wayland device as the motion. Using
+        // `pointer` only here would move one output-bound pointer and press
+        // whichever pointer was selected by an earlier stream update.
+        self.virtual_pointer = pointer;
+        self.pointer_is_output_bound = true;
+        self.virtual_pointer.motion_absolute(time, x, y, output.width, output.height);
+        self.virtual_pointer.frame();
     }
 
     fn pointer_button(&mut self, time: u32, button: u32, pressed: bool) {
