@@ -366,15 +366,16 @@ class MainViewModel: ObservableObject {
             expectedCertificate: expectedCertificate
         )
 
-        // QUIC includes TLS 1.3 and may also wait for a desktop pairing prompt.
+        // A user-initiated connection must fail promptly when the host is not
+        // reachable. Pairing occurs only after a transport connection exists.
         connectionTimeoutTask?.cancel()
         connectionTimeoutTask = Task {
-            try? await Task.sleep(nanoseconds: 65_000_000_000)
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
             if connectionState.status == .connecting {
                 disconnect()
                 connectionState = ConnectionState(
                     status: .disconnected,
-                    error: "Connection or pairing timed out after 65s"
+                    error: "Connection timed out after 5s"
                 )
             }
         }
