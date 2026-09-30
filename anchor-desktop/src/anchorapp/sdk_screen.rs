@@ -234,8 +234,9 @@ impl SdkScreenSender {
     /// `newest_lost` (and possibly older ones) never reached the decoder. Only
     /// an IDR encoded after it makes predictive units useful again.
     pub fn mark_frame_gap(&self, newest_lost: u64) {
-        if self.frame_target.lock().unwrap().is_some() {
-            self.recovery.lock().unwrap().on_gap(newest_lost);
+        if self.frame_target.lock().unwrap().is_some()
+            && self.recovery.lock().unwrap().on_gap(newest_lost, Instant::now())
+        {
             self.raise_keyframe_request();
         }
     }
@@ -272,7 +273,7 @@ impl SdkScreenSender {
         );
         let flags = if contains_h264_idr(frame) { video_frame::FLAG_KEYFRAME } else { 0 };
         let keyframe = flags & video_frame::FLAG_KEYFRAME != 0;
-        let admission = self.recovery.lock().unwrap().admit(keyframe);
+        let admission = self.recovery.lock().unwrap().admit(keyframe, Instant::now());
         if admission.request_keyframe {
             self.raise_keyframe_request();
         }
@@ -437,7 +438,11 @@ impl SdkScreenSender {
             });
             let stream_send_us = stream_started.elapsed().as_micros();
             if let Err(error) = result {
-                if self.recovery.lock().unwrap().on_send_failed(keyframe, source_frame_id) {
+                if self.recovery.lock().unwrap().on_send_failed(
+                    keyframe,
+                    source_frame_id,
+                    Instant::now(),
+                ) {
                     self.raise_keyframe_request();
                 }
                 log::warn!(
@@ -502,10 +507,14 @@ impl SdkScreenSender {
                             (flow.send_buffer_space(), 0)
                         }
                     };
-                    // A failed predictive frame requests an IDR immediately. A
-                    // failed IDR holds predictive frames and is retried by the
-                    // next one, paced by the capture loop's IDR interval.
-                    if self.recovery.lock().unwrap().on_send_failed(keyframe, source_frame_id) {
+                    // A failed predictive frame requests an IDR as soon as
+                    // backoff allows. A failed IDR holds predictive frames and
+                    // is retried by the next one.
+                    if self.recovery.lock().unwrap().on_send_failed(
+                        keyframe,
+                        source_frame_id,
+                        Instant::now(),
+                    ) {
                         self.raise_keyframe_request();
                     }
                     log::warn!(
@@ -603,15 +612,28 @@ struct Admission {
     request_keyframe: bool,
 }
 
-/// Sender-side H.264 recovery decisions, kept free of transports and threads so
-/// a whole loss/recovery sequence can be driven by a test.
+/// Delays between one viewer's consecutive keyframe requests while recovery
+/// keeps failing. The first request after a healthy stream is immediate.
+const KEYFRAME_RETRY_BACKOFF: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+    Duration::from_millis(2000),
+];
+
+/// Sender-side H.264 recovery decisions, kept free of transports, threads and
+/// the wall clock so a whole loss/recovery sequence can be driven by a test.
 ///
-/// Requests are level-triggered: while the decoder's reference chain is broken,
-/// every held predictive frame re-raises the IDR request, and only a delivered
-/// IDR encoded after the newest lost frame ends recovery. Pacing IDRs is the capture loop's job (it honors at most
-/// one forced IDR per `MIN_IDR_INTERVAL`), so a recovery IDR that is lost —
-/// coalesced away, or rejected by a full datagram budget — is simply requested
-/// again instead of leaving the stream frozen until the periodic keyframe.
+/// While the decoder's reference chain is broken, held predictive frames keep
+/// asking for an IDR, and only a delivered IDR encoded after the newest lost
+/// frame ends recovery. A lost recovery IDR is therefore always requested
+/// again, rather than leaving the stream frozen until the periodic keyframe.
+///
+/// Requests are postponed, never dropped: each unsuccessful one pushes the
+/// next back along `KEYFRAME_RETRY_BACKOFF`, and a healing IDR resets it. The
+/// encoder is shared by every viewer, so without this a viewer whose
+/// connection has stalled would force IDRs on all of them at the capture
+/// loop's `MIN_IDR_INTERVAL` until its session timed out.
 #[derive(Debug, Default)]
 struct KeyframeRecovery {
     /// Newest capture frame (`source_frame_id`) known not to have reached the
@@ -620,36 +642,55 @@ struct KeyframeRecovery {
     /// can reference it, so P-frames are held while this is set. This keeps
     /// the receiver from displaying a stale/broken reference chain.
     lost_through: Option<u64>,
+    /// Keyframe requests made since the chain last healed.
+    attempts: usize,
+    /// Earliest time the next keyframe request may be raised.
+    next_request_at: Option<Instant>,
 }
 
 impl KeyframeRecovery {
+    /// Returns whether a wanted keyframe request may be raised now, and if so
+    /// schedules the next one further out.
+    fn request_due(&mut self, wanted: bool, now: Instant) -> bool {
+        if !wanted || self.next_request_at.is_some_and(|at| now < at) {
+            return false;
+        }
+        let delay = KEYFRAME_RETRY_BACKOFF[self.attempts.min(KEYFRAME_RETRY_BACKOFF.len() - 1)];
+        self.next_request_at = Some(now + delay);
+        self.attempts += 1;
+        true
+    }
+
     /// Capture frame `newest_lost` (and possibly older ones) was coalesced or
-    /// dropped before reaching the decoder. The caller always requests a
-    /// recovery IDR.
-    fn on_gap(&mut self, newest_lost: u64) {
+    /// dropped before reaching the decoder. Returns whether to request a
+    /// recovery IDR now; if backoff defers it, a later held frame asks.
+    fn on_gap(&mut self, newest_lost: u64, now: Instant) -> bool {
         self.lost_through = Some(self.lost_through.map_or(newest_lost, |l| l.max(newest_lost)));
+        self.request_due(true, now)
     }
 
     /// Decide whether one encoded access unit goes on the wire. A held
-    /// predictive frame means no healing IDR has landed yet, so it keeps the
-    /// request raised.
-    fn admit(&mut self, keyframe: bool) -> Admission {
+    /// predictive frame means no healing IDR has landed yet, so it asks for
+    /// one again once backoff allows.
+    fn admit(&mut self, keyframe: bool, now: Instant) -> Admission {
         if should_drop_predictive_frame(self.lost_through.is_some(), keyframe) {
-            return Admission { send: false, request_keyframe: true };
+            return Admission { send: false, request_keyframe: self.request_due(true, now) };
         }
         Admission { send: true, request_keyframe: false }
     }
 
     /// The transport accepted an access unit. Returns true when it was an IDR
-    /// encoded after every known loss: that heals the chain, so any IDR
-    /// request still pending is redundant and should be withdrawn to keep the
-    /// capture loop from forcing a second one. An older IDR — one queued
-    /// before a later frame was dropped — heals nothing and leaves the
-    /// request standing.
+    /// encoded after every known loss: that heals the chain and resets
+    /// backoff, so any IDR request still pending is redundant and should be
+    /// withdrawn to keep the capture loop from forcing a second one. An older
+    /// IDR — one queued before a later frame was dropped — heals nothing and
+    /// leaves the request standing.
     fn on_delivered(&mut self, keyframe: bool, source_frame_id: u64) -> bool {
         let heals = keyframe && self.lost_through.is_none_or(|lost| source_frame_id > lost);
         if heals {
             self.lost_through = None;
+            self.attempts = 0;
+            self.next_request_at = None;
         }
         heals
     }
@@ -659,9 +700,10 @@ impl KeyframeRecovery {
     /// held. Returns whether to request an IDR right away: a rejected IDR is
     /// retried by the next held frame instead, which keeps a full datagram
     /// budget from being answered with an immediate second keyframe burst.
-    fn on_send_failed(&mut self, keyframe: bool, source_frame_id: u64) -> bool {
-        self.on_gap(source_frame_id);
-        should_schedule_keyframe_recovery(keyframe)
+    fn on_send_failed(&mut self, keyframe: bool, source_frame_id: u64, now: Instant) -> bool {
+        self.lost_through =
+            Some(self.lost_through.map_or(source_frame_id, |l| l.max(source_frame_id)));
+        self.request_due(should_schedule_keyframe_recovery(keyframe), now)
     }
 }
 
@@ -1071,13 +1113,13 @@ mod tests {
         let mut now = Instant::now();
 
         // Predictive frame 10 is rejected by the transport.
-        assert!(recovery.admit(false).send);
-        assert!(recovery.on_send_failed(false, 10), "first recovery IDR is requested");
+        assert!(recovery.admit(false, now).send);
+        assert!(recovery.on_send_failed(false, 10, now), "first recovery IDR is requested");
 
         // The encoder emits that IDR as frame 11, but P-frame 12 lands behind
         // it and the drain keeps only the newest access unit.
-        recovery.on_gap(11);
-        let mut requested = false;
+        now += FRAME;
+        let mut requested = recovery.on_gap(11, now);
 
         // Capture keeps producing ordinary P-frames. Unless another IDR is
         // requested promptly, the stream stays frozen until the encoder's
@@ -1085,7 +1127,7 @@ mod tests {
         let deadline = now + Duration::from_millis(300);
         while !requested && now < deadline {
             now += FRAME;
-            let admission = recovery.admit(false);
+            let admission = recovery.admit(false, now);
             assert!(!admission.send, "P-frames stay held until an IDR heals the chain");
             requested |= admission.request_keyframe;
         }
@@ -1094,35 +1136,38 @@ mod tests {
 
     #[test]
     fn rejected_recovery_idr_keeps_predictive_frames_held_and_retries() {
+        let t0 = Instant::now();
         let mut recovery = KeyframeRecovery::default();
-        recovery.on_gap(10);
+        assert!(recovery.on_gap(10, t0));
 
         // Recovery IDR 11 is admitted but the full datagram budget rejects it.
-        assert!(recovery.admit(true).send);
-        assert!(!recovery.on_send_failed(true, 11), "no immediate second keyframe burst");
+        assert!(recovery.admit(true, t0).send);
+        assert!(!recovery.on_send_failed(true, 11, t0), "no immediate second keyframe burst");
 
         // The decoder never got that IDR: P-frames referencing it stay off the
-        // wire, and the next one asks for another IDR.
-        let admission = recovery.admit(false);
-        assert!(!admission.send);
-        assert!(admission.request_keyframe);
+        // wire, and one asks for another IDR once backoff allows.
+        assert_eq!(recovery.admit(false, t0), Admission { send: false, request_keyframe: false });
+        let retry = t0 + KEYFRAME_RETRY_BACKOFF[0];
+        assert_eq!(recovery.admit(false, retry), Admission { send: false, request_keyframe: true });
     }
 
     #[test]
     fn periodic_idr_rejected_outside_recovery_still_breaks_the_chain() {
+        let t0 = Instant::now();
         let mut recovery = KeyframeRecovery::default();
-        assert!(recovery.admit(true).send);
-        assert!(!recovery.on_send_failed(true, 500));
-        assert_eq!(recovery.admit(false), Admission { send: false, request_keyframe: true });
+        assert!(recovery.admit(true, t0).send);
+        assert!(!recovery.on_send_failed(true, 500, t0));
+        assert_eq!(recovery.admit(false, t0), Admission { send: false, request_keyframe: true });
     }
 
     #[test]
     fn delivered_idr_ends_recovery_and_withdraws_the_request() {
+        let t0 = Instant::now();
         let mut recovery = KeyframeRecovery::default();
-        recovery.on_gap(10);
-        assert!(recovery.admit(true).send);
+        assert!(recovery.on_gap(10, t0));
+        assert!(recovery.admit(true, t0).send);
         assert!(recovery.on_delivered(true, 11), "pending IDR request is withdrawn");
-        assert_eq!(recovery.admit(false), Admission { send: true, request_keyframe: false });
+        assert_eq!(recovery.admit(false, t0), Admission { send: true, request_keyframe: false });
         assert!(!recovery.on_delivered(false, 12), "a P-frame never withdraws a request");
     }
 
@@ -1131,15 +1176,47 @@ mod tests {
         // The queue holds IDR 11 when P-frame 12 is dropped at publish. IDR 11
         // is delivered, but P-frame 13 references 12, which the decoder never
         // got: recovery must continue and the request must stand.
+        let t0 = Instant::now();
         let mut recovery = KeyframeRecovery::default();
-        recovery.on_gap(12);
-        assert!(recovery.admit(true).send);
+        assert!(recovery.on_gap(12, t0));
+        assert!(recovery.admit(true, t0).send);
         assert!(!recovery.on_delivered(true, 11), "an older IDR must not withdraw the request");
-        assert_eq!(recovery.admit(false), Admission { send: false, request_keyframe: true });
+        let retry = t0 + KEYFRAME_RETRY_BACKOFF[0];
+        assert_eq!(recovery.admit(false, retry), Admission { send: false, request_keyframe: true });
 
         // A newer IDR does heal it.
         assert!(recovery.on_delivered(true, 14));
-        assert!(recovery.admit(false).send);
+        assert!(recovery.admit(false, retry).send);
+    }
+
+    #[test]
+    fn failed_recoveries_back_off_without_dropping_the_request() {
+        // A viewer whose connection has stalled never heals. Its requests must
+        // slow down along the backoff schedule, yet never stop entirely.
+        let t0 = Instant::now();
+        let mut recovery = KeyframeRecovery::default();
+        assert!(recovery.on_send_failed(false, 1, t0));
+
+        let requested_at: Vec<u64> = (1..=6000)
+            .filter(|ms| recovery.admit(false, t0 + Duration::from_millis(*ms)).request_keyframe)
+            .collect();
+        assert_eq!(requested_at, vec![250, 750, 1750, 3750, 5750]);
+    }
+
+    #[test]
+    fn healing_idr_resets_backoff() {
+        let t0 = Instant::now();
+        let mut recovery = KeyframeRecovery::default();
+        assert!(recovery.on_send_failed(false, 1, t0));
+        let late = t0 + Duration::from_millis(1750);
+        for ms in [250, 750, 1750] {
+            assert!(recovery.admit(false, t0 + Duration::from_millis(ms)).request_keyframe);
+        }
+
+        // Recovery succeeds, then a new loss happens right away: the first
+        // request after a healthy stream is immediate again.
+        assert!(recovery.on_delivered(true, 5));
+        assert!(recovery.on_gap(6, late), "backoff was reset by the healing IDR");
     }
 
     #[test]
@@ -1152,3 +1229,7 @@ mod tests {
         assert_eq!(negotiated_screen_datagram_limit(None), None);
     }
 }
+
+#[cfg(test)]
+#[path = "sdk_screen_recovery_sim.rs"]
+mod recovery_sim;
