@@ -3,7 +3,7 @@ use std::{
     ops::Deref,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender},
     },
 };
@@ -18,14 +18,16 @@ pub struct BroadcastFrame {
     pub data: Arc<Vec<u8>>,
 }
 
-/// The receiver and loss marker for one Sideboat viewer. The broadcaster sets
-/// `gap_detected` when its bounded queue drops an access unit. The viewer must
-/// then discard predictive H.264 frames until an IDR arrives.
-pub type TracedFrameSubscription = (mpsc::Receiver<Arc<BroadcastFrame>>, Arc<AtomicBool>);
+/// The receiver and loss marker for one Sideboat viewer. When its bounded
+/// queue drops an access unit, the broadcaster records one past that frame's
+/// `source_frame_id` in the marker (0 means no drop). The viewer must then
+/// discard predictive H.264 frames until an IDR encoded *after* the dropped
+/// frame arrives; an older IDR still sitting in the queue does not heal it.
+pub type TracedFrameSubscription = (mpsc::Receiver<Arc<BroadcastFrame>>, Arc<AtomicU64>);
 
 struct TracedSender {
     tx: SyncSender<Arc<BroadcastFrame>>,
-    gap_detected: Arc<AtomicBool>,
+    gap_marker: Arc<AtomicU64>,
 }
 
 impl Deref for BroadcastFrame {
@@ -82,12 +84,12 @@ impl FrameBroadcaster {
         buffer_size: usize,
     ) -> TracedFrameSubscription {
         let (tx, rx) = mpsc::sync_channel(buffer_size);
-        let gap_detected = Arc::new(AtomicBool::new(false));
+        let gap_marker = Arc::new(AtomicU64::new(0));
         self.traced_senders
             .lock()
             .unwrap()
-            .insert(device_id, TracedSender { tx, gap_detected: Arc::clone(&gap_detected) });
-        (rx, gap_detected)
+            .insert(device_id, TracedSender { tx, gap_marker: Arc::clone(&gap_marker) });
+        (rx, gap_marker)
     }
 
     /// Remove a device. The drain thread's Receiver will return Err on next recv.
@@ -172,7 +174,7 @@ impl FrameBroadcaster {
                 all_delivered = false;
                 // The frame never reached this H.264 decoder. Do not allow
                 // a later predictive access unit to use it as a reference.
-                sender.gap_detected.store(true, Ordering::Release);
+                sender.gap_marker.fetch_max(frame.source_frame_id + 1, Ordering::AcqRel);
                 crate::anchorwayland::frame_trace::event!(
                     "broadcaster_drop",
                     {
@@ -308,14 +310,14 @@ mod tests {
     #[test]
     fn traced_subscriber_receives_capture_frame_id_without_changing_payload() {
         let bc = FrameBroadcaster::new();
-        let (rx, gap_detected) = bc.subscribe_traced("sdk-screen:device-1".to_string(), 1);
+        let (rx, gap_marker) = bc.subscribe_traced("sdk-screen:device-1".to_string(), 1);
 
         assert!(bc.publish_frame(42, vec![1, 2, 3]));
         let frame = rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(frame.source_frame_id, 42);
         assert!(frame.published_ns > 0);
         assert_eq!(frame.data.as_slice(), &[1, 2, 3]);
-        assert!(!gap_detected.load(Ordering::Acquire));
+        assert_eq!(gap_marker.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -327,8 +329,8 @@ mod tests {
         assert!(bc.publish_frame(1, vec![1]));
         assert!(!bc.publish_frame(2, vec![2]));
 
-        assert!(slow_gap.load(Ordering::Acquire));
-        assert!(!fast_gap.load(Ordering::Acquire));
+        assert_eq!(slow_gap.load(Ordering::Acquire), 3, "one past dropped frame 2");
+        assert_eq!(fast_gap.load(Ordering::Acquire), 0);
         assert_eq!(fast_rx.recv_timeout(Duration::from_secs(1)).unwrap().source_frame_id, 1);
         assert_eq!(fast_rx.recv_timeout(Duration::from_secs(1)).unwrap().source_frame_id, 2);
     }
