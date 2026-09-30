@@ -585,40 +585,31 @@ impl InputBackend for WaylandInput {
             log::warn!("Input: rejecting absolute motion for missing output '{output_name}'");
             return;
         };
-        // Do not use the cached output-bound pointer here. Virtual outputs can
-        // be created or recreated after this backend starts, which leaves that
-        // cache missing or bound to a destroyed wl_output object. Resolve the
-        // selected output against the current topology and send global-layout
-        // coordinates through the stable generic pointer instead.
-        let (x, y) = absolute_position_in_layout(
-            self.layout_min_x,
-            self.layout_min_y,
-            self.total_w,
-            self.total_h,
-            output.x,
-            output.y,
-            output.width,
-            output.height,
-            x_norm,
-            y_norm,
-        );
+        let Some(pointer) = self.output_virtual_pointers.get(output_name).cloned() else {
+            log::warn!(
+                "Input: rejecting absolute motion; no output-bound pointer for '{output_name}'"
+            );
+            return;
+        };
+        let (x, y) = absolute_position_in_output(output.width, output.height, x_norm, y_norm);
         log::debug!(
-            "Input: targeted abs norm=({:.3},{:.3}) -> layout=({},{}) extent={}x{} target={}x{} output='{}'",
+            "Input: targeted abs norm=({:.3},{:.3}) -> output-local=({},{}) extent={}x{} output='{}'",
             x_norm,
             y_norm,
             x,
             y,
-            self.total_w,
-            self.total_h,
             output.width,
             output.height,
             output_name
         );
-        // Keep the stable pointer active so the following button transitions
-        // use the same device as this motion.
-        self.virtual_pointer = self.generic_virtual_pointer.clone();
-        self.pointer_is_output_bound = false;
-        self.virtual_pointer.motion_absolute(time, x, y, self.total_w, self.total_h);
+        // A stroke is sent as a targeted absolute motion followed by button
+        // transitions. Keep the selected output's virtual pointer active so
+        // those transitions use the same Wayland device as the motion. Using
+        // `pointer` only here would move one output-bound pointer and press
+        // whichever pointer was selected by an earlier stream update.
+        self.virtual_pointer = pointer;
+        self.pointer_is_output_bound = true;
+        self.virtual_pointer.motion_absolute(time, x, y, output.width, output.height);
         self.virtual_pointer.frame();
     }
 
@@ -1114,44 +1105,6 @@ mod coordinate_tests {
         // output-bound pointer must receive local coordinates, not 2880/3840.
         assert_eq!(absolute_position_in_output(1920, 1080, 0.5, 0.5), (960, 540));
         assert_eq!(absolute_position_in_output(1920, 1080, -1.0, 2.0), (0, 1080));
-    }
-
-    #[test]
-    fn targeted_output_maps_to_its_current_global_rectangle() {
-        let outputs = [output(0, 0, 1920, 1080), output(1920, 0, 1080, 2340)];
-        let (min_x, min_y, width, height) = output_layout_bounds(outputs.iter());
-        let selected = &outputs[1];
-
-        assert_eq!(
-            absolute_position_in_layout(
-                min_x,
-                min_y,
-                width,
-                height,
-                selected.x,
-                selected.y,
-                selected.width,
-                selected.height,
-                0.0,
-                0.0,
-            ),
-            (1920, 0)
-        );
-        assert_eq!(
-            absolute_position_in_layout(
-                min_x,
-                min_y,
-                width,
-                height,
-                selected.x,
-                selected.y,
-                selected.width,
-                selected.height,
-                1.0,
-                1.0,
-            ),
-            (3000, 2340)
-        );
     }
 
     #[test]
