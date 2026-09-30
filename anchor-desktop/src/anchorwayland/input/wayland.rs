@@ -167,6 +167,16 @@ fn refreshed_stream_output<'a>(
         .or_else(|| outputs.iter().min_by_key(|(index, _)| *index).map(|(_, output)| output))
 }
 
+/// Mapped Sideboat input is valid only for the display currently being
+/// streamed. A stale SwiftUI update must never move a pointer on another
+/// display after the user changes the stream selection.
+fn mapped_absolute_target_is_current(
+    active_output_name: &str,
+    requested_output_name: &str,
+) -> bool {
+    !active_output_name.is_empty() && active_output_name == requested_output_name
+}
+
 /// Merge a capture-worker topology into the input connection's output view.
 ///
 /// xdg-output is authoritative for logical positions. The capture worker can
@@ -708,6 +718,14 @@ impl InputBackend for WaylandInput {
             self.pointer_motion_absolute(time, x_norm, y_norm);
             return;
         };
+        if !mapped_absolute_target_is_current(&self.stream_output_name, output_name) {
+            log::warn!(
+                "Input: rejecting stale mapped motion for '{}' while streaming '{}'",
+                output_name,
+                self.stream_output_name
+            );
+            return;
+        }
         let Some(output) = self.outputs.values().find(|output| output.name == output_name) else {
             log::warn!("Input: rejecting absolute motion for missing output '{output_name}'");
             return;
@@ -1231,6 +1249,13 @@ mod coordinate_tests {
         assert_eq!(refreshed_stream_output(&outputs, "alpha").unwrap().name, "alpha");
         assert_eq!(refreshed_stream_output(&outputs, "deleted").unwrap().name, "zeta");
         assert!(refreshed_stream_output(&HashMap::new(), "deleted").is_none());
+    }
+
+    #[test]
+    fn mapped_absolute_input_cannot_override_the_active_stream_output() {
+        assert!(mapped_absolute_target_is_current("HEADLESS-5", "HEADLESS-5"));
+        assert!(!mapped_absolute_target_is_current("HEADLESS-5", "DP-1"));
+        assert!(!mapped_absolute_target_is_current("", "HEADLESS-5"));
     }
 
     #[test]
