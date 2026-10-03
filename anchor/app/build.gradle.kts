@@ -58,6 +58,13 @@ android {
         versionCode = 100
         versionName = "1.0.0"
 
+        // Keep packaged ABIs aligned with the native MsQuic transport built by
+        // scripts/build-android-native.sh. Some AndroidX dependencies publish
+        // x86 JNI libraries, but Anchor does not support 32-bit x86.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GIT_HASH", "\"${gitCommitHash()}\"")
@@ -84,7 +91,7 @@ android {
             if (releaseSigningConfigured) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
