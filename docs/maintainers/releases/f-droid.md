@@ -59,8 +59,8 @@ RepoType: git
 Repo: https://github.com/anchor-software-org/anchor.git
 
 Builds:
-  - versionName: 1.0.0
-    versionCode: 100
+  - versionName: 1.0.1
+    versionCode: 101
     commit: RELEASE_COMMIT_SHA
     subdir: anchor
     submodules: true
@@ -76,8 +76,8 @@ Builds:
 AutoUpdateMode: Version v%v
 UpdateCheckMode: Tags ^v[0-9]+(?:\\.[0-9]+)*$
 UpdateCheckData: anchor/app/build.gradle.kts|versionCode = ([0-9]+)|.|versionName = "([^"]+)"
-CurrentVersion: 1.0.0
-CurrentVersionCode: 100
+CurrentVersion: 1.0.1
+CurrentVersionCode: 101
 ```
 
 The `sudo` block is only needed if those tools are absent from the active

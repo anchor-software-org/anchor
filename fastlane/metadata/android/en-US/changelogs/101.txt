@@ -1,0 +1,6 @@
+Anchor 1.0.1 improves Android release packaging.
+
+• Enabled R8 optimization for release builds
+• Fixed protocol handling when R8 is enabled
+• Removed unsupported 32-bit x86 libraries
+• Improved compatibility with F-Droid packaging requirements
