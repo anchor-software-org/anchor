@@ -19,6 +19,7 @@ node_modules/
 
 # ===== Rust =====
 Cargo.lock
+!anchor-sdk/rust/Cargo.lock
 
 # ===== Python =====
 __pycache__/
