@@ -14,7 +14,7 @@ if git -C "$msquic" submodule status -- submodules/quictls | awk '$1 ~ /^-/' | g
   exit 2
 fi
 
-cargo test --manifest-path anchor-sdk/rust/Cargo.toml
+cargo test --manifest-path anchor-sdk/rust/Cargo.toml --locked
 (
   cd anchor
   ./gradlew :anchorSdk:testDebugUnitTest --no-daemon

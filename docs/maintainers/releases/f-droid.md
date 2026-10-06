@@ -25,7 +25,7 @@ dependency.
    The resulting APK must contain `libmsquic.so` and
    `libanchor_msquic_jni.so` for `arm64-v8a`, `armeabi-v7a`, and `x86_64`.
 3. Commit the release and create a signed or annotated release tag named
-   `v<versionName>` (for example, `v1.0.0`). Push both the commit and tag.
+   `v<versionName>` (for example, `v1.0.1`). Push both the commit and tag.
 4. Replace `RELEASE_COMMIT_SHA` in the template below with that tag's full,
    immutable commit SHA, then open a merge request to
    [`fdroiddata`](https://gitlab.com/fdroid/fdroiddata) adding
@@ -34,11 +34,13 @@ dependency.
 F-Droid must initialise submodules recursively: MsQuic has a pinned QuicTLS
 submodule. Its native libraries are compiled during the build phase, never
 checked into the repository. F-Droid's scanner should therefore see only
-source-derived native output.
+source-derived native output. The Rust SDK is not part of the Android build,
+but its tracked `Cargo.lock` lets F-Droid scan its dependency manifest without
+an exception.
 
 ## Metadata template
 
-Update version, code, and commit for each release. The `ndk` value matches the
+Replace every `RELEASE_*` placeholder for each release. The `ndk` value matches the
 `ndkVersion` declared by the Android app. `protoc` is required to generate the
 checked-in Protocol v1 schemas during Gradle compilation.
 
@@ -59,25 +61,27 @@ RepoType: git
 Repo: https://github.com/anchor-software-org/anchor.git
 
 Builds:
-  - versionName: 1.0.1
-    versionCode: 101
+  - versionName: RELEASE_VERSION
+    versionCode: RELEASE_VERSION_CODE
     commit: RELEASE_COMMIT_SHA
-    subdir: anchor
+    subdir: anchor/app
     submodules: true
     sudo:
       - apt-get update
-      - apt-get install -y protobuf-compiler cmake ninja-build
+      - apt-get install -y protobuf-compiler cmake ninja-build build-essential
     gradle:
       - yes
-    output: app/build/outputs/apk/release/app-release-unsigned.apk
-    build: ../scripts/build-android-native.sh $$NDK$$
+    scanignore:
+      - anchor-sdk/kotlin/src/main/cpp/third_party/msquic/Cargo.toml
+      - anchor-sdk/kotlin/src/main/cpp/third_party/msquic/submodules/quictls
+    build: ../../scripts/build-android-native.sh $$NDK$$
     ndk: 30.0.16138531
 
-AutoUpdateMode: Version v%v
+AutoUpdateMode: Version
 UpdateCheckMode: Tags ^v[0-9]+(?:\\.[0-9]+)*$
 UpdateCheckData: anchor/app/build.gradle.kts|versionCode = ([0-9]+)|.|versionName = "([^"]+)"
-CurrentVersion: 1.0.1
-CurrentVersionCode: 101
+CurrentVersion: RELEASE_VERSION
+CurrentVersionCode: RELEASE_VERSION_CODE
 ```
 
 The `sudo` block is only needed if those tools are absent from the active
