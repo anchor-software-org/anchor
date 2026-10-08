@@ -25,6 +25,7 @@ import com.anchor.plugin.InputPlugin
 import com.anchor.plugin.MediaPlugin
 import com.anchor.plugin.NetworkPlugin
 import com.anchor.plugin.NotificationPlugin
+import com.anchor.plugin.RemoteInputPlugin
 import com.anchor.plugin.SmsPlugin
 import com.anchor.plugin.VideoPlugin
 import org.anchor.sdk.AnchorCapability
@@ -63,6 +64,7 @@ class AnchorApplication : Application() {
 
     val videoPlugin by lazy { VideoPlugin(broker) }
     val inputPlugin by lazy { InputPlugin(broker) }
+    val remoteInputPlugin by lazy { RemoteInputPlugin(broker) }
     val clipboardPlugin by lazy { ClipboardPlugin(broker, this) }
     val notificationPlugin by lazy { NotificationPlugin(broker, this) }
     val smsPlugin by lazy { SmsPlugin(broker, this) }
@@ -83,6 +85,7 @@ class AnchorApplication : Application() {
             },
             onSdkInputReady = { session, capability ->
                 inputPlugin.attachSdkSession(session, capability)
+                remoteInputPlugin.attachSdkSession(session, capability)
             },
             onSdkMediaReady = { session, capability ->
                 mediaPlugin.attachSdkSession(session, capability)
@@ -103,6 +106,7 @@ class AnchorApplication : Application() {
                 smsPlugin.handleSdkRecord(event)
                 commandsPlugin.handleSdkRecord(event)
                 cameraPlugin.handleSdkRecord(event)
+                remoteInputPlugin.handleSdkRecord(event)
             },
             onSdkStreamOpen = { session, event ->
                 fileTransferPlugin.acceptSdkStream(session, event)
@@ -173,6 +177,7 @@ class AnchorApplication : Application() {
         ensureSmsPluginStarted()
         clipboardPlugin.start(processScope)
         inputPlugin.start(processScope)
+        remoteInputPlugin.start(processScope)
         cameraPlugin.start(processScope)
         mediaPlugin.start(processScope)
         commandsPlugin.start(processScope)
