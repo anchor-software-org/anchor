@@ -27,6 +27,7 @@ use crate::anchorapp::{
     sdk_files::{SdkFilesBinding, SdkFilesSender},
     sdk_media::{SdkMediaBinding, SdkMediaSender},
     sdk_notifications::{SdkNotificationsBinding, SdkNotificationsSender},
+    sdk_remote_input::{SdkRemoteInputBinding, SdkRemoteInputSender},
     sdk_screen::{SdkScreenBinding, SdkScreenSender},
     sdk_sms::{SdkSmsBinding, SdkSmsSender},
     tls::AnchorIdentity,
@@ -44,6 +45,7 @@ pub(crate) struct SdkServer {
     commands: SdkCommandsBinding,
     camera: SdkCameraBinding,
     device: SdkDeviceBinding,
+    remote_input: SdkRemoteInputBinding,
     broker_tx: std::sync::mpsc::Sender<AnchorEvent>,
     pairing_request: SharedPairingRequest,
 }
@@ -62,6 +64,7 @@ impl SdkServer {
         commands: SdkCommandsBinding,
         camera: SdkCameraBinding,
         device: SdkDeviceBinding,
+        remote_input: SdkRemoteInputBinding,
         broker_tx: std::sync::mpsc::Sender<AnchorEvent>,
         pairing_request: SharedPairingRequest,
     ) -> Self {
@@ -77,6 +80,7 @@ impl SdkServer {
             commands,
             camera,
             device,
+            remote_input,
             broker_tx,
             pairing_request,
         }
@@ -159,6 +163,7 @@ impl SdkServer {
             let commands = self.commands.clone();
             let camera = self.camera.clone();
             let device = self.device.clone();
+            let remote_input = self.remote_input.clone();
             let broker_tx = self.broker_tx.clone();
             let pairing_request = self.pairing_request.clone();
             let desktop_safety_number = desktop_safety_number.clone();
@@ -177,6 +182,7 @@ impl SdkServer {
                     commands,
                     camera,
                     device,
+                    remote_input,
                     broker_tx,
                     pairing_request,
                     desktop_safety_number,
@@ -205,6 +211,7 @@ async fn handle_session(
     commands_binding: SdkCommandsBinding,
     camera_binding: SdkCameraBinding,
     device_binding: SdkDeviceBinding,
+    remote_input_binding: SdkRemoteInputBinding,
     broker_tx: std::sync::mpsc::Sender<AnchorEvent>,
     pairing_request: SharedPairingRequest,
     desktop_safety_number: String,
@@ -357,7 +364,7 @@ async fn handle_session(
                 && capability_name == input::CAPABILITY_NAME
                 && capability_major == input::CAPABILITY_MAJOR =>
             {
-                session
+                let capability = session
                     .accept_capability(
                         request_id,
                         capability_session_id,
@@ -367,6 +374,30 @@ async fn handle_session(
                     )
                     .await?;
                 input_sessions.insert(capability_session_id);
+                // The accepted capability doubles as the desktop→phone remote
+                // control channel; the sender keeps records ordered on its own
+                // writer thread.
+                let sender = SdkRemoteInputSender::new(capability);
+                remote_input_binding.attach(device_id.clone(), sender.clone());
+                if std::env::var_os("ANCHOR_REMOTE_INPUT_DEMO").is_some() {
+                    thread::spawn(move || {
+                        // Wait for the capability to settle, then send a home
+                        // press every 5 s so the wire path can be verified by
+                        // watching the phone bounce to the launcher.
+                        thread::sleep(Duration::from_secs(2));
+                        loop {
+                            let ok = crate::anchorapp::sdk_remote_input::send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "plugin_id": "remoteinput",
+                                    "type": "remote_home",
+                                }),
+                            );
+                            log::info!("ANCHOR_REMOTE_INPUT_DEMO home -> {ok}");
+                            thread::sleep(Duration::from_secs(5));
+                        }
+                    });
+                }
                 registry.register_sdk_capability(&device_id, "input");
                 log::info!("SDK input capability opened by {device_id}");
             }
@@ -766,6 +797,24 @@ async fn handle_session(
                 camera_binding.attach_frame_flow(device_id.clone(), capability_session_id, flow);
                 log::info!(
                     "SDK camera datagram flow opened by {device_id}: capability_session={capability_session_id} flow={flow_id}"
+                );
+            }
+            SessionEvent::DatagramFlowOpenRequested {
+                request_id,
+                capability_session_id,
+                flow_id,
+                payload_type_url,
+            } if input_sessions.contains(&capability_session_id)
+                && payload_type_url == input::MIRROR_FRAME_TYPE_URL =>
+            {
+                let flow = session.accept_datagram_flow(request_id, flow_id).await?;
+                remote_input_binding.attach_frame_flow(
+                    device_id.clone(),
+                    capability_session_id,
+                    flow,
+                );
+                log::info!(
+                    "SDK mirror datagram flow opened by {device_id}: capability_session={capability_session_id} flow={flow_id}"
                 );
             }
             SessionEvent::CapabilityRecord { capability_session_id, type_url, payload }
@@ -1197,6 +1246,7 @@ async fn handle_session(
                 commands_binding.detach(&device_id);
                 camera_binding.detach(&device_id);
                 device_binding.detach(&device_id);
+                remote_input_binding.detach(&device_id);
                 screen_binding.detach_device(&device_id);
                 return Ok(());
             }
@@ -1233,6 +1283,24 @@ async fn handle_pairing(
     );
     let fingerprint = crate::anchorapp::tls::TrustedStore::fingerprint(&certificate);
     let display_name = hello.display_name.clone();
+    // Dev escape hatch for emulator bring-up: approve pairings without the
+    // GUI dialog. Never enabled by default.
+    if std::env::var_os("ANCHOR_AUTO_ACCEPT_PAIRING").is_some() {
+        registry.add_paired_device(&device_id, &hello.display_name, &certificate_pem);
+        pairing
+            .approve_with_identity(
+                hello.transcript_hash.to_vec(),
+                desktop_certificate_der,
+                desktop_device_id,
+            )
+            .await?;
+        log::warn!(
+            "ANCHOR_AUTO_ACCEPT_PAIRING: auto-approved {} ({device_id})",
+            hello.display_name
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), pairing.closed()).await;
+        return Ok(());
+    }
     let request_device_id = device_id.clone();
     let request_certificate_pem = certificate_pem.clone();
     let pairing_event_tx = broker_tx.clone();

@@ -44,6 +44,7 @@ pub struct DesktopRuntime {
     pub commands: SharedCommands,
     pub camera_setup: CameraSetupHandle,
     pub frame_buffer: Arc<Mutex<Option<SharedFrameBuffer>>>,
+    pub remote_input: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
 }
 
 pub struct AnchorAppInstance {
@@ -59,6 +60,7 @@ pub struct AnchorAppInstance {
     filetransfer_plugin: FileTransferPlugin,
     broker_tx: Sender<AnchorEvent>,
     gui_event_rx: Option<Receiver<AnchorEvent>>,
+    remote_input_binding: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
 }
 
 impl AnchorAppInstance {
@@ -137,6 +139,8 @@ impl AnchorAppInstance {
         let sdk_commands = crate::anchorapp::sdk_commands::SdkCommandsBinding::default();
         let sdk_camera = crate::anchorapp::sdk_camera::SdkCameraBinding::default();
         let sdk_device = crate::anchorapp::sdk_device::SdkDeviceBinding::default();
+        let sdk_remote_input =
+            crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding::default();
         let device_manager = DeviceManager::new(
             config_dir,
             broker_tx.clone(),
@@ -151,7 +155,10 @@ impl AnchorAppInstance {
             sdk_commands.clone(),
             sdk_camera.clone(),
             sdk_device.clone(),
+            sdk_remote_input.clone(),
         );
+
+        let remote_input_binding = sdk_remote_input;
 
         wplugin.broadcaster = Some(device_manager.broadcaster.clone());
 
@@ -173,6 +180,7 @@ impl AnchorAppInstance {
             filetransfer_plugin,
             broker_tx,
             gui_event_rx: Some(gui_rx),
+            remote_input_binding,
         }
     }
 
@@ -217,6 +225,7 @@ impl AnchorAppInstance {
             commands: self.commands_plugin.commands.clone(),
             camera_setup: self.device_manager.camera_setup_handle(),
             frame_buffer: self.wayland_plugin.frame_buffer.clone(),
+            remote_input: self.remote_input_binding.clone(),
         };
 
         // The plugin threads own their receivers after startup, so their join

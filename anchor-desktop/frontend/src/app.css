@@ -362,3 +362,11 @@ input:focus, select:focus { border-color: var(--accent); }
   .about-grid > div:nth-child(2) { border-right: 0; }
   .about-grid > div:nth-child(n + 3) { border-top: 1px solid var(--rock-stroke); }
 }
+
+.remote-pad { display: grid; place-items: center; aspect-ratio: 9 / 19; max-height: 560px; max-width: 100%; margin: 0 auto; border: 1px solid var(--rock-stroke); color: var(--rock); background: var(--ink); font-size: 11px; touch-action: none; user-select: none; cursor: crosshair; overflow: hidden; }
+.remote-pad:active { border-color: var(--sky); }
+.remote-pad-live { padding: 0; }
+.remote-frame { width: 100%; height: 100%; object-fit: fill; pointer-events: none; -webkit-user-drag: none; }
+.remote-nav-row { justify-content: center; }
+.remote-text-input { flex: 1; }
+.button.on { border-color: var(--sky); color: var(--sky); }

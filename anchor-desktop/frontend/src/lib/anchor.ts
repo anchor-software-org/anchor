@@ -121,3 +121,12 @@ export const setCameraZoom = (value: number) => invoke<void>('set_camera_zoom', 
 export const setCameraExposure = (value: number) => invoke<void>('set_camera_exposure', { value });
 export const setCameraTorch = (enabled: boolean) => invoke<void>('set_camera_torch', { enabled });
 export const switchCamera = () => invoke<void>('switch_camera');
+export const remoteTap = (x: number, y: number) => invoke<void>('remote_tap', { x, y });
+export const remotePointerDown = (x: number, y: number) => invoke<void>('remote_pointer_down', { x, y });
+export const remotePointerMove = (x: number, y: number) => invoke<void>('remote_pointer_move', { x, y });
+export const remotePointerUp = () => invoke<void>('remote_pointer_up');
+export const remoteScroll = (dx: number, dy: number) => invoke<void>('remote_scroll', { dx, dy });
+export const remoteText = (text: string) => invoke<void>('remote_text', { text });
+export const remoteNav = (action: string) => invoke<void>('remote_nav', { action });
+export const remoteMirror = (enabled: boolean) => invoke<void>('remote_mirror', { enabled });
+export const remoteFrame = (afterSequence: number) => invoke<ScreenPreview | null>('remote_frame', { afterSequence });

@@ -1,6 +1,7 @@
 package com.anchor
 
 import android.Manifest
+import android.accessibilityservice.AccessibilityService
 import android.app.Application
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -17,6 +18,7 @@ import com.anchor.core.MessageBroker
 import com.anchor.data.ConnectionState
 import com.anchor.data.ConnectionStatus
 import com.anchor.data.TrustedStore
+import com.anchor.plugin.AnchorAccessibilityService
 import com.anchor.plugin.CameraPlugin
 import com.anchor.plugin.ClipboardPlugin
 import com.anchor.plugin.CommandsPlugin
@@ -203,6 +205,58 @@ class AnchorApplication : Application() {
                 }
             },
             IntentFilter("com.anchor.TEST_SEND_SMS_ATTACHMENT"),
+            Context.RECEIVER_EXPORTED,
+        )
+        // Debug hook for emulator bring-up: `adb shell am broadcast -a com.anchor.TEST_CONNECT --es host 10.0.2.2`
+        registerReceiver(
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action != "com.anchor.TEST_CONNECT") return
+                    val host = intent.getStringExtra("host") ?: "10.0.2.2"
+                    Log.i("Anchor", "TEST_CONNECT: pairing to $host")
+                    networkPlugin.pairDirect(host)
+                }
+            },
+            IntentFilter("com.anchor.TEST_CONNECT"),
+            Context.RECEIVER_EXPORTED,
+        )
+        // Debug hook for emulator verification of remote-control gestures:
+        // `adb shell am broadcast -a com.anchor.TEST_REMOTE_INPUT --es kind tap --ef x 540 --ef y 1200`
+        // kinds: tap (x,y px), down/move/up (drag phases at x,y),
+        // scroll (dx,dy px), back|home|recents, text (extra "text"),
+        // mirror (extra "enabled", default true)
+        registerReceiver(
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    if (intent?.action != "com.anchor.TEST_REMOTE_INPUT") return
+                    val svc = AnchorAccessibilityService.get()
+                    if (svc == null) {
+                        Log.e("Anchor", "TEST_REMOTE_INPUT: accessibility service not running")
+                        return
+                    }
+                    val x = intent.getFloatExtra("x", 0f)
+                    val y = intent.getFloatExtra("y", 0f)
+                    when (intent.getStringExtra("kind") ?: "tap") {
+                        "tap" -> svc.tap(x, y)
+                        "down" -> svc.pointerDown(x, y)
+                        "move" -> svc.pointerMove(x, y)
+                        "up" -> svc.pointerUp()
+                        "scroll" -> svc.scroll(
+                            intent.getFloatExtra("dx", 0f),
+                            intent.getFloatExtra("dy", 0f),
+                        )
+                        "back" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+                        "home" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+                        "recents" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
+                        "text" -> svc.commitText(intent.getStringExtra("text") ?: "anchor test")
+                        "mirror" -> remoteInputPlugin.debugSetMirror(
+                            intent.getBooleanExtra("enabled", true),
+                        )
+                        else -> Log.w("Anchor", "TEST_REMOTE_INPUT: unknown kind")
+                    }
+                }
+            },
+            IntentFilter("com.anchor.TEST_REMOTE_INPUT"),
             Context.RECEIVER_EXPORTED,
         )
         // Video is started per-ViewModel (tied to UI lifecycle)

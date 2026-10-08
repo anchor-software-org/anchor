@@ -43,6 +43,7 @@ pub struct DeviceManager {
     pub sdk_commands: crate::anchorapp::sdk_commands::SdkCommandsBinding,
     pub sdk_camera: crate::anchorapp::sdk_camera::SdkCameraBinding,
     pub sdk_device: crate::anchorapp::sdk_device::SdkDeviceBinding,
+    pub sdk_remote_input: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
 }
 
 /// Bag of the bits the GUI needs to display loopback status and trigger setup.
@@ -149,6 +150,7 @@ impl DeviceManager {
         sdk_commands: crate::anchorapp::sdk_commands::SdkCommandsBinding,
         sdk_camera: crate::anchorapp::sdk_camera::SdkCameraBinding,
         sdk_device: crate::anchorapp::sdk_device::SdkDeviceBinding,
+        sdk_remote_input: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
     ) -> Self {
         let trusted_store = TrustedStore::load(&config_dir);
         let registry = DeviceRegistry::new(trusted_store);
@@ -170,6 +172,7 @@ impl DeviceManager {
             sdk_commands,
             sdk_camera,
             sdk_device,
+            sdk_remote_input,
         }
     }
 
@@ -202,6 +205,7 @@ impl DeviceManager {
         let sdk_commands = self.sdk_commands.clone();
         let sdk_camera = self.sdk_camera.clone();
         let sdk_device = self.sdk_device.clone();
+        let sdk_remote_input = self.sdk_remote_input.clone();
         let pairing_request = self.pairing_request.clone();
         let sdk_identity = crate::anchorapp::tls::AnchorIdentity {
             certificate_pem: self.identity.certificate_pem.clone(),
@@ -219,6 +223,7 @@ impl DeviceManager {
             sdk_commands.clone(),
             sdk_camera.clone(),
             sdk_device.clone(),
+            sdk_remote_input.clone(),
         );
 
         let handle = thread::spawn(move || {
@@ -244,6 +249,7 @@ impl DeviceManager {
                 sdk_commands,
                 sdk_camera,
                 sdk_device,
+                sdk_remote_input,
                 broker_tx.clone(),
                 pairing_request,
             )
@@ -322,6 +328,7 @@ fn spawn_forwarding_thread(
     sdk_commands: crate::anchorapp::sdk_commands::SdkCommandsBinding,
     sdk_camera: crate::anchorapp::sdk_camera::SdkCameraBinding,
     sdk_device: crate::anchorapp::sdk_device::SdkDeviceBinding,
+    sdk_remote_input: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
 ) {
     thread::spawn(move || {
         for event in plugin_rx.iter() {
@@ -349,6 +356,9 @@ fn spawn_forwarding_thread(
                     if route_typed_camera_broadcast(&sdk_camera, &bytes) {
                         continue;
                     }
+                    if route_typed_remote_input_broadcast(&sdk_remote_input, &bytes) {
+                        continue;
+                    }
                     log::debug!("Dropping untyped device broadcast after SDK migration");
                 }
                 AnchorTarget::DeviceId(device_id) => {
@@ -362,6 +372,9 @@ fn spawn_forwarding_thread(
                         continue;
                     }
                     if route_typed_camera_device(&sdk_camera, device_id, &bytes) {
+                        continue;
+                    }
+                    if route_typed_remote_input_device(&sdk_remote_input, device_id, &bytes) {
                         continue;
                     }
                     // A reply for a capability that was not negotiated must not
@@ -460,6 +473,40 @@ fn route_typed_camera_device(
         return false;
     };
     crate::anchorapp::sdk_camera::send_json(&sender, &value)
+}
+
+fn route_typed_remote_input_broadcast(
+    binding: &crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
+    bytes: &[u8],
+) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some("remoteinput") {
+        return false;
+    }
+    let mut typed = false;
+    for (_, sender) in binding.senders() {
+        typed |= crate::anchorapp::sdk_remote_input::send_json(&sender, &value);
+    }
+    typed
+}
+
+fn route_typed_remote_input_device(
+    binding: &crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
+    device_id: &str,
+    bytes: &[u8],
+) -> bool {
+    let Some(sender) = binding.sender(device_id) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some("remoteinput") {
+        return false;
+    }
+    crate::anchorapp::sdk_remote_input::send_json(&sender, &value)
 }
 
 fn route_typed_screen(

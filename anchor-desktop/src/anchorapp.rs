@@ -23,6 +23,7 @@ pub mod sdk_device;
 pub mod sdk_files;
 pub mod sdk_media;
 pub mod sdk_notifications;
+pub mod sdk_remote_input;
 pub mod sdk_screen;
 pub mod sdk_sms;
 pub mod settings;

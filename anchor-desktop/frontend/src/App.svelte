@@ -23,6 +23,14 @@
     notificationIcon,
     openSharedFolder,
     openTransfer,
+    remoteFrame,
+    remoteMirror,
+    remoteNav,
+    remotePointerDown,
+    remotePointerMove,
+    remotePointerUp,
+    remoteScroll,
+    remoteText,
     respondToPairing,
     runCommand,
     screenPreview,
@@ -49,9 +57,10 @@
     type SavedCommand,
   } from './lib/anchor';
 
-  type Section = 'sideboat' | 'messages' | 'foghorn' | 'clipboard' | 'files' | 'commands' | 'media' | 'settings' | 'logs';
+  type Section = 'sideboat' | 'remote' | 'messages' | 'foghorn' | 'clipboard' | 'files' | 'commands' | 'media' | 'settings' | 'logs';
   const navigation: Array<{ id: Section; label: string }> = [
     { id: 'sideboat', label: 'Sideboat' },
+    { id: 'remote', label: 'Remote control' },
     { id: 'messages', label: 'Messages' },
     { id: 'foghorn', label: 'Foghorn' },
     { id: 'clipboard', label: 'Clipboard' },
@@ -102,6 +111,94 @@
   let virtualHeight = 1080;
   let copiedClipboardHash = '';
   let clipboardFeedbackTimer = 0;
+  let remoteTextDraft = '';
+  let remotePadDown = false;
+  let remotePadEl: HTMLDivElement | undefined;
+  let remoteMirrorOn = false;
+  let remoteMirrorSeq = 0;
+  let remoteMirrorUrl = '';
+  let remoteMirrorAspect = '';
+  let remoteMirrorTimer = 0;
+
+  const refreshRemoteFrame = async () => {
+    if (!remoteMirrorOn || active !== 'remote' || !windowFocused) return;
+    try {
+      const frame = await remoteFrame(remoteMirrorSeq);
+      if (frame) {
+        remoteMirrorSeq = frame.sequence;
+        remoteMirrorUrl = frame.dataUrl;
+      }
+    } catch {
+      // Transient — the next poll retries.
+    }
+  };
+
+  const scheduleRemoteFrame = () => {
+    window.clearTimeout(remoteMirrorTimer);
+    if (!remoteMirrorOn) return;
+    remoteMirrorTimer = window.setTimeout(async () => {
+      await refreshRemoteFrame();
+      scheduleRemoteFrame();
+    }, 350);
+  };
+
+  const toggleRemoteMirror = async () => {
+    const next = !remoteMirrorOn;
+    remoteMirrorOn = next;
+    try {
+      await remoteMirror(next);
+    } catch {
+      remoteMirrorOn = false;
+      return;
+    }
+    if (next) {
+      scheduleRemoteFrame();
+    } else {
+      remoteMirrorUrl = '';
+      remoteMirrorSeq = 0;
+      window.clearTimeout(remoteMirrorTimer);
+    }
+  };
+
+  const onRemoteFrameLoad = (event: Event) => {
+    const img = event.currentTarget as HTMLImageElement;
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      remoteMirrorAspect = `${img.naturalWidth} / ${img.naturalHeight}`;
+    }
+  };
+
+  const remoteNorm = (event: PointerEvent): [number, number] => {
+    if (!remotePadEl) return [0, 0];
+    const rect = remotePadEl.getBoundingClientRect();
+    return [
+      Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1),
+      Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1),
+    ];
+  };
+
+  const remoteDown = (event: PointerEvent) => {
+    remotePadDown = true;
+    remotePadEl?.setPointerCapture(event.pointerId);
+    const [x, y] = remoteNorm(event);
+    void remotePointerDown(x, y);
+  };
+
+  const remoteMove = (event: PointerEvent) => {
+    if (!remotePadDown) return;
+    const [x, y] = remoteNorm(event);
+    void remotePointerMove(x, y);
+  };
+
+  const remoteUp = () => {
+    if (!remotePadDown) return;
+    remotePadDown = false;
+    void remotePointerUp();
+  };
+
+  const remoteWheel = (event: WheelEvent) => {
+    event.preventDefault();
+    void remoteScroll(event.deltaX, event.deltaY);
+  };
   const attemptedNotificationIcons = new Set<string>();
   const attemptedSmsPhotos = new Set<number>();
 
@@ -680,6 +777,45 @@
               <div><dt>Frame size</dt><dd>{formatBytes(desktop.capture.metrics.frameSizeBytes)}</dd></div>
             </dl>
           {/if}
+        </section>
+
+      {:else if active === 'remote'}
+        <section class="section-block">
+          <div class="section-title">
+            <div><h2>Phone remote control</h2><p>Pointer pad drives the connected phone through its accessibility service. Press-and-release is a tap; drag moves with contact.</p></div>
+            <button class="button" class:on={remoteMirrorOn} onclick={() => void toggleRemoteMirror()}>
+              {remoteMirrorOn ? 'Stop mirror' : 'Mirror screen'}
+            </button>
+          </div>
+          <div
+            class="remote-pad"
+            class:remote-pad-live={Boolean(remoteMirrorUrl)}
+            style={remoteMirrorAspect ? `aspect-ratio: ${remoteMirrorAspect};` : ''}
+            bind:this={remotePadEl}
+            onpointerdown={remoteDown}
+            onpointermove={remoteMove}
+            onpointerup={remoteUp}
+            onpointercancel={remoteUp}
+            onwheel={remoteWheel}
+            role="application"
+            aria-label="Remote pointer pad"
+          >
+            {#if remoteMirrorUrl}
+              <img class="remote-frame" src={remoteMirrorUrl} alt="Phone screen" draggable="false" onload={onRemoteFrameLoad} />
+            {:else}
+              <span>{remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone'}</span>
+            {/if}
+          </div>
+          <div class="form-row remote-nav-row">
+            <button class="button" onclick={() => void remoteNav('back')}>Back</button>
+            <button class="button" onclick={() => void remoteNav('home')}>Home</button>
+            <button class="button" onclick={() => void remoteNav('recents')}>Recents</button>
+          </div>
+          <div class="form-row">
+            <input class="remote-text-input" placeholder="Type text into the focused field…" bind:value={remoteTextDraft}
+              onkeydown={(event) => { if (event.key === 'Enter' && remoteTextDraft) { void remoteText(remoteTextDraft); remoteTextDraft = ''; } }} />
+            <button class="button" disabled={!remoteTextDraft} onclick={() => { void remoteText(remoteTextDraft); remoteTextDraft = ''; }}>Send text</button>
+          </div>
         </section>
 
       {:else if active === 'messages'}

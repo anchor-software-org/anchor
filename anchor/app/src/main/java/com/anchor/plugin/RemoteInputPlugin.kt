@@ -1,22 +1,36 @@
 package com.anchor.plugin
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Bitmap
+import android.os.SystemClock
 import android.util.Log
 import com.anchor.core.AnchorEvent
 import com.anchor.core.AnchorMessage
 import com.anchor.core.AnchorTarget
 import com.anchor.core.MessageBroker
 import com.anchor.core.Plugin
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import org.anchor.sdk.AnchorCapability
+import org.anchor.sdk.AnchorDatagramFlow
 import org.anchor.sdk.AnchorSession
 import org.anchor.sdk.AnchorSessionEvent
 import org.anchor.sdk.InputProtocol
+import org.anchor.sdk.VideoFrameProtocol
 import org.json.JSONObject
 
 private const val TAG = "anchor.remoteinput"
+private const val MIRROR_JPEG_QUALITY = 55
+private const val MIRROR_MAX_WIDTH = 720
+private const val MIRROR_INTERVAL_MS = 350L
 
 /**
  * Remote input plugin — receives desktop → phone pointer/key/text events and
@@ -38,6 +52,8 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
     private var listenJob: Job? = null
     private var sdkScope: CoroutineScope? = null
     private var sdkCapability: AnchorCapability? = null
+    private var mirrorJob: Job? = null
+    private val screenshotExecutor = Executors.newSingleThreadExecutor()
 
     override fun start(scope: CoroutineScope) {
         sdkScope = scope
@@ -56,6 +72,8 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
     override fun stop() {
         listenJob?.cancel()
         listenJob = null
+        mirrorJob?.cancel()
+        mirrorJob = null
         sdkCapability = null
     }
 
@@ -101,6 +119,18 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
                 val k = InputProtocol.decodeKey(payload)
                 service()?.hidKey(k.hidUsage, k.pressed)
             }
+            InputProtocol.REMOTE_CONTROL_TYPE_URL -> {
+                when (InputProtocol.decodeRemoteControl(payload)) {
+                    InputProtocol.REMOTE_CONTROL_MIRROR_START -> startMirror()
+                    InputProtocol.REMOTE_CONTROL_MIRROR_STOP -> stopMirror()
+                    InputProtocol.REMOTE_CONTROL_BACK ->
+                        service()?.globalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+                    InputProtocol.REMOTE_CONTROL_HOME ->
+                        service()?.globalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+                    InputProtocol.REMOTE_CONTROL_RECENTS ->
+                        service()?.globalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
+                }
+            }
         }
     }
 
@@ -139,7 +169,132 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
             "remote_back" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_BACK)
             "remote_home" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_HOME)
             "remote_recents" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
+            "remote_mirror" ->
+                if (json.optBoolean("enabled", true)) startMirror() else stopMirror()
         }
+    }
+
+    // ── Screen mirror (accessibility stills path) ──────────────────────
+    //
+    // Phase 1 of remote screen mirroring: AccessibilityService.takeScreenshot
+    // JPEG stills over an ANFR datagram flow labelled
+    // InputProtocol.MIRROR_FRAME_TYPE_URL. Zero consent beyond the a11y
+    // service itself — MediaProjection/H.264 replaces the producer later
+    // without changing the wire path.
+
+    /** Debug/test hook: toggle the stills mirror without a desktop record. */
+    fun debugSetMirror(enabled: Boolean) {
+        if (enabled) startMirror() else stopMirror()
+    }
+
+    private fun startMirror() {
+        if (mirrorJob?.isActive == true) return
+        val capability = sdkCapability ?: run {
+            Log.w(TAG, "mirror requested with no SDK input capability")
+            return
+        }
+        if (service() == null) {
+            Log.w(TAG, "mirror requested but accessibility service is not enabled")
+            return
+        }
+        val scope = sdkScope ?: return
+        mirrorJob = scope.launch {
+            val flow = try {
+                capability.openDatagramFlow(InputProtocol.MIRROR_FRAME_TYPE_URL)
+            } catch (e: Exception) {
+                Log.w(TAG, "mirror datagram flow open failed: ${e.message}")
+                return@launch
+            }
+            Log.i(TAG, "mirror flow opened (flow=${flow.flowId}, session=${capability.sessionId})")
+            var sequence = 0L
+            var sendFailures = 0
+            try {
+                while (isActive) {
+                    val jpeg = grabJpeg()
+                    if (jpeg != null) {
+                        sendFailures = if (
+                            sendJpegFrame(flow, capability.sessionId, sequence++, jpeg)
+                        ) 0 else sendFailures + 1
+                        // A dead session fails every send — stop retrying.
+                        if (sendFailures >= 5) {
+                            Log.w(TAG, "mirror stopping: datagram flow is failing")
+                            break
+                        }
+                    }
+                    delay(MIRROR_INTERVAL_MS)
+                }
+            } finally {
+                runCatching { flow.close() }
+                Log.i(TAG, "mirror flow closed")
+            }
+        }
+    }
+
+    private fun stopMirror() {
+        mirrorJob?.cancel()
+        mirrorJob = null
+    }
+
+    private suspend fun grabJpeg(): ByteArray? {
+        val svc = service() ?: return null
+        val bitmap = try {
+            suspendCancellableCoroutine<Bitmap?> { cont ->
+                svc.grabScreenshot(screenshotExecutor, object :
+                    AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        val hardware = Bitmap.wrapHardwareBuffer(
+                            result.hardwareBuffer, result.colorSpace
+                        )
+                        result.hardwareBuffer.close()
+                        cont.resume(hardware?.copy(Bitmap.Config.ARGB_8888, false))
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        cont.resumeWithException(
+                            IllegalStateException("takeScreenshot failed: $errorCode")
+                        )
+                    }
+                })
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "screenshot failed: ${e.message}")
+            return null
+        } ?: return null
+        return try {
+            val scaled = if (bitmap.width > MIRROR_MAX_WIDTH) {
+                val h = bitmap.height * MIRROR_MAX_WIDTH / bitmap.width
+                Bitmap.createScaledBitmap(bitmap, MIRROR_MAX_WIDTH, h, true)
+            } else bitmap
+            val out = ByteArrayOutputStream(96 * 1024)
+            scaled.compress(Bitmap.CompressFormat.JPEG, MIRROR_JPEG_QUALITY, out)
+            out.toByteArray()
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun sendJpegFrame(
+        flow: AnchorDatagramFlow,
+        capabilitySessionId: Long,
+        sequence: Long,
+        jpeg: ByteArray,
+    ): Boolean {
+        val packets = VideoFrameProtocol.fragmentWithParity(
+            VideoFrameProtocol.KIND_SCREEN,
+            VideoFrameProtocol.FLAG_KEYFRAME,
+            capabilitySessionId,
+            flow.flowId,
+            sequence,
+            SystemClock.elapsedRealtimeNanos() / 1000,
+            0,
+            jpeg,
+        )
+        var sent = 0
+        for (packet in packets) {
+            val ok = runCatching { flow.send(packet) }.isSuccess
+            if (ok) sent++ else Log.w(TAG, "mirror datagram dropped")
+        }
+        return sent > 0
     }
 
     // ── Helpers ────────────────────────────────────────────────────────

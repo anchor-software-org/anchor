@@ -15,6 +15,18 @@ pub const POINTER_RELATIVE_TYPE_URL: &str =
 pub const POINTER_BUTTON_TYPE_URL: &str =
     "type.googleapis.com/anchor.v1.capabilities.input.InputPointerButton";
 pub const SCROLL_TYPE_URL: &str = "type.googleapis.com/anchor.v1.capabilities.input.InputScroll";
+pub const REMOTE_CONTROL_TYPE_URL: &str =
+    "type.googleapis.com/anchor.v1.capabilities.input.RemoteControl";
+/// Datagram payload label for the device's mirrored screen frames
+/// (controller → device direction reverse: device sends ANFR/JPEG stills).
+pub const MIRROR_FRAME_TYPE_URL: &str =
+    "type.googleapis.com/anchor.v1.capabilities.input.RemoteScreenFrame";
+
+pub const REMOTE_CONTROL_MIRROR_START: i32 = 1;
+pub const REMOTE_CONTROL_MIRROR_STOP: i32 = 2;
+pub const REMOTE_CONTROL_BACK: i32 = 3;
+pub const REMOTE_CONTROL_HOME: i32 = 4;
+pub const REMOTE_CONTROL_RECENTS: i32 = 5;
 
 pub fn advertisement() -> CapabilityAdvertisement {
     CapabilityAdvertisement {
@@ -27,8 +39,10 @@ pub fn advertisement() -> CapabilityAdvertisement {
             POINTER_RELATIVE_TYPE_URL.into(),
             POINTER_BUTTON_TYPE_URL.into(),
             SCROLL_TYPE_URL.into(),
+            REMOTE_CONTROL_TYPE_URL.into(),
+            MIRROR_FRAME_TYPE_URL.into(),
         ],
-        supports_datagrams: false,
+        supports_datagrams: true,
     }
 }
 pub fn endpoint_advertisement() -> EndpointAdvertisement {
@@ -37,8 +51,17 @@ pub fn endpoint_advertisement() -> EndpointAdvertisement {
         capabilities: vec![advertisement()],
     }
 }
+pub fn encode_key(hid_usage: u32, pressed: bool) -> Vec<u8> {
+    v1::capabilities::input::InputKey { hid_usage, pressed }.encode_to_vec()
+}
 pub fn decode_key(bytes: &[u8]) -> Result<v1::capabilities::input::InputKey, prost::DecodeError> {
     v1::capabilities::input::InputKey::decode(bytes)
+}
+pub fn encode_text(text_utf8: &str) -> Vec<u8> {
+    v1::capabilities::input::InputText {
+        text_utf8: text_utf8.into(),
+    }
+    .encode_to_vec()
 }
 pub fn decode_text(bytes: &[u8]) -> Result<v1::capabilities::input::InputText, prost::DecodeError> {
     v1::capabilities::input::InputText::decode(bytes)
@@ -60,15 +83,41 @@ pub fn decode_pointer_relative(
 ) -> Result<v1::capabilities::input::InputPointerRelative, prost::DecodeError> {
     v1::capabilities::input::InputPointerRelative::decode(bytes)
 }
+pub fn encode_pointer_absolute(x: u32, y: u32, target_output_name: &str) -> Vec<u8> {
+    v1::capabilities::input::InputPointerAbsolute {
+        x,
+        y,
+        target_output_name: target_output_name.into(),
+    }
+    .encode_to_vec()
+}
+pub fn encode_pointer_button(button: i32, pressed: bool) -> Vec<u8> {
+    v1::capabilities::input::InputPointerButton { button, pressed }.encode_to_vec()
+}
 pub fn decode_pointer_button(
     bytes: &[u8],
 ) -> Result<v1::capabilities::input::InputPointerButton, prost::DecodeError> {
     v1::capabilities::input::InputPointerButton::decode(bytes)
 }
+pub fn encode_scroll(horizontal_120ths: i32, vertical_120ths: i32) -> Vec<u8> {
+    v1::capabilities::input::InputScroll {
+        horizontal_120ths,
+        vertical_120ths,
+    }
+    .encode_to_vec()
+}
 pub fn decode_scroll(
     bytes: &[u8],
 ) -> Result<v1::capabilities::input::InputScroll, prost::DecodeError> {
     v1::capabilities::input::InputScroll::decode(bytes)
+}
+pub fn encode_remote_control(kind: i32) -> Vec<u8> {
+    v1::capabilities::input::RemoteControl { kind }.encode_to_vec()
+}
+pub fn decode_remote_control(
+    bytes: &[u8],
+) -> Result<v1::capabilities::input::RemoteControl, prost::DecodeError> {
+    v1::capabilities::input::RemoteControl::decode(bytes)
 }
 
 #[cfg(test)]

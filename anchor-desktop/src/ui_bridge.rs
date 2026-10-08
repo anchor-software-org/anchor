@@ -322,6 +322,7 @@ pub struct DesktopController {
     mobile_batteries: crate::anchorapp::battery::MobileBatteryMap,
     input_capabilities: Mutex<InputCapabilities>,
     frame_buffer: std::sync::Arc<Mutex<Option<SharedFrameBuffer>>>,
+    remote_input: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
 }
 
 impl DesktopController {
@@ -343,6 +344,7 @@ impl DesktopController {
             commands,
             camera_setup,
             frame_buffer,
+            remote_input,
         } = runtime;
         Self {
             broker_tx,
@@ -378,6 +380,7 @@ impl DesktopController {
             command_runs: Mutex::new(HashMap::new()),
             camera_setup,
             frame_buffer,
+            remote_input,
             mobile_batteries: crate::anchorapp::battery::new_mobile_battery_map(),
             input_capabilities: Mutex::new(InputCapabilities::default()),
             camera_preferences: Mutex::new(CameraPreferences {
@@ -1090,6 +1093,84 @@ impl DesktopController {
             AnchorTarget::Device,
             serde_json::json!({ "plugin_id": "cameraplugin", "command": "switch_camera" }),
         )
+    }
+
+    /// Remote-control a connected phone: tap at normalized [0,1] coordinates.
+    pub fn remote_tap(&self, x: f64, y: f64) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_tap", "x": x, "y": y }),
+        )
+    }
+
+    pub fn remote_pointer_down(&self, x: f64, y: f64) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_down", "x": x, "y": y }),
+        )
+    }
+
+    pub fn remote_pointer_move(&self, x: f64, y: f64) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_move", "x": x, "y": y }),
+        )
+    }
+
+    pub fn remote_pointer_up(&self) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_up" }),
+        )
+    }
+
+    pub fn remote_scroll(&self, dx: f64, dy: f64) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_scroll", "dx": dx, "dy": dy }),
+        )
+    }
+
+    pub fn remote_text(&self, text: String) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_text", "text": text }),
+        )
+    }
+
+    pub fn remote_nav(&self, action: &str) -> Result<(), String> {
+        let kind = match action {
+            "back" => "remote_back",
+            "home" => "remote_home",
+            "recents" => "remote_recents",
+            _ => return Err("Unsupported remote nav action.".into()),
+        };
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": kind }),
+        )
+    }
+
+    /// Toggle the phone's screen mirror (accessibility stills path).
+    pub fn remote_mirror(&self, enabled: bool) -> Result<(), String> {
+        self.send_json(
+            AnchorTarget::Device,
+            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_mirror", "enabled": enabled }),
+        )
+    }
+
+    /// Newest mirror frame after `after_sequence` across connected devices.
+    /// The payload is already JPEG, so the data URL is built without a decode.
+    pub fn remote_frame(&self, after_sequence: u64) -> Option<ScreenPreview> {
+        self.remote_input
+            .latest_frame(after_sequence)
+            .map(|frame| ScreenPreview {
+                sequence: frame.sequence,
+                data_url: format!(
+                    "data:image/jpeg;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(frame.jpeg.as_slice())
+                ),
+            })
     }
 
     fn send_camera_control(&self, command: &str, value: serde_json::Value) -> Result<(), String> {

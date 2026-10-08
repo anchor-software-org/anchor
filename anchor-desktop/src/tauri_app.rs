@@ -145,6 +145,22 @@ controller_action!(delete_command(id: String) => delete_command(&id));
 controller_action!(update_command(id: String, name: String, command: String, description: String, detach: bool) => update_command(&id, name, command, description, detach));
 controller_action!(run_command(id: String) => run_command(&id));
 controller_action!(media_command(source: String, command: String) => media_command(&source, &command));
+controller_action!(remote_tap(x: f64, y: f64) => remote_tap(x, y));
+controller_action!(remote_pointer_down(x: f64, y: f64) => remote_pointer_down(x, y));
+controller_action!(remote_pointer_move(x: f64, y: f64) => remote_pointer_move(x, y));
+controller_action!(remote_pointer_up() => remote_pointer_up());
+controller_action!(remote_scroll(dx: f64, dy: f64) => remote_scroll(dx, dy));
+controller_action!(remote_text(text: String) => remote_text(text));
+controller_action!(remote_nav(action: String) => remote_nav(&action));
+controller_action!(remote_mirror(enabled: bool) => remote_mirror(enabled));
+
+#[tauri::command]
+fn remote_frame(
+    controller: ControllerState<'_>,
+    after_sequence: u64,
+) -> Option<ScreenPreview> {
+    controller.remote_frame(after_sequence)
+}
 
 #[tauri::command]
 fn clear_logs(controller: ControllerState<'_>) {
@@ -223,6 +239,15 @@ pub fn run() {
             update_command,
             run_command,
             media_command,
+            remote_tap,
+            remote_pointer_down,
+            remote_pointer_move,
+            remote_pointer_up,
+            remote_scroll,
+            remote_text,
+            remote_nav,
+            remote_mirror,
+            remote_frame,
             clear_logs,
             setup_camera,
             set_camera_device,
