@@ -125,13 +125,17 @@ mod tests {
     use super::*;
     #[test]
     fn advertisement_lists_only_defined_control_records() {
-        assert!(
-            advertisement()
-                .record_type_urls
-                .iter()
-                .any(|url| url == TEXT_TYPE_URL)
-        );
-        assert!(!advertisement().supports_datagrams);
+        let advert = advertisement();
+        for url in [
+            TEXT_TYPE_URL,
+            REMOTE_CONTROL_TYPE_URL,
+            MIRROR_FRAME_TYPE_URL,
+        ] {
+            assert!(advert.record_type_urls.iter().any(|listed| listed == url));
+        }
+        // The remote-control direction uses datagram flows for mirrored
+        // screen frames.
+        assert!(advert.supports_datagrams);
     }
 
     #[test]

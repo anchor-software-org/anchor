@@ -381,10 +381,20 @@ async fn handle_session(
                 remote_input_binding.attach(device_id.clone(), sender.clone());
                 if std::env::var_os("ANCHOR_REMOTE_INPUT_DEMO").is_some() {
                     thread::spawn(move || {
-                        // Wait for the capability to settle, then send a home
-                        // press every 5 s so the wire path can be verified by
-                        // watching the phone bounce to the launcher.
+                        // Wait for the capability to settle, start the stills
+                        // mirror once via the RemoteControl record path, then
+                        // send a home press every 5 s so the wire path can be
+                        // verified by watching the phone bounce to the launcher.
                         thread::sleep(Duration::from_secs(2));
+                        let ok = crate::anchorapp::sdk_remote_input::send_json(
+                            &sender,
+                            &serde_json::json!({
+                                "plugin_id": "remoteinput",
+                                "type": "remote_mirror",
+                                "enabled": true,
+                            }),
+                        );
+                        log::info!("ANCHOR_REMOTE_INPUT_DEMO mirror -> {ok}");
                         loop {
                             let ok = crate::anchorapp::sdk_remote_input::send_json(
                                 &sender,

@@ -180,16 +180,28 @@ impl SdkRemoteInputBinding {
                         let frame_sequence_field = video_frame::FrameHeader::decode(&datagram)
                             .map(|(header, _)| header.sequence)
                             .unwrap_or(0);
+                        let jpeg = Arc::new(payload);
                         frames.lock().unwrap().insert(
                             device_id.clone(),
                             MirrorFrame {
                                 sequence,
                                 frame_sequence: frame_sequence_field,
-                                jpeg: Arc::new(payload),
+                                jpeg: Arc::clone(&jpeg),
                             },
                         );
                         received += 1;
-                        if received == 1 || received.is_multiple_of(50) {
+                        if received == 1 {
+                            // JPEG stills start with the SOI magic; anything
+                            // else means the producer/decoder assumptions
+                            // drifted and the UI would render a broken image.
+                            let jpeg_magic = jpeg.starts_with(&[0xFF, 0xD8]);
+                            log::info!(
+                                "SDK mirror first frame from {device_id}: {} bytes, jpeg={}",
+                                jpeg.len(),
+                                jpeg_magic
+                            );
+                        }
+                        if received.is_multiple_of(50) {
                             log::info!("SDK mirror frames received from {device_id}: {received}");
                         }
                     }
