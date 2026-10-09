@@ -787,24 +787,26 @@
               {remoteMirrorOn ? 'Stop mirror' : 'Mirror screen'}
             </button>
           </div>
-          <div
-            class="remote-pad"
-            class:remote-pad-live={Boolean(remoteMirrorUrl)}
-            style={remoteMirrorAspect ? `aspect-ratio: ${remoteMirrorAspect};` : ''}
-            bind:this={remotePadEl}
-            onpointerdown={remoteDown}
-            onpointermove={remoteMove}
-            onpointerup={remoteUp}
-            onpointercancel={remoteUp}
-            onwheel={remoteWheel}
-            role="application"
-            aria-label="Remote pointer pad"
-          >
-            {#if remoteMirrorUrl}
-              <img class="remote-frame" src={remoteMirrorUrl} alt="Phone screen" draggable="false" onload={onRemoteFrameLoad} />
-            {:else}
-              <span>{remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone'}</span>
-            {/if}
+          <div class="remote-pad-wrap">
+            <div
+              class="remote-pad"
+              class:remote-pad-live={Boolean(remoteMirrorUrl)}
+              style={remoteMirrorAspect ? `aspect-ratio: ${remoteMirrorAspect};` : ''}
+              bind:this={remotePadEl}
+              onpointerdown={remoteDown}
+              onpointermove={remoteMove}
+              onpointerup={remoteUp}
+              onpointercancel={remoteUp}
+              onwheel={remoteWheel}
+              role="application"
+              aria-label="Remote pointer pad"
+            >
+              {#if remoteMirrorUrl}
+                <img class="remote-frame" src={remoteMirrorUrl} alt="Phone screen" draggable="false" onload={onRemoteFrameLoad} />
+              {:else}
+                <span>{remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone'}</span>
+              {/if}
+            </div>
           </div>
           <div class="form-row remote-nav-row">
             <button class="button" onclick={() => void remoteNav('back')}>Back</button>

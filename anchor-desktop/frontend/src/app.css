@@ -363,7 +363,8 @@ input:focus, select:focus { border-color: var(--accent); }
   .about-grid > div:nth-child(n + 3) { border-top: 1px solid var(--rock-stroke); }
 }
 
-.remote-pad { display: grid; place-items: center; aspect-ratio: 9 / 19; max-height: 560px; max-width: 100%; margin: 0 auto; border: 1px solid var(--rock-stroke); color: var(--rock); background: var(--ink); font-size: 11px; touch-action: none; user-select: none; cursor: crosshair; overflow: hidden; }
+.remote-pad-wrap { display: flex; justify-content: center; }
+.remote-pad { display: grid; place-items: center; flex: none; aspect-ratio: 9 / 19; height: min(560px, 70vh); width: auto; max-width: 100%; border: 1px solid var(--rock-stroke); color: var(--rock); background: var(--ink); font-size: 11px; touch-action: none; user-select: none; cursor: crosshair; overflow: hidden; }
 .remote-pad:active { border-color: var(--sky); }
 .remote-pad-live { padding: 0; }
 .remote-frame { width: 100%; height: 100%; object-fit: fill; pointer-events: none; -webkit-user-drag: none; }
