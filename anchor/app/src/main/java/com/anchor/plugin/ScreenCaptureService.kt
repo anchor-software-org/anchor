@@ -61,6 +61,8 @@ class ScreenCaptureService : Service() {
     private var encoder: MediaCodec? = null
     private var encoderThread: HandlerThread? = null
     private var codecConfig: ByteArray? = null
+    private var capturedRotation = -1
+    private var displayListener: DisplayManager.DisplayListener? = null
     /** nanoTime → elapsedRealtime translation for codec output timestamps. */
     private var clockDeltaUs = 0L
 
@@ -111,11 +113,63 @@ class ScreenCaptureService : Service() {
 
         try {
             startEncoder()
+            watchRotation()
             onProjectionReady?.invoke()
         } catch (e: Exception) {
             Log.e(TAG, "capture encoder failed: ${e.message}")
             stopCapture()
         }
+    }
+
+    /**
+     * A MediaProjection token is single-capture on Android 14+: the same
+     * instance rejects a second createVirtualDisplay. Rotation therefore
+     * resizes the existing virtual display and re-points it at a freshly
+     * configured encoder surface instead of rebuilding it.
+     */
+    private fun watchRotation() {
+        val display = runCatching {
+            @Suppress("DEPRECATION")
+            getSystemService(WindowManager::class.java).defaultDisplay
+        }.getOrNull() ?: return
+        capturedRotation = display.rotation
+        val dm = getSystemService(DisplayManager::class.java)
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) {}
+            override fun onDisplayRemoved(displayId: Int) {}
+            override fun onDisplayChanged(displayId: Int) {
+                if (displayId != display.displayId) return
+                val rotation = display.rotation
+                if (rotation == capturedRotation) return
+                capturedRotation = rotation
+                Log.i(TAG, "display rotated to $rotation — resizing encoder")
+                runCatching { restartEncoder() }
+                    .onFailure { error ->
+                        Log.e(TAG, "rotation restart failed: ${error.message}")
+                        stopCapture()
+                    }
+            }
+        }
+        displayListener = listener
+        dm.registerDisplayListener(listener, null)
+    }
+
+    /** Swap the encoder+surface inside the same virtual display. */
+    private fun restartEncoder() {
+        val display = virtualDisplay ?: return
+        runCatching { encoder?.stop() }
+        runCatching { encoder?.release() }
+        encoder = null
+        codecConfig = null
+        encoderThread?.quitSafely()
+        encoderThread = null
+
+        val (width, height) = displaySize()
+        val (codec, surface) = createEncoder(width, height)
+        encoder = codec
+        display.resize(width, height, resources.displayMetrics.densityDpi)
+        display.surface = surface
+        Log.i(TAG, "capture resized to ${width}x${height} on rotation")
     }
 
     private fun startForegroundWithType() {
@@ -146,18 +200,28 @@ class ScreenCaptureService : Service() {
     }
 
     private fun displaySize(): Pair<Int, Int> {
-        val wm = getSystemService(WindowManager::class.java)
-        val bounds = wm.maximumWindowMetrics.bounds
-        var w = bounds.width()
-        var h = bounds.height()
+        // getRealSize tracks the current orientation; maximumWindowMetrics
+        // does not reliably swap width/height on rotation across vendors.
+        val size = android.graphics.Point()
+        runCatching {
+            @Suppress("DEPRECATION")
+            getSystemService(WindowManager::class.java).defaultDisplay.getRealSize(size)
+        }
+        var w = size.x
+        var h = size.y
+        if (w <= 0 || h <= 0) {
+            val bounds = getSystemService(WindowManager::class.java).maximumWindowMetrics.bounds
+            w = bounds.width()
+            h = bounds.height()
+        }
         val scale = minOf(1f, MAX_DIMENSION.toFloat() / maxOf(w, h))
         w = (w * scale).toInt() and 0x7FFFFFFE
         h = (h * scale).toInt() and 0x7FFFFFFE
         return w to h
     }
 
-    private fun startEncoder() {
-        val (width, height) = displaySize()
+    /** Configure+start a surface-input H.264 encoder; returns codec+surface. */
+    private fun createEncoder(width: Int, height: Int): Pair<MediaCodec, android.view.Surface> {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -187,13 +251,19 @@ class ScreenCaptureService : Service() {
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val surface = codec.createInputSurface()
         codec.start()
-        encoder = codec
+        Log.i(TAG, "encoder started ${width}x${height}@${FRAME_RATE}fps ${BIT_RATE / 1000}kbps")
+        return codec to surface
+    }
 
+    private fun startEncoder() {
+        val (width, height) = displaySize()
+        val (codec, surface) = createEncoder(width, height)
+        encoder = codec
         val dpi = resources.displayMetrics.densityDpi
         virtualDisplay = projection?.createVirtualDisplay(
             "anchor-mirror", width, height, dpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            surface, null, Handler(thread.looper),
+            surface, null, null,
         ) ?: throw IllegalStateException("virtual display without projection")
         Log.i(TAG, "capture started ${width}x${height}@${FRAME_RATE}fps ${BIT_RATE / 1000}kbps")
     }
@@ -266,6 +336,12 @@ class ScreenCaptureService : Service() {
         runCatching { encoder?.release() }
         encoder = null
         codecConfig = null
+        displayListener?.let {
+            runCatching {
+                getSystemService(DisplayManager::class.java).unregisterDisplayListener(it)
+            }
+        }
+        displayListener = null
         runCatching { projection?.stop() }
         projection = null
         encoderThread?.quitSafely()

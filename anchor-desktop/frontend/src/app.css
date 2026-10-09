@@ -366,9 +366,12 @@ input:focus, select:focus { border-color: var(--accent); }
 .remote-pad-wrap { display: flex; justify-content: center; }
 .remote-pad { position: relative; display: grid; place-items: center; flex: none; aspect-ratio: 9 / 19; height: min(560px, 70vh); width: auto; max-width: 100%; border: 1px solid var(--rock-stroke); color: var(--rock); background: var(--ink); font-size: 11px; touch-action: none; user-select: none; cursor: crosshair; overflow: hidden; }
 .remote-pad:active { border-color: var(--sky); }
+.remote-pad-landscape { height: auto; width: min(100%, 900px); }
 .remote-pad-live { padding: 0; }
 .remote-frame { width: 100%; height: 100%; object-fit: fill; pointer-events: none; -webkit-user-drag: none; }
 .remote-latency { position: absolute; top: 6px; right: 8px; padding: 2px 7px; border-radius: 4px; background: rgba(0, 0, 0, 0.62); color: var(--sky); font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none; z-index: 1; }
+.remote-click { position: absolute; width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%; border: 2px solid var(--sky); background: rgba(56, 189, 248, 0.35); pointer-events: none; z-index: 2; animation: remote-click-ping 0.45s ease-out forwards; }
+@keyframes remote-click-ping { from { transform: scale(0.5); opacity: 1; } to { transform: scale(1.8); opacity: 0; } }
 .remote-nav-row { justify-content: center; }
 .remote-text-input { flex: 1; }
 .button.on { border-color: var(--sky); color: var(--sky); }

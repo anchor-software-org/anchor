@@ -118,8 +118,12 @@
   let remoteMirrorSeq = 0;
   let remoteMirrorUrl = '';
   let remoteMirrorAspect = '';
+  let remoteMirrorLandscape = false;
   let remoteMirrorLatency = 0;
   let remoteMirrorTimer = 0;
+  let remoteClicks: { id: number; x: number; y: number }[] = [];
+  let remoteClickSeq = 0;
+  let remoteLastMoveSent = 0;
 
   const refreshRemoteFrame = async () => {
     if (!remoteMirrorOn || active !== 'remote' || !windowFocused) return;
@@ -141,7 +145,7 @@
     remoteMirrorTimer = window.setTimeout(async () => {
       await refreshRemoteFrame();
       scheduleRemoteFrame();
-    }, 120);
+    }, 60);
   };
 
   const toggleRemoteMirror = async () => {
@@ -166,6 +170,7 @@
     const img = event.currentTarget as HTMLImageElement;
     if (img.naturalWidth > 0 && img.naturalHeight > 0) {
       remoteMirrorAspect = `${img.naturalWidth} / ${img.naturalHeight}`;
+      remoteMirrorLandscape = img.naturalWidth > img.naturalHeight;
     }
   };
 
@@ -182,11 +187,21 @@
     remotePadDown = true;
     remotePadEl?.setPointerCapture(event.pointerId);
     const [x, y] = remoteNorm(event);
+    const id = ++remoteClickSeq;
+    remoteClicks = [...remoteClicks, { id, x, y }];
+    window.setTimeout(() => {
+      remoteClicks = remoteClicks.filter((click) => click.id !== id);
+    }, 450);
     void remotePointerDown(x, y);
   };
 
   const remoteMove = (event: PointerEvent) => {
     if (!remotePadDown) return;
+    // Drag events fire faster than the wire needs — cap at ~40Hz so the
+    // phone replays the freshest position instead of a backlog.
+    const now = performance.now();
+    if (now - remoteLastMoveSent < 25) return;
+    remoteLastMoveSent = now;
     const [x, y] = remoteNorm(event);
     void remotePointerMove(x, y);
   };
@@ -793,6 +808,7 @@
             <div
               class="remote-pad"
               class:remote-pad-live={Boolean(remoteMirrorUrl)}
+              class:remote-pad-landscape={remoteMirrorLandscape}
               style={remoteMirrorAspect ? `aspect-ratio: ${remoteMirrorAspect};` : ''}
               bind:this={remotePadEl}
               onpointerdown={remoteDown}
@@ -806,6 +822,9 @@
               {#if remoteMirrorUrl}
                 <img class="remote-frame" src={remoteMirrorUrl} alt="Phone screen" draggable="false" onload={onRemoteFrameLoad} />
                 <span class="remote-latency">{Math.round(remoteMirrorLatency)}ms</span>
+                {#each remoteClicks as click (click.id)}
+                  <span class="remote-click" style="left: {click.x * 100}%; top: {click.y * 100}%"></span>
+                {/each}
               {:else}
                 <span>{remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone'}</span>
               {/if}

@@ -52,12 +52,33 @@ impl SdkRemoteInputSender {
                             return;
                         }
                     };
-                for record in rx {
-                    let result = runtime.block_on(async {
-                        capability.send_record(record.type_url, record.payload).await
-                    });
-                    if let Err(error) = result {
-                        log::warn!("SDK remote-input send failed: {error}");
+                for first in rx.iter() {
+                    // Drain whatever queued while the last record was in
+                    // flight, then collapse each run of absolute moves to the
+                    // newest — a drag should never replay stale positions.
+                    let mut batch = vec![first];
+                    while let Ok(next) = rx.try_recv() {
+                        batch.push(next);
+                    }
+                    let mut skip = vec![false; batch.len()];
+                    let mut last_move: Option<usize> = None;
+                    for (i, record) in batch.iter().enumerate() {
+                        if record.type_url == input::POINTER_ABSOLUTE_TYPE_URL {
+                            if let Some(prev) = last_move.replace(i) {
+                                skip[prev] = true;
+                            }
+                        }
+                    }
+                    for (record, drop) in batch.into_iter().zip(skip) {
+                        if drop {
+                            continue;
+                        }
+                        let result = runtime.block_on(async {
+                            capability.send_record(record.type_url, record.payload).await
+                        });
+                        if let Err(error) = result {
+                            log::warn!("SDK remote-input send failed: {error}");
+                        }
                     }
                 }
             })
