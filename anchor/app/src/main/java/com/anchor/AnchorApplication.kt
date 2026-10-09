@@ -51,6 +51,11 @@ import java.io.File
  */
 class AnchorApplication : Application() {
 
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
+
     /** Connects the clipboard provider to a negotiated SDK session. */
     fun attachSdkClipboard(session: AnchorSession, capability: AnchorCapability, originNodeId: ByteArray) {
         clipboardPlugin.attachSdkSession(session, capability, originNodeId, processScope)
@@ -66,7 +71,7 @@ class AnchorApplication : Application() {
 
     val videoPlugin by lazy { VideoPlugin(broker) }
     val inputPlugin by lazy { InputPlugin(broker) }
-    val remoteInputPlugin by lazy { RemoteInputPlugin(broker) }
+    val remoteInputPlugin by lazy { RemoteInputPlugin(broker, this) }
     val clipboardPlugin by lazy { ClipboardPlugin(broker, this) }
     val notificationPlugin by lazy { NotificationPlugin(broker, this) }
     val smsPlugin by lazy { SmsPlugin(broker, this) }
@@ -386,5 +391,10 @@ class AnchorApplication : Application() {
             file.writeText(id)
             id
         }
+    }
+
+    companion object {
+        @Volatile var instance: AnchorApplication? = null
+            private set
     }
 }

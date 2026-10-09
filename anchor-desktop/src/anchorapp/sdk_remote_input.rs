@@ -15,6 +15,8 @@ use std::time::Instant;
 
 use anchor_sdk::{Capability, DatagramFlow, input, video_frame};
 
+use super::mirror_decoder::MirrorDecoder;
+
 const POINTER_BUTTON_LEFT: i32 = 1;
 
 static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -197,6 +199,9 @@ impl SdkRemoteInputBinding {
                     };
                 let mut assembler = video_frame::Reassembler::default();
                 let mut received = 0_u64;
+                // Created lazily on the first non-JPEG payload so the stills
+                // path never pays for an H.264 context it won't use.
+                let mut decoder: Option<MirrorDecoder> = None;
                 runtime.block_on(async move {
                     loop {
                         let datagram = match flow.recv().await {
@@ -216,7 +221,6 @@ impl SdkRemoteInputBinding {
                         ) else {
                             continue;
                         };
-                        let sequence = frame_sequence.fetch_add(1, Ordering::Relaxed) + 1;
                         let (frame_sequence_field, pts_us) =
                             video_frame::FrameHeader::decode(&datagram)
                                 .map(|(header, _)| {
@@ -228,36 +232,54 @@ impl SdkRemoteInputBinding {
                             .unwrap()
                             .get(&device_id)
                             .map(|offset| (monotonic_us() - (pts_us + offset)) as f64 / 1000.0);
-                        let jpeg = Arc::new(payload);
-                        frames.lock().unwrap().insert(
-                            device_id.clone(),
-                            MirrorFrame {
-                                sequence,
-                                frame_sequence: frame_sequence_field,
-                                latency_ms,
-                                jpeg: Arc::clone(&jpeg),
-                            },
-                        );
-                        received += 1;
-                        if received == 1 {
-                            // JPEG stills start with the SOI magic; anything
-                            // else means the producer/decoder assumptions
-                            // drifted and the UI would render a broken image.
-                            let jpeg_magic = jpeg.starts_with(&[0xFF, 0xD8]);
-                            log::info!(
-                                "SDK mirror first frame from {device_id}: {} bytes, jpeg={}",
-                                jpeg.len(),
-                                jpeg_magic
+                        // Two producers share this flow: JPEG stills arrive
+                        // display-ready; anything else is an Annex-B H.264
+                        // access unit (config AUs feed the decoder too — it
+                        // consumes parameter sets without emitting a frame).
+                        let jpegs: Vec<Vec<u8>> = if payload.starts_with(&[0xFF, 0xD8]) {
+                            vec![payload]
+                        } else {
+                            if decoder.is_none() {
+                                decoder = MirrorDecoder::new();
+                                log::info!(
+                                    "SDK mirror H.264 stream from {device_id}: decoder={}",
+                                    decoder.is_some()
+                                );
+                            }
+                            match decoder.as_mut() {
+                                Some(decoder) => decoder.decode_to_jpeg(&payload),
+                                None => continue,
+                            }
+                        };
+                        for jpeg in jpegs {
+                            let sequence = frame_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                            let jpeg = Arc::new(jpeg);
+                            frames.lock().unwrap().insert(
+                                device_id.clone(),
+                                MirrorFrame {
+                                    sequence,
+                                    frame_sequence: frame_sequence_field,
+                                    latency_ms,
+                                    jpeg: Arc::clone(&jpeg),
+                                },
                             );
-                        }
-                        if received.is_multiple_of(50) {
-                            let rtt = flow.transport_stats().rtt.as_millis();
-                            let latency = latency_ms
-                                .map(|ms| format!("{ms:.0}ms e2e"))
-                                .unwrap_or_else(|| "no clock offset".into());
-                            log::info!(
-                                "SDK mirror frames received from {device_id}: {received} (rtt={rtt}ms, {latency})"
-                            );
+                            received += 1;
+                            if received == 1 {
+                                log::info!(
+                                    "SDK mirror first frame from {device_id}: {} bytes, jpeg={}",
+                                    jpeg.len(),
+                                    jpeg.starts_with(&[0xFF, 0xD8])
+                                );
+                            }
+                            if received.is_multiple_of(50) {
+                                let rtt = flow.transport_stats().rtt.as_millis();
+                                let latency = latency_ms
+                                    .map(|ms| format!("{ms:.0}ms e2e"))
+                                    .unwrap_or_else(|| "no clock offset".into());
+                                log::info!(
+                                    "SDK mirror frames received from {device_id}: {received} (rtt={rtt}ms, {latency})"
+                                );
+                            }
                         }
                     }
                 });

@@ -1,9 +1,15 @@
 package com.anchor.plugin
 
 import android.accessibilityservice.AccessibilityService
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
+import androidx.core.app.NotificationCompat
 import com.anchor.core.AnchorEvent
 import com.anchor.core.AnchorMessage
 import com.anchor.core.AnchorTarget
@@ -31,6 +37,8 @@ private const val TAG = "anchor.remoteinput"
 private const val MIRROR_JPEG_QUALITY = 55
 private const val MIRROR_MAX_WIDTH = 720
 private const val MIRROR_INTERVAL_MS = 80L
+private const val CONSENT_CHANNEL_ID = "anchor_capture"
+private const val CONSENT_NOTIFICATION_ID = 41
 
 /**
  * Remote input plugin — receives desktop → phone pointer/key/text events and
@@ -45,7 +53,10 @@ private const val MIRROR_INTERVAL_MS = 80L
  * should check AnchorAccessibilityService.isEnabled() before advertising the
  * capability.
  */
-class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
+class RemoteInputPlugin(
+    private val broker: MessageBroker,
+    private val context: Context,
+) : Plugin {
 
     override val pluginId = "remoteinput"
 
@@ -53,6 +64,11 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
     private var sdkScope: CoroutineScope? = null
     private var sdkCapability: AnchorCapability? = null
     private var mirrorJob: Job? = null
+    /** True once the desktop asked for the mirror; drives auto-start on consent. */
+    @Volatile private var mirrorWanted = false
+    @Volatile private var consentPending = false
+    private var videoFlow: AnchorDatagramFlow? = null
+    private var videoSequence = 0L
     @Volatile private var mirrorCaptureMs = -1L
     @Volatile private var mirrorEncodeMs = -1L
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
@@ -81,6 +97,13 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
 
     fun attachSdkSession(session: AnchorSession, capability: AnchorCapability) {
         sdkCapability = capability
+        videoFlow = null
+        // A projection can outlive the session — reattach its sink so the
+        // mirror resumes without a new consent dialog.
+        val service = ScreenCaptureService.instance
+        if (mirrorWanted && service != null) {
+            startVideoMirror(capability, service)
+        }
         Log.i(TAG, "SDK remote-input capability attached (session=${capability.sessionId})")
     }
 
@@ -193,27 +216,173 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
         }
     }
 
-    // ── Screen mirror (accessibility stills path) ──────────────────────
+    // ── Screen mirror ────────────────────────────────────────────────────
     //
-    // Phase 1 of remote screen mirroring: AccessibilityService.takeScreenshot
-    // JPEG stills over an ANFR datagram flow labelled
-    // InputProtocol.MIRROR_FRAME_TYPE_URL. Zero consent beyond the a11y
-    // service itself — MediaProjection/H.264 replaces the producer later
-    // without changing the wire path.
+    // Mirror frames ride an ANFR datagram flow labelled
+    // InputProtocol.MIRROR_FRAME_TYPE_URL. Two producers feed it:
+    //   - MediaProjection → MediaCodec H.264 (primary, one consent tap)
+    //   - AccessibilityService.takeScreenshot JPEG stills (fallback)
 
-    /** Debug/test hook: toggle the stills mirror without a desktop record. */
+    /** Debug/test hook: toggle the mirror without a desktop record. */
     fun debugSetMirror(enabled: Boolean) {
         if (enabled) startMirror() else stopMirror()
     }
 
     private fun startMirror() {
+        mirrorWanted = true
+        if (videoFlow != null || mirrorJob?.isActive == true) return
+        val capability = sdkCapability ?: run {
+            Log.w(TAG, "mirror requested with no SDK input capability")
+            return
+        }
+        val service = ScreenCaptureService.instance
+        if (service != null) {
+            startVideoMirror(capability, service)
+            return
+        }
+        // No projection token — ask for consent once; the video mirror starts
+        // automatically when the grant lands. JPEG stills need the a11y
+        // service, video doesn't.
+        requestCaptureConsent()
+    }
+
+    /** Called by ScreenCaptureConsentActivity with the user's choice. */
+    fun onConsentResult(granted: Boolean) {
+        consentPending = false
+        if (!granted) {
+            Log.i(TAG, "projection consent denied — falling back to a11y stills")
+            if (mirrorWanted) startStillsMirror()
+            return
+        }
+        // The consent trampoline hands the token to ScreenCaptureService;
+        // wait for it to come up, then start the video mirror.
+        val capability = sdkCapability ?: return
+        sdkScope?.launch {
+            var waited = 0
+            while (ScreenCaptureService.instance == null && waited < 50) {
+                delay(100)
+                waited++
+            }
+            val service = ScreenCaptureService.instance
+            if (service != null && mirrorWanted) {
+                startVideoMirror(capability, service)
+            } else if (service == null) {
+                Log.w(TAG, "capture service never started after consent")
+            }
+        }
+    }
+
+    private fun requestCaptureConsent() {
+        if (consentPending) return
+        consentPending = true
+        val intent = Intent(context, com.anchor.ScreenCaptureConsentActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(intent) }
+            .onSuccess { Log.i(TAG, "capture consent activity launched") }
+            .onFailure { error ->
+                // Background activity launch was blocked — offer the consent
+                // trigger as a notification tap instead.
+                Log.i(TAG, "direct consent launch blocked ($error); posting notification")
+                postConsentNotification(intent)
+            }
+    }
+
+    private fun postConsentNotification(consentIntent: Intent) {
+        val nm = context.getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(
+            NotificationChannel(
+                CONSENT_CHANNEL_ID, "Screen mirroring", NotificationManager.IMPORTANCE_HIGH,
+            )
+        )
+        val pending = PendingIntent.getActivity(
+            context, 0, consentIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val notification = NotificationCompat.Builder(context, CONSENT_CHANNEL_ID)
+            .setContentTitle("Anchor wants to mirror this screen")
+            .setContentText("Tap to allow screen capture")
+            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .build()
+        runCatching { nm.notify(CONSENT_NOTIFICATION_ID, notification) }
+    }
+
+    // ── Screen mirror (MediaProjection + H.264) ─────────────────────────
+    //
+    // Phase 2: VirtualDisplay feeds a MediaCodec surface encoder; each Annex-B
+    // access unit rides the same ANFR datagram flow as the stills path. The
+    // service owns the projection; this plugin owns the wire.
+
+    private fun startVideoMirror(
+        capability: AnchorCapability,
+        service: ScreenCaptureService,
+    ) {
+        val scope = sdkScope ?: return
+        scope.launch {
+            val flow = videoFlow ?: runCatching {
+                capability.openDatagramFlow(InputProtocol.MIRROR_FRAME_TYPE_URL)
+            }.getOrElse { error ->
+                Log.w(TAG, "video mirror flow open failed: ${error.message}")
+                return@launch
+            }
+            videoFlow = flow
+            videoSequence = 0
+            Log.i(TAG, "video mirror flow opened (flow=${flow.flowId}, session=${capability.sessionId})")
+            service.frameSink = { data, isKey, isConfig, ptsUs ->
+                sendVideoFrame(flow, capability.sessionId, data, isKey, isConfig, ptsUs)
+            }
+            service.onProjectionStopped = {
+                Log.i(TAG, "projection stopped — closing video mirror flow")
+                videoFlow = null
+                scope.launch { runCatching { flow.close() } }
+            }
+        }
+    }
+
+    private fun sendVideoFrame(
+        flow: AnchorDatagramFlow,
+        capabilitySessionId: Long,
+        data: ByteArray,
+        isKey: Boolean,
+        isConfig: Boolean,
+        presentationTimeUs: Long,
+    ) {
+        val flags = (if (isKey) VideoFrameProtocol.FLAG_KEYFRAME else 0) or
+            (if (isConfig) VideoFrameProtocol.FLAG_CODEC_CONFIG else 0)
+        val sequence = videoSequence++
+        runCatching {
+            VideoFrameProtocol.fragmentWithParity(
+                kind = VideoFrameProtocol.KIND_SCREEN,
+                flags = flags,
+                capabilitySessionId = capabilitySessionId,
+                flowId = flow.flowId,
+                sequence = sequence,
+                presentationTimeUs = presentationTimeUs,
+                codecConfigId = 1,
+                payload = data,
+            ).forEach(flow::send)
+            if (sequence % 90L == 0L) {
+                Log.i(TAG, "video mirror frames sent: sequence=$sequence bytes=${data.size} key=$isKey")
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "video mirror send failed: ${error.message}")
+        }
+    }
+
+    // ── Screen mirror (accessibility stills path) ──────────────────────
+    //
+    // Fallback when projection consent is denied or unavailable: JPEG stills
+    // via AccessibilityService.takeScreenshot on the same wire format.
+
+    private fun startStillsMirror() {
         if (mirrorJob?.isActive == true) return
         val capability = sdkCapability ?: run {
             Log.w(TAG, "mirror requested with no SDK input capability")
             return
         }
         if (service() == null) {
-            Log.w(TAG, "mirror requested but accessibility service is not enabled")
+            Log.w(TAG, "stills mirror requested but accessibility service is not enabled")
             return
         }
         val scope = sdkScope ?: return
@@ -256,8 +425,16 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
     }
 
     private fun stopMirror() {
+        mirrorWanted = false
         mirrorJob?.cancel()
         mirrorJob = null
+        val staleFlow = videoFlow
+        videoFlow = null
+        staleFlow?.let { flow -> sdkScope?.launch { runCatching { flow.close() } } }
+        val service = ScreenCaptureService.instance
+        service?.frameSink = null
+        service?.onProjectionStopped = null
+        if (service != null) ScreenCaptureService.stop(context)
     }
 
     private suspend fun grabJpeg(): ByteArray? {

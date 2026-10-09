@@ -15,6 +15,7 @@ pub mod input_plugin;
 pub mod log_collector;
 pub mod media_plugin;
 pub mod message_handler;
+pub mod mirror_decoder;
 pub mod plugin;
 pub mod sdk_camera;
 pub mod sdk_clipboard;
