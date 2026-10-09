@@ -124,9 +124,10 @@
   let remoteClicks: { id: number; x: number; y: number }[] = [];
   let remoteClickSeq = 0;
   let remoteLastMoveSent = 0;
-  let remoteDrags: { id: number; points: { x: number; y: number }[] }[] = [];
+  let remoteDrags: { id: number; points: { x: number; y: number; t: number }[] }[] = [];
   let remoteDragSeq = 0;
   let remoteActiveDrag = 0;
+  let remoteDragTimer = 0;
 
   const refreshRemoteFrame = async () => {
     if (!remoteMirrorOn || active !== 'remote' || !windowFocused) return;
@@ -186,6 +187,33 @@
     ];
   };
 
+  const dragPath = (points: { x: number; y: number }[]) => {
+    if (points.length < 2) return '';
+    let d = `M ${points[0].x} ${points[0].y}`;
+    for (let i = 1; i < points.length - 1; i++) {
+      const mx = (points[i].x + points[i + 1].x) / 2;
+      const my = (points[i].y + points[i + 1].y) / 2;
+      d += ` Q ${points[i].x} ${points[i].y} ${mx} ${my}`;
+    }
+    const last = points[points.length - 1];
+    return `${d} L ${last.x} ${last.y}`;
+  };
+
+  /** Prune expired trail points — the tail recedes behind the finger. */
+  const ensureDragTimer = () => {
+    if (remoteDragTimer) return;
+    remoteDragTimer = window.setInterval(() => {
+      const now = performance.now();
+      remoteDrags = remoteDrags
+        .map((drag) => ({ ...drag, points: drag.points.filter((p) => now - p.t < 450) }))
+        .filter((drag) => drag.points.length > 0 || drag.id === remoteActiveDrag);
+      if (remoteDrags.length === 0 && !remoteActiveDrag) {
+        window.clearInterval(remoteDragTimer);
+        remoteDragTimer = 0;
+      }
+    }, 60);
+  };
+
   const remoteDown = (event: PointerEvent) => {
     remotePadDown = true;
     remotePadEl?.setPointerCapture(event.pointerId);
@@ -194,19 +222,29 @@
     remoteClicks = [...remoteClicks, { id, x, y }];
     window.setTimeout(() => {
       remoteClicks = remoteClicks.filter((click) => click.id !== id);
-    }, 450);
+    }, 400);
     remoteActiveDrag = ++remoteDragSeq;
-    remoteDrags = [...remoteDrags, { id: remoteActiveDrag, points: [{ x, y }] }];
+    remoteDrags = [
+      ...remoteDrags,
+      { id: remoteActiveDrag, points: [{ x, y, t: performance.now() }] },
+    ];
+    ensureDragTimer();
     void remotePointerDown(x, y);
   };
 
   const remoteMove = (event: PointerEvent) => {
     if (!remotePadDown) return;
-    const [x, y] = remoteNorm(event);
-    // The trail shows every local event; the wire path is throttled below.
     const drag = remoteDrags.find((d) => d.id === remoteActiveDrag);
     if (drag) {
-      drag.points = [...drag.points.slice(-239), { x, y }];
+      const now = performance.now();
+      // Coalesced events recover the sub-frame samples the browser merged —
+      // the trail samples them all even though the wire path is throttled.
+      const events = event.getCoalescedEvents?.() ?? [event];
+      const nowPoints = events.map((e) => {
+        const [x, y] = remoteNorm(e);
+        return { x, y, t: now };
+      });
+      drag.points = [...drag.points.slice(-299), ...nowPoints];
       remoteDrags = remoteDrags;
     }
     // Drag events fire faster than the wire needs — cap at ~40Hz so the
@@ -214,17 +252,15 @@
     const now = performance.now();
     if (now - remoteLastMoveSent < 25) return;
     remoteLastMoveSent = now;
+    const [x, y] = remoteNorm(event);
     void remotePointerMove(x, y);
   };
 
   const remoteUp = () => {
     if (!remotePadDown) return;
     remotePadDown = false;
-    const done = remoteActiveDrag;
+    // The expiry timer recedes the trail tail on its own.
     remoteActiveDrag = 0;
-    window.setTimeout(() => {
-      remoteDrags = remoteDrags.filter((drag) => drag.id !== done);
-    }, 400);
     void remotePointerUp();
   };
 
@@ -840,7 +876,7 @@
                 <span class="remote-latency">{Math.round(remoteMirrorLatency)}ms</span>
                 <svg class="remote-drag-layer" viewBox="0 0 1 1" preserveAspectRatio="none">
                   {#each remoteDrags as drag (drag.id)}
-                    <polyline points={drag.points.map((p) => `${p.x},${p.y}`).join(' ')} />
+                    <path d={dragPath(drag.points)} />
                   {/each}
                 </svg>
                 {#each remoteClicks as click (click.id)}

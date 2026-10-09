@@ -215,9 +215,27 @@ class ScreenCaptureService : Service() {
             h = bounds.height()
         }
         val scale = minOf(1f, MAX_DIMENSION.toFloat() / maxOf(w, h))
-        w = (w * scale).toInt() and 0x7FFFFFFE
-        h = (h * scale).toInt() and 0x7FFFFFFE
-        return w to h
+        val fw = w * scale
+        val fh = h * scale
+        // Codec dims must be even; rounding each independently skews the
+        // aspect and leaves letterbox bars inside the AUTO_MIRROR capture.
+        // Search nearby even pairs for the closest aspect match.
+        val aspect = w.toDouble() / h
+        var best = (fw.toInt() and -2) to (fh.toInt() and -2)
+        var bestErr = Math.abs(best.first / best.second.toDouble() - aspect)
+        for (dw in 0 downTo -10 step 2) {
+            val cw = (fw.toInt() + dw) and -2
+            if (cw < 16) break
+            val ch = (cw / aspect).toInt()
+            for (candH in intArrayOf(ch and -2, (ch + 1) and -2)) {
+                val err = Math.abs(cw / candH.toDouble() - aspect)
+                if (err < bestErr - 1e-9) {
+                    bestErr = err
+                    best = cw to candH
+                }
+            }
+        }
+        return best
     }
 
     /** Configure+start a surface-input H.264 encoder; returns codec+surface. */

@@ -149,9 +149,11 @@ pub struct SdkRemoteInputBinding {
     senders: Arc<Mutex<HashMap<String, SdkRemoteInputSender>>>,
     frames: Arc<Mutex<HashMap<String, MirrorFrame>>>,
     frame_sequence: Arc<AtomicU64>,
-    /// device_id → (desktop monotonic us) − (device monotonic us), derived
-    /// from ping/pong round trips. ±RTT/2 error; a few ms on LAN.
-    clock_offsets: Arc<Mutex<HashMap<String, i64>>>,
+    /// device_id → ((desktop monotonic us) − (device monotonic us), best rtt)
+    /// from ping/pong round trips. The offset estimate is only trusted as far
+    /// as its sample's RTT is symmetric — keeping the minimum-RTT sample
+    /// filters queued/asymmetric pongs that otherwise skew the offset.
+    clock_offsets: Arc<Mutex<HashMap<String, (i64, i64)>>>,
 }
 
 impl SdkRemoteInputBinding {
@@ -188,10 +190,13 @@ impl SdkRemoteInputBinding {
         // Assume a symmetric path: the device clock at pong receipt reads
         // roughly pong.sent + RTT/2.
         let offset = now - (pong.sent_time_us + rtt_us / 2);
-        self.clock_offsets
-            .lock()
-            .unwrap()
-            .insert(device_id.to_string(), offset);
+        let mut offsets = self.clock_offsets.lock().unwrap();
+        let keep = offsets
+            .get(device_id)
+            .is_none_or(|&(_, best_rtt)| rtt_us <= best_rtt);
+        if keep {
+            offsets.insert(device_id.to_string(), (offset, rtt_us));
+        }
         log::debug!("SDK mirror clock offset {device_id}: rtt={}us", rtt_us);
     }
 
@@ -252,7 +257,9 @@ impl SdkRemoteInputBinding {
                             .lock()
                             .unwrap()
                             .get(&device_id)
-                            .map(|offset| (monotonic_us() - (pts_us + offset)) as f64 / 1000.0);
+                            .map(|&(offset, _)| {
+                                (monotonic_us() - (pts_us + offset)) as f64 / 1000.0
+                            });
                         // Two producers share this flow: JPEG stills arrive
                         // display-ready; anything else is an Annex-B H.264
                         // access unit (config AUs feed the decoder too — it

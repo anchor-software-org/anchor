@@ -202,8 +202,15 @@ class AnchorAccessibilityService : AccessibilityService() {
         val cy = pointerY
         post {
             if (gestureBusy || heldStroke != null) return@post
-            val path = Path().apply { moveTo(cx, cy); lineTo(cx - dx, cy - dy) }
-            dispatchStroke(GestureDescription.StrokeDescription(path, 0L, SCROLL_MS, false))
+            // StrokeDescription throws on any path point outside the display —
+            // a big wheel delta near the edge would otherwise crash the app.
+            val (w, h) = displaySize()
+            val endX = (cx - dx).coerceIn(0f, w.toFloat())
+            val endY = (cy - dy).coerceIn(0f, h.toFloat())
+            val path = Path().apply { moveTo(cx, cy); lineTo(endX, endY) }
+            runCatching {
+                dispatchStroke(GestureDescription.StrokeDescription(path, 0L, SCROLL_MS, false))
+            }.onFailure { Log.w(TAG, "scroll stroke rejected: ${it.message}") }
         }
     }
 
