@@ -379,6 +379,18 @@ async fn handle_session(
                 // writer thread.
                 let sender = SdkRemoteInputSender::new(capability);
                 remote_input_binding.attach(device_id.clone(), sender.clone());
+                {
+                    // Clock-sync probe: ping every 2 s so mirrored frames can
+                    // be aged end-to-end. Ends when the session closes and the
+                    // sender channel dies.
+                    let ping_sender = sender.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(1));
+                        while ping_sender.ping() {
+                            thread::sleep(Duration::from_secs(2));
+                        }
+                    });
+                }
                 if std::env::var_os("ANCHOR_REMOTE_INPUT_DEMO").is_some() {
                     thread::spawn(move || {
                         // Wait for the capability to settle, start the stills
@@ -931,6 +943,12 @@ async fn handle_session(
                 } else {
                     log::warn!("Ignoring malformed SDK notification record");
                 }
+            }
+            SessionEvent::CapabilityRecord { capability_session_id, type_url, payload }
+                if input_sessions.contains(&capability_session_id)
+                    && type_url == input::PONG_TYPE_URL =>
+            {
+                remote_input_binding.handle_pong(&device_id, &payload);
             }
             SessionEvent::CapabilityRecord { capability_session_id, type_url, payload }
                 if input_sessions.contains(&capability_session_id)

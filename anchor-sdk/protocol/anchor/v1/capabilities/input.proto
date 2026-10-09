@@ -58,6 +58,20 @@ message InputScroll {
   sint32 vertical_120ths = 2;
 }
 
+// Latency probes for the remote-control direction. The controller sends
+// InputPing with its monotonic micros; the device echoes it in InputPong
+// stamped with its own monotonic micros (elapsedRealtime). The controller
+// derives a clock offset (±RTT/2) that lets it age datagram frames carrying
+// device-time presentation timestamps — true glass-to-glass latency.
+message InputPing {
+  int64 sent_time_us = 1;
+}
+
+message InputPong {
+  int64 ping_sent_time_us = 1;
+  int64 sent_time_us = 2;
+}
+
 // Remote-control session control — used on the reversed (controller → device)
 // direction of org.anchor.input. Navigation actions that have no HID mapping
 // and the remote screen mirror toggle live here rather than in InputKey.

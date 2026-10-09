@@ -121,6 +121,23 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
                 val k = InputProtocol.decodeKey(payload)
                 service()?.hidKey(k.hidUsage, k.pressed)
             }
+            InputProtocol.PING_TYPE_URL -> {
+                // Latency probe — echo with our own monotonic timestamp so the
+                // desktop can age mirror frames stamped on this clock.
+                val pingSentUs = InputProtocol.decodePing(payload)
+                val cap = sdkCapability ?: return
+                sdkScope?.launch {
+                    runCatching {
+                        cap.sendRecord(
+                            InputProtocol.PONG_TYPE_URL,
+                            InputProtocol.encodePong(
+                                pingSentUs,
+                                SystemClock.elapsedRealtimeNanos() / 1000,
+                            ),
+                        )
+                    }
+                }
+            }
             InputProtocol.REMOTE_CONTROL_TYPE_URL -> {
                 when (InputProtocol.decodeRemoteControl(payload)) {
                     InputProtocol.REMOTE_CONTROL_MIRROR_START -> startMirror()
@@ -212,10 +229,16 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
             var sendFailures = 0
             try {
                 while (isActive) {
+                    val captureStartUs = SystemClock.elapsedRealtimeNanos() / 1000
                     val jpeg = grabJpeg()
                     if (jpeg != null) {
+                        // Stamp the frame at capture start so the desktop's
+                        // e2e measure covers capture+encode, not just the wire.
                         sendFailures = if (
-                            sendJpegFrame(flow, capability.sessionId, sequence++, jpeg)
+                            sendJpegFrame(
+                                flow, capability.sessionId, sequence++,
+                                captureStartUs, jpeg,
+                            )
                         ) 0 else sendFailures + 1
                         // A dead session fails every send — stop retrying.
                         if (sendFailures >= 5) {
@@ -286,6 +309,7 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
         flow: AnchorDatagramFlow,
         capabilitySessionId: Long,
         sequence: Long,
+        presentationTimeUs: Long,
         jpeg: ByteArray,
     ): Boolean {
         val packets = VideoFrameProtocol.fragmentWithParity(
@@ -294,7 +318,7 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
             capabilitySessionId,
             flow.flowId,
             sequence,
-            SystemClock.elapsedRealtimeNanos() / 1000,
+            presentationTimeUs,
             0,
             jpeg,
         )

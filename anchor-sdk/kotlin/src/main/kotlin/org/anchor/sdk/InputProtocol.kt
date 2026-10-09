@@ -6,6 +6,8 @@ import org.anchor.sdk.v1.capabilities.input.InputKey
 import org.anchor.sdk.v1.capabilities.input.InputPointerAbsolute
 import org.anchor.sdk.v1.capabilities.input.InputPointerRelative
 import org.anchor.sdk.v1.capabilities.input.InputPointerButton
+import org.anchor.sdk.v1.capabilities.input.InputPing
+import org.anchor.sdk.v1.capabilities.input.InputPong
 import org.anchor.sdk.v1.capabilities.input.InputScroll
 import org.anchor.sdk.v1.capabilities.input.InputText
 import org.anchor.sdk.v1.capabilities.input.RemoteControl
@@ -35,6 +37,8 @@ object InputProtocol {
     const val POINTER_BUTTON_FORWARD = 5
     const val SCROLL_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.InputScroll"
     const val REMOTE_CONTROL_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.RemoteControl"
+    const val PING_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.InputPing"
+    const val PONG_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.InputPong"
     /** Datagram payload label for mirrored device screen frames (ANFR/JPEG). */
     const val MIRROR_FRAME_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.RemoteScreenFrame"
 
@@ -52,6 +56,8 @@ object InputProtocol {
         .addRecordTypeUrls(SCROLL_TYPE_URL)
         .addRecordTypeUrls(REMOTE_CONTROL_TYPE_URL)
         .addRecordTypeUrls(MIRROR_FRAME_TYPE_URL)
+        .addRecordTypeUrls(PING_TYPE_URL)
+        .addRecordTypeUrls(PONG_TYPE_URL)
         .setSupportsDatagrams(true).build()
 
     fun endpointAdvertisement(): EndpointAdvertisement = EndpointAdvertisement.newBuilder()
@@ -114,4 +120,10 @@ object InputProtocol {
         .let { Scroll(it.horizontal120Ths, it.vertical120Ths) }
     fun decodeRemoteControl(bytes: ByteArray): Int =
         RemoteControl.parseFrom(bytes).kindValue
+    fun decodePing(bytes: ByteArray): Long = InputPing.parseFrom(bytes).sentTimeUs
+    fun encodePong(pingSentTimeUs: Long, sentTimeUs: Long): ByteArray =
+        InputPong.newBuilder()
+            .setPingSentTimeUs(pingSentTimeUs)
+            .setSentTimeUs(sentTimeUs)
+            .build().toByteArray()
 }

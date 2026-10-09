@@ -9,12 +9,20 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use anchor_sdk::{Capability, DatagramFlow, input, video_frame};
 
 const POINTER_BUTTON_LEFT: i32 = 1;
+
+static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Shared monotonic clock for ping/pong offsets and frame ageing.
+fn monotonic_us() -> i64 {
+    MONOTONIC_EPOCH.elapsed().as_micros() as i64
+}
 
 struct InputRecord {
     type_url: &'static str,
@@ -89,6 +97,12 @@ impl SdkRemoteInputSender {
             input::encode_remote_control(kind),
         )
     }
+
+    /// Latency probe — the device echoes this with its own monotonic
+    /// timestamp, letting the binding derive a clock offset for frame ageing.
+    pub fn ping(&self) -> bool {
+        self.send(input::PING_TYPE_URL, input::encode_ping(monotonic_us()))
+    }
 }
 
 /// Latest reassembled mirror frame for a device. Phase 1 carries JPEG stills
@@ -101,6 +115,9 @@ pub struct MirrorFrame {
     pub sequence: u64,
     /// ANFR frame sequence echoed back for debugging/ordering.
     pub frame_sequence: u64,
+    /// Glass-to-glass latency when the ping/pong clock offset is known:
+    /// desktop receive time minus (device pts + offset).
+    pub latency_ms: Option<f64>,
     pub jpeg: Arc<Vec<u8>>,
 }
 
@@ -109,6 +126,9 @@ pub struct SdkRemoteInputBinding {
     senders: Arc<Mutex<HashMap<String, SdkRemoteInputSender>>>,
     frames: Arc<Mutex<HashMap<String, MirrorFrame>>>,
     frame_sequence: Arc<AtomicU64>,
+    /// device_id → (desktop monotonic us) − (device monotonic us), derived
+    /// from ping/pong round trips. ±RTT/2 error; a few ms on LAN.
+    clock_offsets: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl SdkRemoteInputBinding {
@@ -133,6 +153,25 @@ impl SdkRemoteInputBinding {
             .collect()
     }
 
+    /// Handle an inbound InputPong record: estimate the device↔desktop clock
+    /// offset so frame presentation timestamps can be aged on arrival.
+    pub fn handle_pong(&self, device_id: &str, payload: &[u8]) {
+        let Ok(pong) = input::decode_pong(payload) else {
+            log::debug!("SDK mirror: undecodable pong from {device_id}");
+            return;
+        };
+        let now = monotonic_us();
+        let rtt_us = now - pong.ping_sent_time_us;
+        // Assume a symmetric path: the device clock at pong receipt reads
+        // roughly pong.sent + RTT/2.
+        let offset = now - (pong.sent_time_us + rtt_us / 2);
+        self.clock_offsets
+            .lock()
+            .unwrap()
+            .insert(device_id.to_string(), offset);
+        log::debug!("SDK mirror clock offset {device_id}: rtt={}us", rtt_us);
+    }
+
     /// Accept the device's mirror datagram flow and keep only the newest
     /// reassembled frame — the UI polls, so stale stills are worthless.
     pub fn attach_frame_flow(
@@ -144,6 +183,7 @@ impl SdkRemoteInputBinding {
         let expected_flow_id = flow.flow_id();
         let frames = Arc::clone(&self.frames);
         let frame_sequence = Arc::clone(&self.frame_sequence);
+        let clock_offsets = Arc::clone(&self.clock_offsets);
         thread::Builder::new()
             .name(format!("anchor-sdk-mirror-frames-{device_id}"))
             .spawn(move || {
@@ -177,15 +217,24 @@ impl SdkRemoteInputBinding {
                             continue;
                         };
                         let sequence = frame_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-                        let frame_sequence_field = video_frame::FrameHeader::decode(&datagram)
-                            .map(|(header, _)| header.sequence)
-                            .unwrap_or(0);
+                        let (frame_sequence_field, pts_us) =
+                            video_frame::FrameHeader::decode(&datagram)
+                                .map(|(header, _)| {
+                                    (header.sequence, header.presentation_time_us as i64)
+                                })
+                                .unwrap_or((0, 0));
+                        let latency_ms = clock_offsets
+                            .lock()
+                            .unwrap()
+                            .get(&device_id)
+                            .map(|offset| (monotonic_us() - (pts_us + offset)) as f64 / 1000.0);
                         let jpeg = Arc::new(payload);
                         frames.lock().unwrap().insert(
                             device_id.clone(),
                             MirrorFrame {
                                 sequence,
                                 frame_sequence: frame_sequence_field,
+                                latency_ms,
                                 jpeg: Arc::clone(&jpeg),
                             },
                         );
@@ -203,8 +252,11 @@ impl SdkRemoteInputBinding {
                         }
                         if received.is_multiple_of(50) {
                             let rtt = flow.transport_stats().rtt.as_millis();
+                            let latency = latency_ms
+                                .map(|ms| format!("{ms:.0}ms e2e"))
+                                .unwrap_or_else(|| "no clock offset".into());
                             log::info!(
-                                "SDK mirror frames received from {device_id}: {received} (rtt={rtt}ms)"
+                                "SDK mirror frames received from {device_id}: {received} (rtt={rtt}ms, {latency})"
                             );
                         }
                     }

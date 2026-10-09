@@ -114,6 +114,10 @@ pub struct CaptureMetrics {
 pub struct ScreenPreview {
     pub sequence: u64,
     pub data_url: String,
+    /// Remote-mirror frames carry a measured glass-to-glass latency; local
+    /// screen previews leave this unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1170,6 +1174,7 @@ impl DesktopController {
                     "data:image/jpeg;base64,{}",
                     base64::engine::general_purpose::STANDARD.encode(frame.jpeg.as_slice())
                 ),
+                latency_ms: frame.latency_ms,
             })
     }
 
@@ -1541,6 +1546,7 @@ pub fn encode_screen_preview(frame: SharedFrameBuffer) -> Result<ScreenPreview, 
             "data:image/jpeg;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(jpeg)
         ),
+        latency_ms: None,
     })
 }
 

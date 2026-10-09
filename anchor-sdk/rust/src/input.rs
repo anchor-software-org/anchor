@@ -17,6 +17,8 @@ pub const POINTER_BUTTON_TYPE_URL: &str =
 pub const SCROLL_TYPE_URL: &str = "type.googleapis.com/anchor.v1.capabilities.input.InputScroll";
 pub const REMOTE_CONTROL_TYPE_URL: &str =
     "type.googleapis.com/anchor.v1.capabilities.input.RemoteControl";
+pub const PING_TYPE_URL: &str = "type.googleapis.com/anchor.v1.capabilities.input.InputPing";
+pub const PONG_TYPE_URL: &str = "type.googleapis.com/anchor.v1.capabilities.input.InputPong";
 /// Datagram payload label for the device's mirrored screen frames
 /// (controller → device direction reverse: device sends ANFR/JPEG stills).
 pub const MIRROR_FRAME_TYPE_URL: &str =
@@ -41,6 +43,8 @@ pub fn advertisement() -> CapabilityAdvertisement {
             SCROLL_TYPE_URL.into(),
             REMOTE_CONTROL_TYPE_URL.into(),
             MIRROR_FRAME_TYPE_URL.into(),
+            PING_TYPE_URL.into(),
+            PONG_TYPE_URL.into(),
         ],
         supports_datagrams: true,
     }
@@ -118,6 +122,14 @@ pub fn decode_remote_control(
     bytes: &[u8],
 ) -> Result<v1::capabilities::input::RemoteControl, prost::DecodeError> {
     v1::capabilities::input::RemoteControl::decode(bytes)
+}
+pub fn encode_ping(sent_time_us: i64) -> Vec<u8> {
+    v1::capabilities::input::InputPing { sent_time_us }.encode_to_vec()
+}
+pub fn decode_pong(
+    bytes: &[u8],
+) -> Result<v1::capabilities::input::InputPong, prost::DecodeError> {
+    v1::capabilities::input::InputPong::decode(bytes)
 }
 
 #[cfg(test)]

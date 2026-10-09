@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export type CaptureMetrics = { fps: number; avgFrameMs: number; frameSizeBytes: number };
-export type ScreenPreview = { sequence: number; dataUrl: string };
+export type ScreenPreview = { sequence: number; dataUrl: string; latencyMs?: number };
 export type Output = {
   index: number;
   name: string;

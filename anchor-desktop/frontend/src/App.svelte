@@ -118,6 +118,7 @@
   let remoteMirrorSeq = 0;
   let remoteMirrorUrl = '';
   let remoteMirrorAspect = '';
+  let remoteMirrorLatency = 0;
   let remoteMirrorTimer = 0;
 
   const refreshRemoteFrame = async () => {
@@ -127,6 +128,7 @@
       if (frame) {
         remoteMirrorSeq = frame.sequence;
         remoteMirrorUrl = frame.dataUrl;
+        if (frame.latencyMs !== undefined) remoteMirrorLatency = frame.latencyMs;
       }
     } catch {
       // Transient — the next poll retries.
@@ -803,6 +805,7 @@
             >
               {#if remoteMirrorUrl}
                 <img class="remote-frame" src={remoteMirrorUrl} alt="Phone screen" draggable="false" onload={onRemoteFrameLoad} />
+                <span class="remote-latency">{Math.round(remoteMirrorLatency)}ms</span>
               {:else}
                 <span>{remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone'}</span>
               {/if}
