@@ -225,6 +225,10 @@ impl SdkRemoteInputBinding {
                     };
                 let mut assembler = video_frame::Reassembler::default();
                 let mut received = 0_u64;
+                // Smoothed latency for display — per-frame measurements jitter
+                // with the clock-offset error and reassembly timing, so the
+                // badge would flicker nonsense (incl. negatives) without this.
+                let mut latency_ema: Option<f64> = None;
                 // Created lazily on the first non-JPEG payload so the stills
                 // path never pays for an H.264 context it won't use.
                 let mut decoder: Option<MirrorDecoder> = None;
@@ -258,8 +262,19 @@ impl SdkRemoteInputBinding {
                             .unwrap()
                             .get(&device_id)
                             .map(|&(offset, _)| {
-                                (monotonic_us() - (pts_us + offset)) as f64 / 1000.0
+                                // Negative latency is impossible — it only
+                                // means the clock-offset estimate overshot.
+                                // Clamp the sample, then EMA-smooth so the
+                                // UI shows a stable number, not per-frame noise.
+                                ((monotonic_us() - (pts_us + offset)) as f64 / 1000.0).max(0.0)
                             });
+                        if let Some(sample) = latency_ms {
+                            latency_ema = Some(match latency_ema {
+                                Some(ema) => ema * 0.85 + sample * 0.15,
+                                None => sample,
+                            });
+                        }
+                        let latency_ms = latency_ema;
                         // Two producers share this flow: JPEG stills arrive
                         // display-ready; anything else is an Annex-B H.264
                         // access unit (config AUs feed the decoder too — it
