@@ -139,7 +139,7 @@
     remoteMirrorTimer = window.setTimeout(async () => {
       await refreshRemoteFrame();
       scheduleRemoteFrame();
-    }, 350);
+    }, 120);
   };
 
   const toggleRemoteMirror = async () => {

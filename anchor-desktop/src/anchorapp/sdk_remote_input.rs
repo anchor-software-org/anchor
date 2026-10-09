@@ -202,7 +202,10 @@ impl SdkRemoteInputBinding {
                             );
                         }
                         if received.is_multiple_of(50) {
-                            log::info!("SDK mirror frames received from {device_id}: {received}");
+                            let rtt = flow.transport_stats().rtt.as_millis();
+                            log::info!(
+                                "SDK mirror frames received from {device_id}: {received} (rtt={rtt}ms)"
+                            );
                         }
                     }
                 });

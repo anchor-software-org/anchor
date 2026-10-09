@@ -30,7 +30,7 @@ import org.json.JSONObject
 private const val TAG = "anchor.remoteinput"
 private const val MIRROR_JPEG_QUALITY = 55
 private const val MIRROR_MAX_WIDTH = 720
-private const val MIRROR_INTERVAL_MS = 350L
+private const val MIRROR_INTERVAL_MS = 80L
 
 /**
  * Remote input plugin — receives desktop → phone pointer/key/text events and
@@ -53,6 +53,8 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
     private var sdkScope: CoroutineScope? = null
     private var sdkCapability: AnchorCapability? = null
     private var mirrorJob: Job? = null
+    @Volatile private var mirrorCaptureMs = -1L
+    @Volatile private var mirrorEncodeMs = -1L
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
 
     override fun start(scope: CoroutineScope) {
@@ -237,11 +239,14 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
 
     private suspend fun grabJpeg(): ByteArray? {
         val svc = service() ?: return null
+        val requestNanos = SystemClock.elapsedRealtimeNanos()
+        var captureMs = -1L
         val bitmap = try {
             suspendCancellableCoroutine<Bitmap?> { cont ->
                 svc.grabScreenshot(screenshotExecutor, object :
                     AccessibilityService.TakeScreenshotCallback {
                     override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        captureMs = (SystemClock.elapsedRealtimeNanos() - requestNanos) / 1_000_000
                         val hardware = Bitmap.wrapHardwareBuffer(
                             result.hardwareBuffer, result.colorSpace
                         )
@@ -260,6 +265,7 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
             Log.w(TAG, "screenshot failed: ${e.message}")
             return null
         } ?: return null
+        val encodeNanos = SystemClock.elapsedRealtimeNanos()
         return try {
             val scaled = if (bitmap.width > MIRROR_MAX_WIDTH) {
                 val h = bitmap.height * MIRROR_MAX_WIDTH / bitmap.width
@@ -267,6 +273,9 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
             } else bitmap
             val out = ByteArrayOutputStream(96 * 1024)
             scaled.compress(Bitmap.CompressFormat.JPEG, MIRROR_JPEG_QUALITY, out)
+            val encodeMs = (SystemClock.elapsedRealtimeNanos() - encodeNanos) / 1_000_000
+            mirrorCaptureMs = captureMs
+            mirrorEncodeMs = encodeMs
             out.toByteArray()
         } finally {
             bitmap.recycle()
@@ -293,6 +302,12 @@ class RemoteInputPlugin(private val broker: MessageBroker) : Plugin {
         for (packet in packets) {
             val ok = runCatching { flow.send(packet) }.isSuccess
             if (ok) sent++ else Log.w(TAG, "mirror datagram dropped")
+        }
+        if (sequence % 20L == 0L) {
+            Log.i(
+                TAG,
+                "mirror frame $sequence: capture=${mirrorCaptureMs}ms encode=${mirrorEncodeMs}ms bytes=${jpeg.size} packets=${packets.size}",
+            )
         }
         return sent > 0
     }
