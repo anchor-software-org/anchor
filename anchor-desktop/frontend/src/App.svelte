@@ -124,6 +124,9 @@
   let remoteClicks: { id: number; x: number; y: number }[] = [];
   let remoteClickSeq = 0;
   let remoteLastMoveSent = 0;
+  let remoteDrags: { id: number; points: { x: number; y: number }[] }[] = [];
+  let remoteDragSeq = 0;
+  let remoteActiveDrag = 0;
 
   const refreshRemoteFrame = async () => {
     if (!remoteMirrorOn || active !== 'remote' || !windowFocused) return;
@@ -192,23 +195,36 @@
     window.setTimeout(() => {
       remoteClicks = remoteClicks.filter((click) => click.id !== id);
     }, 450);
+    remoteActiveDrag = ++remoteDragSeq;
+    remoteDrags = [...remoteDrags, { id: remoteActiveDrag, points: [{ x, y }] }];
     void remotePointerDown(x, y);
   };
 
   const remoteMove = (event: PointerEvent) => {
     if (!remotePadDown) return;
+    const [x, y] = remoteNorm(event);
+    // The trail shows every local event; the wire path is throttled below.
+    const drag = remoteDrags.find((d) => d.id === remoteActiveDrag);
+    if (drag) {
+      drag.points = [...drag.points.slice(-239), { x, y }];
+      remoteDrags = remoteDrags;
+    }
     // Drag events fire faster than the wire needs — cap at ~40Hz so the
     // phone replays the freshest position instead of a backlog.
     const now = performance.now();
     if (now - remoteLastMoveSent < 25) return;
     remoteLastMoveSent = now;
-    const [x, y] = remoteNorm(event);
     void remotePointerMove(x, y);
   };
 
   const remoteUp = () => {
     if (!remotePadDown) return;
     remotePadDown = false;
+    const done = remoteActiveDrag;
+    remoteActiveDrag = 0;
+    window.setTimeout(() => {
+      remoteDrags = remoteDrags.filter((drag) => drag.id !== done);
+    }, 400);
     void remotePointerUp();
   };
 
@@ -822,6 +838,11 @@
               {#if remoteMirrorUrl}
                 <img class="remote-frame" src={remoteMirrorUrl} alt="Phone screen" draggable="false" onload={onRemoteFrameLoad} />
                 <span class="remote-latency">{Math.round(remoteMirrorLatency)}ms</span>
+                <svg class="remote-drag-layer" viewBox="0 0 1 1" preserveAspectRatio="none">
+                  {#each remoteDrags as drag (drag.id)}
+                    <polyline points={drag.points.map((p) => `${p.x},${p.y}`).join(' ')} />
+                  {/each}
+                </svg>
                 {#each remoteClicks as click (click.id)}
                   <span class="remote-click" style="left: {click.x * 100}%; top: {click.y * 100}%"></span>
                 {/each}
