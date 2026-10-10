@@ -1169,6 +1169,12 @@ impl Session {
             return true;
         }
         let queued = crate::quinn_transport::DATAGRAM_SEND_BUFFER_BYTES.saturating_sub(available);
+        // The staleness bound is clamped below by STALE_QUEUE_MIN_BYTES, so a
+        // backlog at or under that floor can never deny — skip the stats
+        // snapshot entirely on an empty or near-empty queue.
+        if queued <= DATAGRAM_STALE_QUEUE_MIN_BYTES {
+            return false;
+        }
         let stats = self.0.connection.stats();
         // cwnd/RTT approximates the pacing rate congestion control is
         // enforcing right now; backlog beyond ~40 ms of drain time is stale.
@@ -1437,6 +1443,10 @@ fn encode_record_into(
 /// are dropped; a full flow queue drops too — the receiver treats that as
 /// ordinary media loss and recovers from the next keyframe.
 async fn dispatch_datagrams(session: Session) {
+    // Media flows deliver thousands of consecutive datagrams to one flow ID;
+    // remember the last route so the common case skips the map lock, the hash
+    // probe, and the per-datagram `Sender` refcount churn.
+    let mut cached_route: Option<(u64, tokio::sync::mpsc::Sender<Bytes>)> = None;
     loop {
         let Ok(datagram) = session.0.connection.read_datagram().await else {
             // Connection ended; dropping the session closes every channel.
@@ -1445,14 +1455,17 @@ async fn dispatch_datagrams(session: Session) {
         let Some(flow_id) = crate::video_frame::datagram_flow_id(&datagram) else {
             continue;
         };
-        let sender = session
-            .0
-            .datagram_routes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&flow_id)
-            .cloned();
-        let Some(sender) = sender else {
+        if !matches!(&cached_route, Some((id, _)) if *id == flow_id) {
+            cached_route = session
+                .0
+                .datagram_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&flow_id)
+                .cloned()
+                .map(|sender| (flow_id, sender));
+        }
+        let Some((_, sender)) = &cached_route else {
             continue;
         };
         if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = sender.try_send(datagram) {
@@ -1462,6 +1475,7 @@ async fn dispatch_datagrams(session: Session) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&flow_id);
+            cached_route = None;
         }
     }
 }
