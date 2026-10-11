@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{wl_output, wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols::xdg::xdg_output::zv1::client::{zxdg_output_manager_v1, zxdg_output_v1};
@@ -39,10 +40,14 @@ struct InputWaylandState {
     outputs: HashMap<u32, OutputInfo>,
     /// Bound output objects, retained so virtual pointers can target them.
     output_objects: HashMap<u32, wl_output::WlOutput>,
+    /// Registry global name → wl_output object id, used to remove stale
+    /// geometry when an output is unplugged and recreated.
+    output_globals: HashMap<u32, u32>,
     /// Map from xdg_output object id → wl_output object id, for routing xdg events.
     xdg_to_wl: HashMap<u32, u32>,
-    /// Currently building output (accumulates geometry/mode/name events before Done).
-    pending_output: Option<(u32, OutputInfo)>,
+    /// Outputs currently receiving geometry/mode/name updates, keyed by
+    /// wl_output object id. Updates for different displays can interleave.
+    pending_outputs: HashMap<u32, OutputInfo>,
     /// The streamed output's geometry in global compositor coords.
     stream_output_x: i32,
     stream_output_y: i32,
@@ -59,6 +64,11 @@ struct InputWaylandState {
 /// Wayland-based pointer + keyboard injection.
 pub struct WaylandInput {
     conn: Connection,
+    /// Keeps the input connection subscribed to runtime xdg-output changes.
+    /// Without this queue, positions are only the values observed at startup.
+    event_queue: EventQueue<InputWaylandState>,
+    wayland_state: InputWaylandState,
+    qh: QueueHandle<InputWaylandState>,
     /// Unbound fallback for compositors that do not expose virtual-pointer v2.
     generic_virtual_pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
     virtual_pointer: zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
@@ -69,6 +79,9 @@ pub struct WaylandInput {
     virtual_keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
     char_to_keycode: HashMap<char, (u32, bool)>,
     outputs: HashMap<u32, OutputInfo>,
+    /// Last topology published by the capture worker. It supplies output
+    /// membership, while the local Wayland connection supplies logical geometry.
+    reported_outputs: Option<Vec<OutputGeometry>>,
     stream_output_name: String,
     stream_output_x: i32,
     stream_output_y: i32,
@@ -154,6 +167,46 @@ fn refreshed_stream_output<'a>(
         .or_else(|| outputs.iter().min_by_key(|(index, _)| *index).map(|(_, output)| output))
 }
 
+/// Mapped Sideboat input is valid only for the display currently being
+/// streamed. A stale SwiftUI update must never move a pointer on another
+/// display after the user changes the stream selection.
+fn mapped_absolute_target_is_current(
+    active_output_name: &str,
+    requested_output_name: &str,
+) -> bool {
+    !active_output_name.is_empty() && active_output_name == requested_output_name
+}
+
+/// Merge a capture-worker topology into the input connection's output view.
+///
+/// xdg-output is authoritative for logical positions. The capture worker can
+/// report `(0, 0)` for virtual Sway outputs even when they are placed elsewhere
+/// in the desktop layout. Keep the local Wayland logical geometry for an output
+/// with the same stable name. The worker still supplies membership and fallback
+/// geometry for outputs which the input connection has not seen yet.
+fn merge_output_layout(
+    known_outputs: &HashMap<u32, OutputInfo>,
+    reported_outputs: &[OutputGeometry],
+) -> HashMap<u32, OutputInfo> {
+    reported_outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let known = known_outputs.values().find(|known| known.name == output.name);
+            (
+                index as u32,
+                OutputInfo {
+                    name: output.name.clone(),
+                    x: known.map(|output| output.x).unwrap_or(output.x),
+                    y: known.map(|output| output.y).unwrap_or(output.y),
+                    width: known.map(|output| output.width).unwrap_or(output.width),
+                    height: known.map(|output| output.height).unwrap_or(output.height),
+                },
+            )
+        })
+        .collect()
+}
+
 /// Resolve the global origin for the output that is currently being streamed.
 ///
 /// A display name is the only safe local identity. Width and height are not an
@@ -177,6 +230,120 @@ fn stream_output_origin(
 }
 
 impl WaylandInput {
+    /// Read already-available Wayland events without waiting for the compositor.
+    /// Input must remain responsive, so a quiet Wayland socket is not an error.
+    fn poll_wayland_events(&mut self) {
+        if let Err(error) = self.event_queue.dispatch_pending(&mut self.wayland_state) {
+            log::warn!("Input: could not dispatch pending Wayland events: {error}");
+            return;
+        }
+
+        let Some(read_guard) = self.event_queue.prepare_read() else {
+            return;
+        };
+        match read_guard.read() {
+            Ok(_) => {
+                if let Err(error) = self.event_queue.dispatch_pending(&mut self.wayland_state) {
+                    log::warn!("Input: could not dispatch Wayland events: {error}");
+                }
+            }
+            Err(WaylandError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => log::warn!("Input: could not read Wayland events: {error}"),
+        }
+    }
+
+    /// Create a pointer for each output first discovered after startup.
+    fn create_missing_output_pointers(&mut self) {
+        let Some(manager) = self
+            .wayland_state
+            .pointer_manager
+            .as_ref()
+            .filter(|manager| manager.version() >= 2)
+            .cloned()
+        else {
+            return;
+        };
+
+        let missing_outputs: Vec<_> = self
+            .wayland_state
+            .outputs
+            .iter()
+            .filter(|(_, info)| !self.output_virtual_pointers.contains_key(&info.name))
+            .filter_map(|(id, info)| {
+                self.wayland_state
+                    .output_objects
+                    .get(id)
+                    .cloned()
+                    .map(|object| (info.name.clone(), object))
+            })
+            .collect();
+
+        for (name, output) in missing_outputs {
+            let pointer = manager.create_virtual_pointer_with_output(
+                self.wayland_state.seat.as_ref(),
+                Some(&output),
+                &self.qh,
+                (),
+            );
+            self.output_virtual_pointers.insert(name, pointer);
+        }
+
+        let live_names: Vec<_> =
+            self.wayland_state.outputs.values().map(|output| output.name.as_str()).collect();
+        self.output_virtual_pointers.retain(|name, _| live_names.contains(&name.as_str()));
+    }
+
+    /// Apply current local Wayland geometry to the topology received from the
+    /// capture worker. Output names join the two independent connections.
+    fn refresh_live_output_layout(&mut self) {
+        self.poll_wayland_events();
+        self.create_missing_output_pointers();
+
+        self.outputs = match &self.reported_outputs {
+            // Before the capture worker sends its first topology, use the
+            // local view. Once it has sent one, even an empty list means all
+            // published outputs were removed.
+            None => self.wayland_state.outputs.clone(),
+            Some(reported_outputs) => {
+                merge_output_layout(&self.wayland_state.outputs, reported_outputs)
+            }
+        };
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(self.outputs.values());
+        self.layout_min_x = min_x;
+        self.layout_min_y = min_y;
+        self.total_w = total_w;
+        self.total_h = total_h;
+
+        let selected = refreshed_stream_output(&self.outputs, &self.stream_output_name).cloned();
+        if let Some(output) = selected {
+            let selected_changed = output.name != self.stream_output_name;
+            if selected_changed && !self.stream_output_name.is_empty() {
+                log::warn!(
+                    "Input: mapped output '{}' disappeared; falling back to '{}'",
+                    self.stream_output_name,
+                    output.name
+                );
+            }
+            self.stream_output_name = output.name;
+            self.stream_output_x = output.x;
+            self.stream_output_y = output.y;
+            self.stream_output_w = output.width;
+            self.stream_output_h = output.height;
+            if let Some(pointer) = self.output_virtual_pointers.get(&self.stream_output_name) {
+                self.virtual_pointer = pointer.clone();
+                self.pointer_is_output_bound = true;
+            }
+        } else {
+            self.stream_output_name.clear();
+            self.stream_output_x = 0;
+            self.stream_output_y = 0;
+            self.stream_output_w = self.total_w;
+            self.stream_output_h = self.total_h;
+            self.virtual_pointer = self.generic_virtual_pointer.clone();
+            self.pointer_is_output_bound = false;
+        }
+    }
+
     /// Connect to Wayland, discover outputs, and create virtual devices.
     pub fn new() -> Result<WaylandInput, String> {
         let conn = Connection::connect_to_env()
@@ -193,8 +360,9 @@ impl WaylandInput {
             xdg_output_manager: None,
             outputs: HashMap::new(),
             output_objects: HashMap::new(),
+            output_globals: HashMap::new(),
             xdg_to_wl: HashMap::new(),
-            pending_output: None,
+            pending_outputs: HashMap::new(),
             stream_output_x: 0,
             stream_output_y: 0,
             stream_output_w: 1920,
@@ -355,25 +523,38 @@ impl WaylandInput {
             wl_state.total_w,
             wl_state.total_h
         );
+        let initial_outputs = wl_state.outputs.clone();
+        let initial_stream_output_x = wl_state.stream_output_x;
+        let initial_stream_output_y = wl_state.stream_output_y;
+        let initial_stream_output_w = wl_state.stream_output_w;
+        let initial_stream_output_h = wl_state.stream_output_h;
+        let initial_layout_min_x = wl_state.layout_min_x;
+        let initial_layout_min_y = wl_state.layout_min_y;
+        let initial_total_w = wl_state.total_w;
+        let initial_total_h = wl_state.total_h;
 
         Ok(WaylandInput {
             conn,
+            event_queue,
+            wayland_state: wl_state,
+            qh,
             generic_virtual_pointer: generic_virtual_pointer.clone(),
             virtual_pointer: generic_virtual_pointer,
             output_virtual_pointers,
             pointer_is_output_bound: false,
             virtual_keyboard,
             char_to_keycode,
-            outputs: wl_state.outputs,
+            outputs: initial_outputs,
+            reported_outputs: None,
             stream_output_name: String::new(),
-            stream_output_x: wl_state.stream_output_x,
-            stream_output_y: wl_state.stream_output_y,
-            stream_output_w: wl_state.stream_output_w,
-            stream_output_h: wl_state.stream_output_h,
-            layout_min_x: wl_state.layout_min_x,
-            layout_min_y: wl_state.layout_min_y,
-            total_w: wl_state.total_w,
-            total_h: wl_state.total_h,
+            stream_output_x: initial_stream_output_x,
+            stream_output_y: initial_stream_output_y,
+            stream_output_w: initial_stream_output_w,
+            stream_output_h: initial_stream_output_h,
+            layout_min_x: initial_layout_min_x,
+            layout_min_y: initial_layout_min_y,
+            total_w: initial_total_w,
+            total_h: initial_total_h,
         })
     }
 }
@@ -399,6 +580,7 @@ impl InputBackend for WaylandInput {
         output_x: Option<i32>,
         output_y: Option<i32>,
     ) {
+        self.refresh_live_output_layout();
         self.stream_output_name = output_name.to_string();
         // Prefer local xdg_output positions (always correct) over what
         // the screencopy backend reports — wl_output::Geometry gives wrong
@@ -447,55 +629,8 @@ impl InputBackend for WaylandInput {
     }
 
     fn set_output_layout(&mut self, outputs: &[OutputGeometry]) {
-        self.outputs = outputs
-            .iter()
-            .enumerate()
-            .map(|(index, output)| {
-                (
-                    index as u32,
-                    OutputInfo {
-                        name: output.name.clone(),
-                        x: output.x,
-                        y: output.y,
-                        width: output.width,
-                        height: output.height,
-                    },
-                )
-            })
-            .collect();
-        let (min_x, min_y, total_w, total_h) = output_layout_bounds(self.outputs.values());
-        self.layout_min_x = min_x;
-        self.layout_min_y = min_y;
-        self.total_w = total_w;
-        self.total_h = total_h;
-
-        // Capture and input must choose the same fallback. Both use the first
-        // output in the freshly published topology when the selected name is
-        // gone; HashMap iteration order must never decide the target.
-        let selected = refreshed_stream_output(&self.outputs, &self.stream_output_name);
-        if let Some(output) = selected {
-            if output.name != self.stream_output_name {
-                log::warn!(
-                    "Input: mapped output '{}' disappeared; falling back to '{}'",
-                    self.stream_output_name,
-                    output.name
-                );
-                self.stream_output_name = output.name.clone();
-            }
-            self.stream_output_x = output.x;
-            self.stream_output_y = output.y;
-            self.stream_output_w = output.width;
-            self.stream_output_h = output.height;
-        } else {
-            // Do not keep mapping input to geometry for an output that no
-            // longer exists. The default bounds keep any in-flight absolute
-            // event finite until a replacement topology arrives.
-            self.stream_output_name.clear();
-            self.stream_output_x = 0;
-            self.stream_output_y = 0;
-            self.stream_output_w = self.total_w;
-            self.stream_output_h = self.total_h;
-        }
+        self.reported_outputs = Some(outputs.to_vec());
+        self.refresh_live_output_layout();
         log::info!(
             "Input: refreshed output topology ({} outputs), layout origin ({},{}) extent {}x{}",
             outputs.len(),
@@ -512,6 +647,7 @@ impl InputBackend for WaylandInput {
     }
 
     fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64) {
+        self.refresh_live_output_layout();
         if self.pointer_is_output_bound {
             let (x, y) = absolute_position_in_output(
                 self.stream_output_w,
@@ -577,10 +713,19 @@ impl InputBackend for WaylandInput {
         y_norm: f64,
         output_name: Option<&str>,
     ) {
+        self.refresh_live_output_layout();
         let Some(output_name) = output_name else {
             self.pointer_motion_absolute(time, x_norm, y_norm);
             return;
         };
+        if !mapped_absolute_target_is_current(&self.stream_output_name, output_name) {
+            log::warn!(
+                "Input: rejecting stale mapped motion for '{}' while streaming '{}'",
+                output_name,
+                self.stream_output_name
+            );
+            return;
+        }
         let Some(output) = self.outputs.values().find(|output| output.name == output_name) else {
             log::warn!("Input: rejecting absolute motion for missing output '{output_name}'");
             return;
@@ -882,8 +1027,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputWaylandState {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            match interface.as_str() {
+        match event {
+            wl_registry::Event::Global { name, interface, version } => match interface.as_str() {
                 "wl_seat" => {
                     state.seat =
                         Some(registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ()));
@@ -905,9 +1050,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputWaylandState {
                 "wl_output" => {
                     let output =
                         registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ());
-                    state.output_objects.insert(output.id().protocol_id(), output.clone());
+                    let output_id = output.id().protocol_id();
+                    state.output_objects.insert(output_id, output.clone());
+                    state.output_globals.insert(name, output_id);
                     // Request xdg_output for this wl_output to get logical position.
-                    if let Some(mgr) = &state.xdg_output_manager {
+                    if let Some(mgr) = state.xdg_output_manager.clone() {
                         let wl_id = output.id().protocol_id();
                         let xdg_out = mgr.get_xdg_output(&output, qh, ());
                         let xdg_id = xdg_out.id().protocol_id();
@@ -915,16 +1062,40 @@ impl Dispatch<wl_registry::WlRegistry, ()> for InputWaylandState {
                     }
                 }
                 "zxdg_output_manager_v1" => {
-                    state.xdg_output_manager =
-                        Some(registry.bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
+                    let manager = registry
+                        .bind::<zxdg_output_manager_v1::ZxdgOutputManagerV1, _, _>(
                             name,
                             version.min(3),
                             qh,
                             (),
-                        ));
+                        );
+                    // Registry global order is not guaranteed. If outputs
+                    // appeared first, subscribe them now instead of leaving
+                    // their wl_output::Geometry coordinates authoritative.
+                    for (wl_id, output) in &state.output_objects {
+                        let xdg_output = manager.get_xdg_output(output, qh, ());
+                        state.xdg_to_wl.insert(xdg_output.id().protocol_id(), *wl_id);
+                    }
+                    state.xdg_output_manager = Some(manager);
                 }
                 _ => {}
+            },
+            wl_registry::Event::GlobalRemove { name } => {
+                let Some(output_id) = state.output_globals.remove(&name) else {
+                    return;
+                };
+                state.outputs.remove(&output_id);
+                state.pending_outputs.remove(&output_id);
+                state.output_objects.remove(&output_id);
+                state.xdg_to_wl.retain(|_, wl_id| *wl_id != output_id);
+                let (min_x, min_y, total_w, total_h) = output_layout_bounds(state.outputs.values());
+                state.layout_min_x = min_x;
+                state.layout_min_y = min_y;
+                state.total_w = total_w;
+                state.total_h = total_h;
+                log::info!("Input: removed Wayland output id={output_id}");
             }
+            _ => {}
         }
     }
 }
@@ -939,12 +1110,16 @@ impl Dispatch<wl_output::WlOutput, ()> for InputWaylandState {
         _qh: &QueueHandle<Self>,
     ) {
         let id = proxy.id().protocol_id();
-        let pending = state.pending_output.get_or_insert_with(|| (id, OutputInfo::default()));
+        // wl_output sends a new Done after a mode or geometry change. Seed the
+        // update with the prior name and geometry, because these later batches
+        // often contain only the changed fields.
+        let prior = state.outputs.get(&id).cloned().unwrap_or_default();
+        let pending = state.pending_outputs.entry(id).or_insert(prior);
 
         match event {
             wl_output::Event::Geometry { x, y, .. } => {
-                pending.1.x = x;
-                pending.1.y = y;
+                pending.x = x;
+                pending.y = y;
             }
             wl_output::Event::Mode { flags, width, height, .. } => {
                 let is_current = match flags {
@@ -952,28 +1127,28 @@ impl Dispatch<wl_output::WlOutput, ()> for InputWaylandState {
                     _ => false,
                 };
                 if is_current {
-                    pending.1.width = width as u32;
-                    pending.1.height = height as u32;
+                    pending.width = width as u32;
+                    pending.height = height as u32;
                 }
             }
             wl_output::Event::Name { name } => {
-                pending.1.name = name;
+                pending.name = name;
             }
             wl_output::Event::Done => {
-                if let Some((oid, info)) = state.pending_output.take() {
+                if let Some(info) = state.pending_outputs.remove(&id) {
                     // Only insert if this has real data (name + size).
                     // Subsequent Done events after xdg roundtrips have empty pending.
                     if !info.name.is_empty() && info.width > 0 {
                         log::info!(
                             "Input: output '{}' (id={}) {}x{} at ({},{})",
                             info.name,
-                            oid,
+                            id,
                             info.width,
                             info.height,
                             info.x,
                             info.y
                         );
-                        state.outputs.insert(oid, info);
+                        state.outputs.insert(id, info);
                         // Recompute signed bounds so late-arriving outputs
                         // (HEADLESS/hotplug) can extend left or above origin.
                         let (min_x, min_y, new_w, new_h) =
@@ -1077,6 +1252,13 @@ mod coordinate_tests {
     }
 
     #[test]
+    fn mapped_absolute_input_cannot_override_the_active_stream_output() {
+        assert!(mapped_absolute_target_is_current("HEADLESS-5", "HEADLESS-5"));
+        assert!(!mapped_absolute_target_is_current("HEADLESS-5", "DP-1"));
+        assert!(!mapped_absolute_target_is_current("", "HEADLESS-5"));
+    }
+
+    #[test]
     fn unknown_virtual_output_uses_reported_origin_not_same_sized_primary() {
         // Both displays are 1920x1080. Selecting by dimensions would map this
         // event to eDP-1 instead of the selected HEADLESS-2 output.
@@ -1097,6 +1279,111 @@ mod coordinate_tests {
         )]);
 
         assert_eq!(stream_output_origin(&outputs, "HEADLESS-2", Some(0), Some(0)), (-1600, 80));
+    }
+
+    #[test]
+    fn layout_refresh_keeps_local_position_for_known_virtual_output() {
+        let known = HashMap::from([
+            (1, OutputInfo { name: "DP-1".into(), ..output(0, 0, 1920, 1080) }),
+            (2, OutputInfo { name: "HEADLESS-3".into(), ..output(1920, 0, 1180, 820) }),
+        ]);
+        // The capture worker reports the virtual display at the compositor
+        // origin. This is the failure observed with Sway virtual outputs.
+        let reported = vec![
+            OutputGeometry { name: "DP-1".into(), x: 0, y: 0, width: 1920, height: 1080 },
+            // The capture surface has a different buffer size. Pointer
+            // injection needs the compositor's logical output extent.
+            OutputGeometry { name: "HEADLESS-3".into(), x: 0, y: 0, width: 2360, height: 1640 },
+        ];
+
+        let merged = merge_output_layout(&known, &reported);
+        let headless = merged.values().find(|output| output.name == "HEADLESS-3").unwrap();
+
+        assert_eq!((headless.x, headless.y), (1920, 0));
+        assert_eq!((headless.width, headless.height), (1180, 820));
+        assert_eq!(output_layout_bounds(merged.values()), (0, 0, 3100, 1080));
+    }
+
+    #[test]
+    fn empty_published_topology_removes_all_outputs() {
+        let known = HashMap::from([(
+            1,
+            OutputInfo { name: "HEADLESS-3".into(), ..output(1920, 0, 1180, 820) },
+        )]);
+
+        assert!(merge_output_layout(&known, &[]).is_empty());
+    }
+
+    #[test]
+    fn layout_refresh_uses_reported_position_for_new_output() {
+        let reported = vec![OutputGeometry {
+            name: "HEADLESS-4".into(),
+            x: -1080,
+            y: 50,
+            width: 1080,
+            height: 1920,
+        }];
+
+        let merged = merge_output_layout(&HashMap::new(), &reported);
+        let added = merged.values().next().unwrap();
+
+        assert_eq!((added.x, added.y, added.width, added.height), (-1080, 50, 1080, 1920));
+    }
+
+    #[test]
+    fn refreshed_layout_uses_live_position_after_a_known_output_moves() {
+        let live = HashMap::from([
+            (1, OutputInfo { name: "eDP-1".into(), ..output(0, 0, 1920, 1080) }),
+            (2, OutputInfo { name: "HEADLESS-3".into(), ..output(-1370, 50, 1180, 820) }),
+        ]);
+        // The capture connection has not learned about the move and still
+        // reports its unusable virtual-output origin.
+        let reported = vec![
+            OutputGeometry { name: "eDP-1".into(), x: 0, y: 0, width: 1920, height: 1080 },
+            OutputGeometry { name: "HEADLESS-3".into(), x: 0, y: 0, width: 1180, height: 820 },
+        ];
+
+        let merged = merge_output_layout(&live, &reported);
+        let selected = refreshed_stream_output(&merged, "HEADLESS-3").unwrap();
+        let (min_x, min_y, total_w, total_h) = output_layout_bounds(merged.values());
+
+        assert_eq!((selected.x, selected.y), (-1370, 50));
+        // A centred point must follow the new display location. It must not
+        // map to eDP-1 or the stale capture origin.
+        assert_eq!(
+            absolute_position_in_layout(
+                min_x,
+                min_y,
+                total_w,
+                total_h,
+                selected.x,
+                selected.y,
+                selected.width,
+                selected.height,
+                0.5,
+                0.5,
+            ),
+            (590, 460)
+        );
+    }
+
+    #[test]
+    fn reordered_capture_topology_keeps_selected_output_by_name() {
+        let live = HashMap::from([
+            (7, OutputInfo { name: "eDP-1".into(), ..output(0, 0, 1920, 1080) }),
+            (11, OutputInfo { name: "HEADLESS-3".into(), ..output(1920, -300, 1180, 820) }),
+        ]);
+        // Capture order changes as displays are recreated. Positions in this
+        // list are not identities.
+        let reordered = vec![
+            OutputGeometry { name: "HEADLESS-3".into(), x: 0, y: 0, width: 1180, height: 820 },
+            OutputGeometry { name: "eDP-1".into(), x: 0, y: 0, width: 1920, height: 1080 },
+        ];
+
+        let merged = merge_output_layout(&live, &reordered);
+        let selected = refreshed_stream_output(&merged, "HEADLESS-3").unwrap();
+
+        assert_eq!((selected.name.as_str(), selected.x, selected.y), ("HEADLESS-3", 1920, -300));
     }
 
     #[test]
@@ -1242,5 +1529,604 @@ mod coordinate_tests {
         ];
 
         assert_eq!(output_layout_bounds(outputs.iter()), (i32::MIN, i32::MIN, u32::MAX, u32::MAX));
+    }
+
+    use proptest::prelude::*;
+
+    // Layout coordinates are logical compositor pixels: the output's mode with
+    // transform applied, divided by scale with truncating integer math. Real
+    // wlroots layouts stay within a few thousand px of the origin; bounding
+    // positions at ±1M keeps extents inside u32 while covering absurd cases.
+    const MAX_POS: i32 = 1_000_000;
+    const MAX_DIM: u32 = 100_000;
+
+    /// wlroots-style connector names. A pool of ~20 keeps collisions frequent
+    /// enough to exercise name joins while covering the common prefixes.
+    fn arb_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "eDP-[1-2]",
+            "DP-[1-3]",
+            "HDMI-A-[1-3]",
+            "DVI-I-[1-2]",
+            "HEADLESS-[1-9]",
+            "WL-[1-2]",
+            "X11-[1-2]",
+        ]
+    }
+
+    fn arb_geometry() -> impl Strategy<Value = (i32, i32, u32, u32)> {
+        (-MAX_POS..=MAX_POS, -MAX_POS..=MAX_POS, 0..=MAX_DIM, 0..=MAX_DIM)
+    }
+
+    fn arb_output_info() -> impl Strategy<Value = OutputInfo> {
+        (arb_name(), arb_geometry()).prop_map(|(name, (x, y, width, height))| OutputInfo {
+            name,
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn arb_output_geometry() -> impl Strategy<Value = OutputGeometry> {
+        (arb_name(), arb_geometry()).prop_map(|(name, (x, y, width, height))| OutputGeometry {
+            name,
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    /// Outputs keyed by object id with unique names: two live outputs can
+    /// never share a Wayland/xdg-output name.
+    fn arb_known_outputs() -> impl Strategy<Value = HashMap<u32, OutputInfo>> {
+        prop::collection::hash_map(arb_name(), arb_geometry(), 0..=6).prop_map(|by_name| {
+            by_name
+                .into_iter()
+                .enumerate()
+                .map(|(id, (name, (x, y, width, height)))| {
+                    (id as u32, OutputInfo { name, x, y, width, height })
+                })
+                .collect()
+        })
+    }
+
+    /// Outputs keyed by arbitrary object ids; duplicate names are allowed
+    /// because the map can transiently hold stale entries.
+    fn arb_output_map() -> impl Strategy<Value = HashMap<u32, OutputInfo>> {
+        prop::collection::hash_map(any::<u32>(), arb_output_info(), 0..=8)
+    }
+
+    /// Topology published by the capture worker. On wlroots, wl_output.geometry
+    /// reports (0,0) for every output, so reported positions are routinely all
+    /// zero; order is capture order and carries no identity.
+    fn arb_reported() -> impl Strategy<Value = Vec<OutputGeometry>> {
+        prop::collection::vec(arb_output_geometry(), 0..=6)
+    }
+
+    /// Reported topologies with unique names — the only kind a compositor can
+    /// produce. With duplicate names, the name join in `merge_output_layout`
+    /// cannot tell same-named outputs apart and is not idempotent.
+    fn arb_reported_unique_names() -> impl Strategy<Value = Vec<OutputGeometry>> {
+        prop::collection::hash_map(arb_name(), arb_geometry(), 0..=6).prop_map(|by_name| {
+            by_name
+                .into_iter()
+                .map(|(name, (x, y, width, height))| OutputGeometry { name, x, y, width, height })
+                .collect()
+        })
+    }
+
+    /// The shape wlroots `output_layout_reconfigure` produces for
+    /// auto-configured outputs (what `swaymsg create_output` makes): a
+    /// horizontal row chained rightward from a start point, sharing one y.
+    fn arb_auto_row() -> impl Strategy<Value = Vec<OutputInfo>> {
+        (
+            -MAX_POS..=MAX_POS / 2,
+            -MAX_POS..=MAX_POS / 2,
+            prop::collection::vec((arb_name(), 1..=MAX_DIM / 4, 1..=MAX_DIM / 4), 1..=6),
+        )
+            .prop_map(|(x0, y0, outputs)| {
+                let mut x = i64::from(x0);
+                outputs
+                    .into_iter()
+                    .map(|(name, width, height)| {
+                        let info = OutputInfo { name, x: x as i32, y: y0, width, height };
+                        x += i64::from(width);
+                        info
+                    })
+                    .collect()
+            })
+    }
+
+    /// A realistic mix: mostly compositor-shaped layouts, occasionally
+    /// arbitrary ones with overlaps and gaps (both legal in wlr_output_layout).
+    fn arb_layout() -> impl Strategy<Value = Vec<OutputInfo>> {
+        prop_oneof![
+            3 => arb_auto_row(),
+            1 => prop::collection::vec(arb_output_info(), 0..=8),
+        ]
+    }
+
+    /// True when no two outputs share interior area; adjacent edges are fine.
+    fn interiors_disjoint(outputs: &[OutputInfo]) -> bool {
+        outputs.iter().enumerate().all(|(i, a)| {
+            outputs.iter().skip(i + 1).all(|b| {
+                let (ax, ay, aw, ah) =
+                    (i64::from(a.x), i64::from(a.y), i64::from(a.width), i64::from(a.height));
+                let (bx, by, bw, bh) =
+                    (i64::from(b.x), i64::from(b.y), i64::from(b.width), i64::from(b.height));
+                ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay
+            })
+        })
+    }
+
+    proptest! {
+        // --- output_layout_bounds --------------------------------------
+
+        /// The bounding box is a union, not a partition: it contains every
+        /// output even when they overlap or leave dead space, and is never
+        /// degenerate.
+        #[test]
+        fn prop_bounds_contain_every_output(outputs in arb_layout()) {
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+
+            prop_assert!(total_w >= 1 && total_h >= 1);
+            let (bx, by, bw, bh) =
+                (i64::from(min_x), i64::from(min_y), i64::from(total_w), i64::from(total_h));
+            for output in &outputs {
+                let (ox, oy, ow, oh) = (
+                    i64::from(output.x),
+                    i64::from(output.y),
+                    i64::from(output.width),
+                    i64::from(output.height),
+                );
+                prop_assert!(ox >= bx && oy >= by);
+                prop_assert!(ox + ow <= bx + bw);
+                prop_assert!(oy + oh <= by + bh);
+            }
+        }
+
+        /// The box is tight: each edge touches some output's edge, matching
+        /// wlr_output_layout_get_box semantics.
+        #[test]
+        fn prop_bounds_are_tight(outputs in arb_layout()) {
+            prop_assume!(!outputs.is_empty());
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+
+            prop_assert_eq!(min_x, outputs.iter().map(|o| o.x).min().unwrap());
+            prop_assert_eq!(min_y, outputs.iter().map(|o| o.y).min().unwrap());
+            let max_x = outputs
+                .iter()
+                .map(|o| i64::from(o.x) + i64::from(o.width))
+                .max()
+                .unwrap();
+            let max_y = outputs
+                .iter()
+                .map(|o| i64::from(o.y) + i64::from(o.height))
+                .max()
+                .unwrap();
+            prop_assert_eq!(i64::from(total_w), max_x - i64::from(min_x));
+            prop_assert_eq!(i64::from(total_h), max_y - i64::from(min_y));
+        }
+
+        /// Iteration order carries no meaning.
+        #[test]
+        fn prop_bounds_ignore_iteration_order(outputs in arb_layout(), rot in any::<usize>()) {
+            let mut rotated = outputs.clone();
+            if !rotated.is_empty() {
+                let n = rotated.len();
+                rotated.rotate_left(rot % n);
+            }
+
+            prop_assert_eq!(
+                output_layout_bounds(outputs.iter()),
+                output_layout_bounds(rotated.iter())
+            );
+        }
+
+        /// Totality: any i32 origin + u32 extent returns without overflow.
+        #[test]
+        fn prop_bounds_never_panics_on_extreme_geometry(
+            outputs in prop::collection::vec(
+                (any::<i32>(), any::<i32>(), any::<u32>(), any::<u32>())
+                    .prop_map(|(x, y, width, height)| OutputInfo {
+                        name: String::new(),
+                        x,
+                        y,
+                        width,
+                        height,
+                    }),
+                0..=8,
+            )
+        ) {
+            let (_, _, total_w, total_h) = output_layout_bounds(outputs.iter());
+            prop_assert!(total_w >= 1 && total_h >= 1);
+        }
+
+        // --- absolute_position_in_layout -------------------------------
+
+        /// Boundedness holds for every normalized input, including NaN and
+        /// infinities, out-of-range values, and zero-size outputs.
+        #[test]
+        fn prop_layout_mapping_stays_in_bounds(
+            outputs in arb_layout(),
+            index in any::<usize>(),
+            xn in any::<f64>(),
+            yn in any::<f64>(),
+        ) {
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+            let target = if outputs.is_empty() {
+                output(0, 0, 0, 0)
+            } else {
+                outputs[index % outputs.len()].clone()
+            };
+
+            let (x, y) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                xn, yn,
+            );
+
+            prop_assert!(x <= total_w);
+            prop_assert!(y <= total_h);
+        }
+
+        /// Endpoint fidelity: 0.0 lands on the output's near edge, 1.0 on its
+        /// far edge, in translated layout space.
+        #[test]
+        fn prop_layout_mapping_hits_output_edges(
+            outputs in arb_layout(),
+            index in any::<usize>(),
+        ) {
+            prop_assume!(!outputs.is_empty());
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+            let target = &outputs[index % outputs.len()];
+
+            let (x0, y0) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                0.0, 0.0,
+            );
+            let (x1, y1) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                1.0, 1.0,
+            );
+
+            prop_assert_eq!(i64::from(x0), i64::from(target.x) - i64::from(min_x));
+            prop_assert_eq!(i64::from(y0), i64::from(target.y) - i64::from(min_y));
+            prop_assert_eq!(
+                i64::from(x1),
+                i64::from(target.x) - i64::from(min_x) + i64::from(target.width)
+            );
+            prop_assert_eq!(
+                i64::from(y1),
+                i64::from(target.y) - i64::from(min_y) + i64::from(target.height)
+            );
+        }
+
+        /// Within [0,1] the mapping never inverts direction.
+        #[test]
+        fn prop_layout_mapping_is_monotonic(
+            outputs in arb_layout(),
+            index in any::<usize>(),
+            x1 in 0f64..=1f64,
+            x2 in 0f64..=1f64,
+            y1 in 0f64..=1f64,
+            y2 in 0f64..=1f64,
+        ) {
+            prop_assume!(!outputs.is_empty());
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+            let target = &outputs[index % outputs.len()];
+
+            let (mx1, my1) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                x1.min(x2), y1.min(y2),
+            );
+            let (mx2, my2) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                x1.max(x2), y1.max(y2),
+            );
+
+            prop_assert!(mx1 <= mx2);
+            prop_assert!(my1 <= my2);
+        }
+
+        /// Translation preserves relative geometry: the same normalized point
+        /// in two same-sized outputs differs by exactly the origin delta.
+        #[test]
+        fn prop_layout_mapping_preserves_relative_offsets(
+            ax in -MAX_POS..=MAX_POS,
+            ay in -MAX_POS..=MAX_POS,
+            bx in -MAX_POS..=MAX_POS,
+            by in -MAX_POS..=MAX_POS,
+            w in 1..=MAX_DIM,
+            h in 1..=MAX_DIM,
+            xn in 0f64..=1f64,
+            yn in 0f64..=1f64,
+        ) {
+            let outputs = [output(ax, ay, w, h), output(bx, by, w, h)];
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+
+            let (mxa, mya) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h, ax, ay, w, h, xn, yn,
+            );
+            let (mxb, myb) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h, bx, by, w, h, xn, yn,
+            );
+
+            prop_assert_eq!(i64::from(mxb) - i64::from(mxa), i64::from(bx) - i64::from(ax));
+            prop_assert_eq!(i64::from(myb) - i64::from(mya), i64::from(by) - i64::from(ay));
+        }
+
+        // --- absolute_position_in_output -------------------------------
+
+        /// Output-local mapping depends only on the output's own extent —
+        /// where it sits in the layout can never leak into the result.
+        #[test]
+        fn prop_output_mapping_stays_in_extent(
+            w in 0..=MAX_DIM,
+            h in 0..=MAX_DIM,
+            xn in any::<f64>(),
+            yn in any::<f64>(),
+        ) {
+            let (x, y) = absolute_position_in_output(w, h, xn, yn);
+
+            prop_assert!(x <= w);
+            prop_assert!(y <= h);
+        }
+
+        #[test]
+        fn prop_output_mapping_is_monotonic_and_exact_at_edges(
+            w in 1..=MAX_DIM,
+            h in 1..=MAX_DIM,
+            x1 in 0f64..=1f64,
+            x2 in 0f64..=1f64,
+        ) {
+            let (xlo, _) = absolute_position_in_output(w, h, x1.min(x2), 0.0);
+            let (xhi, _) = absolute_position_in_output(w, h, x1.max(x2), 0.0);
+            prop_assert!(xlo <= xhi);
+
+            prop_assert_eq!(absolute_position_in_output(w, h, 0.0, 0.0), (0, 0));
+            prop_assert_eq!(absolute_position_in_output(w, h, 1.0, 1.0), (w, h));
+        }
+
+        // --- merge_output_layout ---------------------------------------
+
+        /// Membership is exactly the reported topology; local geometry wins
+        /// for every name the input connection knows, reported geometry fills
+        /// only genuine unknowns.
+        #[test]
+        fn prop_merge_membership_and_geometry_source(
+            known in arb_known_outputs(),
+            reported in arb_reported(),
+        ) {
+            let merged = merge_output_layout(&known, &reported);
+
+            prop_assert_eq!(merged.len(), reported.len());
+            for (index, rep) in reported.iter().enumerate() {
+                let m = &merged[&(index as u32)];
+                prop_assert_eq!(&m.name, &rep.name);
+                if let Some(k) = known.values().find(|k| k.name == rep.name) {
+                    prop_assert_eq!(
+                        (m.x, m.y, m.width, m.height),
+                        (k.x, k.y, k.width, k.height),
+                        "known output '{}' lost its local geometry",
+                        rep.name
+                    );
+                } else {
+                    prop_assert_eq!(
+                        (m.x, m.y, m.width, m.height),
+                        (rep.x, rep.y, rep.width, rep.height)
+                    );
+                }
+            }
+        }
+
+        /// The Sway case: wlroots reports (0,0) in wl_output.geometry for
+        /// every output, so an all-zero reported topology must still resolve
+        /// known outputs to their local positions — reported contributes
+        /// membership, not position.
+        #[test]
+        fn prop_merge_all_zero_reported_keeps_local_positions(
+            known in arb_known_outputs(),
+            reported_names in prop::collection::vec(
+                (arb_name(), 1..=MAX_DIM, 1..=MAX_DIM),
+                0..=6,
+            ),
+        ) {
+            let reported: Vec<OutputGeometry> = reported_names
+                .into_iter()
+                .map(|(name, width, height)| OutputGeometry { name, x: 0, y: 0, width, height })
+                .collect();
+            let merged = merge_output_layout(&known, &reported);
+
+            for (index, rep) in reported.iter().enumerate() {
+                let m = &merged[&(index as u32)];
+                if let Some(k) = known.values().find(|k| k.name == rep.name) {
+                    prop_assert_eq!((m.x, m.y), (k.x, k.y));
+                } else {
+                    prop_assert_eq!((m.x, m.y), (0, 0));
+                }
+            }
+        }
+
+        /// Capture order is not identity: permuting the reported list changes
+        /// only the map keys, never the set of (name, geometry) pairs.
+        #[test]
+        fn prop_merge_ignores_capture_order(
+            known in arb_known_outputs(),
+            reported in arb_reported(),
+            rot in any::<usize>(),
+        ) {
+            let mut rotated = reported.clone();
+            if !rotated.is_empty() {
+                let n = rotated.len();
+                rotated.rotate_left(rot % n);
+            }
+
+            let signature = |map: &HashMap<u32, OutputInfo>| {
+                let mut sig: Vec<_> = map
+                    .values()
+                    .map(|o| (o.name.clone(), o.x, o.y, o.width, o.height))
+                    .collect();
+                sig.sort();
+                sig
+            };
+
+            prop_assert_eq!(
+                signature(&merge_output_layout(&known, &reported)),
+                signature(&merge_output_layout(&known, &rotated))
+            );
+        }
+
+        /// Merging the result again with the same topology is a no-op. Only
+        /// holds for unique-name topologies: with duplicate names the local
+        /// lookup cannot distinguish same-named outputs, so geometry can
+        /// migrate between them on re-merge.
+        #[test]
+        fn prop_merge_is_idempotent(
+            known in arb_known_outputs(),
+            reported in arb_reported_unique_names(),
+        ) {
+            let once = merge_output_layout(&known, &reported);
+            let twice = merge_output_layout(&once, &reported);
+
+            let signature = |map: &HashMap<u32, OutputInfo>| {
+                let mut sig: Vec<_> = map
+                    .values()
+                    .map(|o| (o.name.clone(), o.x, o.y, o.width, o.height))
+                    .collect();
+                sig.sort();
+                sig
+            };
+            prop_assert_eq!(signature(&once), signature(&twice));
+        }
+
+        // --- output selection / origin / stale-target ------------------
+
+        /// Name lookup resolves to an output with that exact name; a miss
+        /// falls back to the lowest-keyed entry, never to a size match.
+        #[test]
+        fn prop_refresh_keeps_name_or_deterministic_fallback(
+            outputs in arb_output_map(),
+            index in any::<usize>(),
+            query in arb_name(),
+        ) {
+            if !outputs.is_empty() {
+                let key = *outputs.keys().nth(index % outputs.len()).unwrap();
+                let named = refreshed_stream_output(&outputs, &outputs[&key].name).unwrap();
+                prop_assert_eq!(named.name.as_str(), outputs[&key].name.as_str());
+            }
+
+            if outputs.values().any(|o| o.name == query) {
+                prop_assert_eq!(
+                    refreshed_stream_output(&outputs, &query).unwrap().name.as_str(),
+                    query.as_str()
+                );
+            } else {
+                let expected =
+                    outputs.iter().min_by_key(|(k, _)| *k).map(|(_, o)| o.name.clone());
+                match (&expected, refreshed_stream_output(&outputs, &query)) {
+                    (Some(expected), Some(found)) => prop_assert_eq!(&found.name, expected),
+                    (None, None) => {}
+                    _ => prop_assert!(false, "fallback mismatch"),
+                }
+            }
+        }
+
+        /// Origin resolution is all-or-nothing on the reported fallback and
+        /// always prefers a local name match.
+        #[test]
+        fn prop_stream_origin_prefers_local_then_reported(
+            outputs in arb_output_map(),
+            name in arb_name(),
+            rx in prop::option::of(any::<i32>()),
+            ry in prop::option::of(any::<i32>()),
+        ) {
+            let (x, y) = stream_output_origin(&outputs, &name, rx, ry);
+
+            if let Some(o) = outputs.values().find(|o| o.name == name) {
+                prop_assert_eq!((x, y), (o.x, o.y));
+            } else if let (Some(rx), Some(ry)) = (rx, ry) {
+                prop_assert_eq!((x, y), (rx, ry));
+            } else {
+                prop_assert_eq!((x, y), (0, 0));
+            }
+        }
+
+        /// Mapped input is accepted only for the exact, non-empty active name.
+        #[test]
+        fn prop_stale_target_rejected_unless_exact_nonempty_match(
+            active in ".*",
+            requested in ".*",
+        ) {
+            prop_assert_eq!(
+                mapped_absolute_target_is_current(&active, &requested),
+                !active.is_empty() && active == requested
+            );
+        }
+
+        // --- end-to-end targeting --------------------------------------
+
+        /// The whole pipeline — merge → bounds → map — lands a normalized
+        /// point inside the expected output's rect, for arbitrary topologies.
+        /// When outputs have disjoint interiors, the point is also never
+        /// strictly inside a different output: the input reaches the display
+        /// the user selected and no other.
+        #[test]
+        fn prop_pipeline_targets_the_expected_output(
+            known in arb_known_outputs(),
+            reported in arb_reported(),
+            index in any::<usize>(),
+            xn in 0f64..=1f64,
+            yn in 0f64..=1f64,
+        ) {
+            prop_assume!(!reported.is_empty());
+            let target_index = index % reported.len();
+
+            let merged = merge_output_layout(&known, &reported);
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(merged.values());
+            let merged_vec: Vec<OutputInfo> = merged.values().cloned().collect();
+            let target = merged[&(target_index as u32)].clone();
+            prop_assume!(target.width > 0 && target.height > 0);
+
+            let (mx, my) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                xn, yn,
+            );
+
+            prop_assert!(mx <= total_w && my <= total_h);
+
+            // Back in compositor coordinates the point is inside the target.
+            let gx = i64::from(mx) + i64::from(min_x);
+            let gy = i64::from(my) + i64::from(min_y);
+            prop_assert!(gx >= i64::from(target.x) && gx <= i64::from(target.x) + i64::from(target.width));
+            prop_assert!(gy >= i64::from(target.y) && gy <= i64::from(target.y) + i64::from(target.height));
+
+            // And not strictly inside a different output, whenever the
+            // topology has no overlapping interiors.
+            if interiors_disjoint(&merged_vec) {
+                for (key, other) in &merged {
+                    if *key == target_index as u32 {
+                        continue;
+                    }
+                    let strictly_inside = i64::from(other.x) < gx
+                        && gx < i64::from(other.x) + i64::from(other.width)
+                        && i64::from(other.y) < gy
+                        && gy < i64::from(other.y) + i64::from(other.height);
+                    prop_assert!(
+                        !strictly_inside,
+                        "point ({gx},{gy}) routed into interior of '{}' instead of '{}'",
+                        other.name,
+                        target.name
+                    );
+                }
+            }
+        }
     }
 }

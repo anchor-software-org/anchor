@@ -69,6 +69,9 @@ souvlaki = "0.7"
 tauri = { version = "2", features = ["tray-icon", "image-png", "custom-protocol"] }
 tauri-plugin-single-instance = "2"
 
+[dev-dependencies]
+proptest = "1"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
