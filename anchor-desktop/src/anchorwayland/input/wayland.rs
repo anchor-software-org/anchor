@@ -1530,4 +1530,603 @@ mod coordinate_tests {
 
         assert_eq!(output_layout_bounds(outputs.iter()), (i32::MIN, i32::MIN, u32::MAX, u32::MAX));
     }
+
+    use proptest::prelude::*;
+
+    // Layout coordinates are logical compositor pixels: the output's mode with
+    // transform applied, divided by scale with truncating integer math. Real
+    // wlroots layouts stay within a few thousand px of the origin; bounding
+    // positions at ±1M keeps extents inside u32 while covering absurd cases.
+    const MAX_POS: i32 = 1_000_000;
+    const MAX_DIM: u32 = 100_000;
+
+    /// wlroots-style connector names. A pool of ~20 keeps collisions frequent
+    /// enough to exercise name joins while covering the common prefixes.
+    fn arb_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "eDP-[1-2]",
+            "DP-[1-3]",
+            "HDMI-A-[1-3]",
+            "DVI-I-[1-2]",
+            "HEADLESS-[1-9]",
+            "WL-[1-2]",
+            "X11-[1-2]",
+        ]
+    }
+
+    fn arb_geometry() -> impl Strategy<Value = (i32, i32, u32, u32)> {
+        (-MAX_POS..=MAX_POS, -MAX_POS..=MAX_POS, 0..=MAX_DIM, 0..=MAX_DIM)
+    }
+
+    fn arb_output_info() -> impl Strategy<Value = OutputInfo> {
+        (arb_name(), arb_geometry()).prop_map(|(name, (x, y, width, height))| OutputInfo {
+            name,
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    fn arb_output_geometry() -> impl Strategy<Value = OutputGeometry> {
+        (arb_name(), arb_geometry()).prop_map(|(name, (x, y, width, height))| OutputGeometry {
+            name,
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
+    /// Outputs keyed by object id with unique names: two live outputs can
+    /// never share a Wayland/xdg-output name.
+    fn arb_known_outputs() -> impl Strategy<Value = HashMap<u32, OutputInfo>> {
+        prop::collection::hash_map(arb_name(), arb_geometry(), 0..=6).prop_map(|by_name| {
+            by_name
+                .into_iter()
+                .enumerate()
+                .map(|(id, (name, (x, y, width, height)))| {
+                    (id as u32, OutputInfo { name, x, y, width, height })
+                })
+                .collect()
+        })
+    }
+
+    /// Outputs keyed by arbitrary object ids; duplicate names are allowed
+    /// because the map can transiently hold stale entries.
+    fn arb_output_map() -> impl Strategy<Value = HashMap<u32, OutputInfo>> {
+        prop::collection::hash_map(any::<u32>(), arb_output_info(), 0..=8)
+    }
+
+    /// Topology published by the capture worker. On wlroots, wl_output.geometry
+    /// reports (0,0) for every output, so reported positions are routinely all
+    /// zero; order is capture order and carries no identity.
+    fn arb_reported() -> impl Strategy<Value = Vec<OutputGeometry>> {
+        prop::collection::vec(arb_output_geometry(), 0..=6)
+    }
+
+    /// Reported topologies with unique names — the only kind a compositor can
+    /// produce. With duplicate names, the name join in `merge_output_layout`
+    /// cannot tell same-named outputs apart and is not idempotent.
+    fn arb_reported_unique_names() -> impl Strategy<Value = Vec<OutputGeometry>> {
+        prop::collection::hash_map(arb_name(), arb_geometry(), 0..=6).prop_map(|by_name| {
+            by_name
+                .into_iter()
+                .map(|(name, (x, y, width, height))| OutputGeometry { name, x, y, width, height })
+                .collect()
+        })
+    }
+
+    /// The shape wlroots `output_layout_reconfigure` produces for
+    /// auto-configured outputs (what `swaymsg create_output` makes): a
+    /// horizontal row chained rightward from a start point, sharing one y.
+    fn arb_auto_row() -> impl Strategy<Value = Vec<OutputInfo>> {
+        (
+            -MAX_POS..=MAX_POS / 2,
+            -MAX_POS..=MAX_POS / 2,
+            prop::collection::vec((arb_name(), 1..=MAX_DIM / 4, 1..=MAX_DIM / 4), 1..=6),
+        )
+            .prop_map(|(x0, y0, outputs)| {
+                let mut x = i64::from(x0);
+                outputs
+                    .into_iter()
+                    .map(|(name, width, height)| {
+                        let info = OutputInfo { name, x: x as i32, y: y0, width, height };
+                        x += i64::from(width);
+                        info
+                    })
+                    .collect()
+            })
+    }
+
+    /// A realistic mix: mostly compositor-shaped layouts, occasionally
+    /// arbitrary ones with overlaps and gaps (both legal in wlr_output_layout).
+    fn arb_layout() -> impl Strategy<Value = Vec<OutputInfo>> {
+        prop_oneof![
+            3 => arb_auto_row(),
+            1 => prop::collection::vec(arb_output_info(), 0..=8),
+        ]
+    }
+
+    /// True when no two outputs share interior area; adjacent edges are fine.
+    fn interiors_disjoint(outputs: &[OutputInfo]) -> bool {
+        outputs.iter().enumerate().all(|(i, a)| {
+            outputs.iter().skip(i + 1).all(|b| {
+                let (ax, ay, aw, ah) =
+                    (i64::from(a.x), i64::from(a.y), i64::from(a.width), i64::from(a.height));
+                let (bx, by, bw, bh) =
+                    (i64::from(b.x), i64::from(b.y), i64::from(b.width), i64::from(b.height));
+                ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay
+            })
+        })
+    }
+
+    proptest! {
+        // --- output_layout_bounds --------------------------------------
+
+        /// The bounding box is a union, not a partition: it contains every
+        /// output even when they overlap or leave dead space, and is never
+        /// degenerate.
+        #[test]
+        fn prop_bounds_contain_every_output(outputs in arb_layout()) {
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+
+            prop_assert!(total_w >= 1 && total_h >= 1);
+            let (bx, by, bw, bh) =
+                (i64::from(min_x), i64::from(min_y), i64::from(total_w), i64::from(total_h));
+            for output in &outputs {
+                let (ox, oy, ow, oh) = (
+                    i64::from(output.x),
+                    i64::from(output.y),
+                    i64::from(output.width),
+                    i64::from(output.height),
+                );
+                prop_assert!(ox >= bx && oy >= by);
+                prop_assert!(ox + ow <= bx + bw);
+                prop_assert!(oy + oh <= by + bh);
+            }
+        }
+
+        /// The box is tight: each edge touches some output's edge, matching
+        /// wlr_output_layout_get_box semantics.
+        #[test]
+        fn prop_bounds_are_tight(outputs in arb_layout()) {
+            prop_assume!(!outputs.is_empty());
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+
+            prop_assert_eq!(min_x, outputs.iter().map(|o| o.x).min().unwrap());
+            prop_assert_eq!(min_y, outputs.iter().map(|o| o.y).min().unwrap());
+            let max_x = outputs
+                .iter()
+                .map(|o| i64::from(o.x) + i64::from(o.width))
+                .max()
+                .unwrap();
+            let max_y = outputs
+                .iter()
+                .map(|o| i64::from(o.y) + i64::from(o.height))
+                .max()
+                .unwrap();
+            prop_assert_eq!(i64::from(total_w), max_x - i64::from(min_x));
+            prop_assert_eq!(i64::from(total_h), max_y - i64::from(min_y));
+        }
+
+        /// Iteration order carries no meaning.
+        #[test]
+        fn prop_bounds_ignore_iteration_order(outputs in arb_layout(), rot in any::<usize>()) {
+            let mut rotated = outputs.clone();
+            if !rotated.is_empty() {
+                let n = rotated.len();
+                rotated.rotate_left(rot % n);
+            }
+
+            prop_assert_eq!(
+                output_layout_bounds(outputs.iter()),
+                output_layout_bounds(rotated.iter())
+            );
+        }
+
+        /// Totality: any i32 origin + u32 extent returns without overflow.
+        #[test]
+        fn prop_bounds_never_panics_on_extreme_geometry(
+            outputs in prop::collection::vec(
+                (any::<i32>(), any::<i32>(), any::<u32>(), any::<u32>())
+                    .prop_map(|(x, y, width, height)| OutputInfo {
+                        name: String::new(),
+                        x,
+                        y,
+                        width,
+                        height,
+                    }),
+                0..=8,
+            )
+        ) {
+            let (_, _, total_w, total_h) = output_layout_bounds(outputs.iter());
+            prop_assert!(total_w >= 1 && total_h >= 1);
+        }
+
+        // --- absolute_position_in_layout -------------------------------
+
+        /// Boundedness holds for every normalized input, including NaN and
+        /// infinities, out-of-range values, and zero-size outputs.
+        #[test]
+        fn prop_layout_mapping_stays_in_bounds(
+            outputs in arb_layout(),
+            index in any::<usize>(),
+            xn in any::<f64>(),
+            yn in any::<f64>(),
+        ) {
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+            let target = if outputs.is_empty() {
+                output(0, 0, 0, 0)
+            } else {
+                outputs[index % outputs.len()].clone()
+            };
+
+            let (x, y) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                xn, yn,
+            );
+
+            prop_assert!(x <= total_w);
+            prop_assert!(y <= total_h);
+        }
+
+        /// Endpoint fidelity: 0.0 lands on the output's near edge, 1.0 on its
+        /// far edge, in translated layout space.
+        #[test]
+        fn prop_layout_mapping_hits_output_edges(
+            outputs in arb_layout(),
+            index in any::<usize>(),
+        ) {
+            prop_assume!(!outputs.is_empty());
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+            let target = &outputs[index % outputs.len()];
+
+            let (x0, y0) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                0.0, 0.0,
+            );
+            let (x1, y1) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                1.0, 1.0,
+            );
+
+            prop_assert_eq!(i64::from(x0), i64::from(target.x) - i64::from(min_x));
+            prop_assert_eq!(i64::from(y0), i64::from(target.y) - i64::from(min_y));
+            prop_assert_eq!(
+                i64::from(x1),
+                i64::from(target.x) - i64::from(min_x) + i64::from(target.width)
+            );
+            prop_assert_eq!(
+                i64::from(y1),
+                i64::from(target.y) - i64::from(min_y) + i64::from(target.height)
+            );
+        }
+
+        /// Within [0,1] the mapping never inverts direction.
+        #[test]
+        fn prop_layout_mapping_is_monotonic(
+            outputs in arb_layout(),
+            index in any::<usize>(),
+            x1 in 0f64..=1f64,
+            x2 in 0f64..=1f64,
+            y1 in 0f64..=1f64,
+            y2 in 0f64..=1f64,
+        ) {
+            prop_assume!(!outputs.is_empty());
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+            let target = &outputs[index % outputs.len()];
+
+            let (mx1, my1) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                x1.min(x2), y1.min(y2),
+            );
+            let (mx2, my2) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                x1.max(x2), y1.max(y2),
+            );
+
+            prop_assert!(mx1 <= mx2);
+            prop_assert!(my1 <= my2);
+        }
+
+        /// Translation preserves relative geometry: the same normalized point
+        /// in two same-sized outputs differs by exactly the origin delta.
+        #[test]
+        fn prop_layout_mapping_preserves_relative_offsets(
+            ax in -MAX_POS..=MAX_POS,
+            ay in -MAX_POS..=MAX_POS,
+            bx in -MAX_POS..=MAX_POS,
+            by in -MAX_POS..=MAX_POS,
+            w in 1..=MAX_DIM,
+            h in 1..=MAX_DIM,
+            xn in 0f64..=1f64,
+            yn in 0f64..=1f64,
+        ) {
+            let outputs = [output(ax, ay, w, h), output(bx, by, w, h)];
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(outputs.iter());
+
+            let (mxa, mya) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h, ax, ay, w, h, xn, yn,
+            );
+            let (mxb, myb) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h, bx, by, w, h, xn, yn,
+            );
+
+            prop_assert_eq!(i64::from(mxb) - i64::from(mxa), i64::from(bx) - i64::from(ax));
+            prop_assert_eq!(i64::from(myb) - i64::from(mya), i64::from(by) - i64::from(ay));
+        }
+
+        // --- absolute_position_in_output -------------------------------
+
+        /// Output-local mapping depends only on the output's own extent —
+        /// where it sits in the layout can never leak into the result.
+        #[test]
+        fn prop_output_mapping_stays_in_extent(
+            w in 0..=MAX_DIM,
+            h in 0..=MAX_DIM,
+            xn in any::<f64>(),
+            yn in any::<f64>(),
+        ) {
+            let (x, y) = absolute_position_in_output(w, h, xn, yn);
+
+            prop_assert!(x <= w);
+            prop_assert!(y <= h);
+        }
+
+        #[test]
+        fn prop_output_mapping_is_monotonic_and_exact_at_edges(
+            w in 1..=MAX_DIM,
+            h in 1..=MAX_DIM,
+            x1 in 0f64..=1f64,
+            x2 in 0f64..=1f64,
+        ) {
+            let (xlo, _) = absolute_position_in_output(w, h, x1.min(x2), 0.0);
+            let (xhi, _) = absolute_position_in_output(w, h, x1.max(x2), 0.0);
+            prop_assert!(xlo <= xhi);
+
+            prop_assert_eq!(absolute_position_in_output(w, h, 0.0, 0.0), (0, 0));
+            prop_assert_eq!(absolute_position_in_output(w, h, 1.0, 1.0), (w, h));
+        }
+
+        // --- merge_output_layout ---------------------------------------
+
+        /// Membership is exactly the reported topology; local geometry wins
+        /// for every name the input connection knows, reported geometry fills
+        /// only genuine unknowns.
+        #[test]
+        fn prop_merge_membership_and_geometry_source(
+            known in arb_known_outputs(),
+            reported in arb_reported(),
+        ) {
+            let merged = merge_output_layout(&known, &reported);
+
+            prop_assert_eq!(merged.len(), reported.len());
+            for (index, rep) in reported.iter().enumerate() {
+                let m = &merged[&(index as u32)];
+                prop_assert_eq!(&m.name, &rep.name);
+                if let Some(k) = known.values().find(|k| k.name == rep.name) {
+                    prop_assert_eq!(
+                        (m.x, m.y, m.width, m.height),
+                        (k.x, k.y, k.width, k.height),
+                        "known output '{}' lost its local geometry",
+                        rep.name
+                    );
+                } else {
+                    prop_assert_eq!(
+                        (m.x, m.y, m.width, m.height),
+                        (rep.x, rep.y, rep.width, rep.height)
+                    );
+                }
+            }
+        }
+
+        /// The Sway case: wlroots reports (0,0) in wl_output.geometry for
+        /// every output, so an all-zero reported topology must still resolve
+        /// known outputs to their local positions — reported contributes
+        /// membership, not position.
+        #[test]
+        fn prop_merge_all_zero_reported_keeps_local_positions(
+            known in arb_known_outputs(),
+            reported_names in prop::collection::vec(
+                (arb_name(), 1..=MAX_DIM, 1..=MAX_DIM),
+                0..=6,
+            ),
+        ) {
+            let reported: Vec<OutputGeometry> = reported_names
+                .into_iter()
+                .map(|(name, width, height)| OutputGeometry { name, x: 0, y: 0, width, height })
+                .collect();
+            let merged = merge_output_layout(&known, &reported);
+
+            for (index, rep) in reported.iter().enumerate() {
+                let m = &merged[&(index as u32)];
+                if let Some(k) = known.values().find(|k| k.name == rep.name) {
+                    prop_assert_eq!((m.x, m.y), (k.x, k.y));
+                } else {
+                    prop_assert_eq!((m.x, m.y), (0, 0));
+                }
+            }
+        }
+
+        /// Capture order is not identity: permuting the reported list changes
+        /// only the map keys, never the set of (name, geometry) pairs.
+        #[test]
+        fn prop_merge_ignores_capture_order(
+            known in arb_known_outputs(),
+            reported in arb_reported(),
+            rot in any::<usize>(),
+        ) {
+            let mut rotated = reported.clone();
+            if !rotated.is_empty() {
+                let n = rotated.len();
+                rotated.rotate_left(rot % n);
+            }
+
+            let signature = |map: &HashMap<u32, OutputInfo>| {
+                let mut sig: Vec<_> = map
+                    .values()
+                    .map(|o| (o.name.clone(), o.x, o.y, o.width, o.height))
+                    .collect();
+                sig.sort();
+                sig
+            };
+
+            prop_assert_eq!(
+                signature(&merge_output_layout(&known, &reported)),
+                signature(&merge_output_layout(&known, &rotated))
+            );
+        }
+
+        /// Merging the result again with the same topology is a no-op. Only
+        /// holds for unique-name topologies: with duplicate names the local
+        /// lookup cannot distinguish same-named outputs, so geometry can
+        /// migrate between them on re-merge.
+        #[test]
+        fn prop_merge_is_idempotent(
+            known in arb_known_outputs(),
+            reported in arb_reported_unique_names(),
+        ) {
+            let once = merge_output_layout(&known, &reported);
+            let twice = merge_output_layout(&once, &reported);
+
+            let signature = |map: &HashMap<u32, OutputInfo>| {
+                let mut sig: Vec<_> = map
+                    .values()
+                    .map(|o| (o.name.clone(), o.x, o.y, o.width, o.height))
+                    .collect();
+                sig.sort();
+                sig
+            };
+            prop_assert_eq!(signature(&once), signature(&twice));
+        }
+
+        // --- output selection / origin / stale-target ------------------
+
+        /// Name lookup resolves to an output with that exact name; a miss
+        /// falls back to the lowest-keyed entry, never to a size match.
+        #[test]
+        fn prop_refresh_keeps_name_or_deterministic_fallback(
+            outputs in arb_output_map(),
+            index in any::<usize>(),
+            query in arb_name(),
+        ) {
+            if !outputs.is_empty() {
+                let key = *outputs.keys().nth(index % outputs.len()).unwrap();
+                let named = refreshed_stream_output(&outputs, &outputs[&key].name).unwrap();
+                prop_assert_eq!(named.name.as_str(), outputs[&key].name.as_str());
+            }
+
+            if outputs.values().any(|o| o.name == query) {
+                prop_assert_eq!(
+                    refreshed_stream_output(&outputs, &query).unwrap().name.as_str(),
+                    query.as_str()
+                );
+            } else {
+                let expected =
+                    outputs.iter().min_by_key(|(k, _)| *k).map(|(_, o)| o.name.clone());
+                match (&expected, refreshed_stream_output(&outputs, &query)) {
+                    (Some(expected), Some(found)) => prop_assert_eq!(&found.name, expected),
+                    (None, None) => {}
+                    _ => prop_assert!(false, "fallback mismatch"),
+                }
+            }
+        }
+
+        /// Origin resolution is all-or-nothing on the reported fallback and
+        /// always prefers a local name match.
+        #[test]
+        fn prop_stream_origin_prefers_local_then_reported(
+            outputs in arb_output_map(),
+            name in arb_name(),
+            rx in prop::option::of(any::<i32>()),
+            ry in prop::option::of(any::<i32>()),
+        ) {
+            let (x, y) = stream_output_origin(&outputs, &name, rx, ry);
+
+            if let Some(o) = outputs.values().find(|o| o.name == name) {
+                prop_assert_eq!((x, y), (o.x, o.y));
+            } else if let (Some(rx), Some(ry)) = (rx, ry) {
+                prop_assert_eq!((x, y), (rx, ry));
+            } else {
+                prop_assert_eq!((x, y), (0, 0));
+            }
+        }
+
+        /// Mapped input is accepted only for the exact, non-empty active name.
+        #[test]
+        fn prop_stale_target_rejected_unless_exact_nonempty_match(
+            active in ".*",
+            requested in ".*",
+        ) {
+            prop_assert_eq!(
+                mapped_absolute_target_is_current(&active, &requested),
+                !active.is_empty() && active == requested
+            );
+        }
+
+        // --- end-to-end targeting --------------------------------------
+
+        /// The whole pipeline — merge → bounds → map — lands a normalized
+        /// point inside the expected output's rect, for arbitrary topologies.
+        /// When outputs have disjoint interiors, the point is also never
+        /// strictly inside a different output: the input reaches the display
+        /// the user selected and no other.
+        #[test]
+        fn prop_pipeline_targets_the_expected_output(
+            known in arb_known_outputs(),
+            reported in arb_reported(),
+            index in any::<usize>(),
+            xn in 0f64..=1f64,
+            yn in 0f64..=1f64,
+        ) {
+            prop_assume!(!reported.is_empty());
+            let target_index = index % reported.len();
+
+            let merged = merge_output_layout(&known, &reported);
+            let (min_x, min_y, total_w, total_h) = output_layout_bounds(merged.values());
+            let merged_vec: Vec<OutputInfo> = merged.values().cloned().collect();
+            let target = merged[&(target_index as u32)].clone();
+            prop_assume!(target.width > 0 && target.height > 0);
+
+            let (mx, my) = absolute_position_in_layout(
+                min_x, min_y, total_w, total_h,
+                target.x, target.y, target.width, target.height,
+                xn, yn,
+            );
+
+            prop_assert!(mx <= total_w && my <= total_h);
+
+            // Back in compositor coordinates the point is inside the target.
+            let gx = i64::from(mx) + i64::from(min_x);
+            let gy = i64::from(my) + i64::from(min_y);
+            prop_assert!(gx >= i64::from(target.x) && gx <= i64::from(target.x) + i64::from(target.width));
+            prop_assert!(gy >= i64::from(target.y) && gy <= i64::from(target.y) + i64::from(target.height));
+
+            // And not strictly inside a different output, whenever the
+            // topology has no overlapping interiors.
+            if interiors_disjoint(&merged_vec) {
+                for (key, other) in &merged {
+                    if *key == target_index as u32 {
+                        continue;
+                    }
+                    let strictly_inside = i64::from(other.x) < gx
+                        && gx < i64::from(other.x) + i64::from(other.width)
+                        && i64::from(other.y) < gy
+                        && gy < i64::from(other.y) + i64::from(other.height);
+                    prop_assert!(
+                        !strictly_inside,
+                        "point ({gx},{gy}) routed into interior of '{}' instead of '{}'",
+                        other.name,
+                        target.name
+                    );
+                }
+            }
+        }
+    }
 }
