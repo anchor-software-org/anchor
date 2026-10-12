@@ -10,10 +10,6 @@ import android.graphics.Bitmap
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.anchor.core.AnchorEvent
-import com.anchor.core.AnchorMessage
-import com.anchor.core.AnchorTarget
-import com.anchor.core.MessageBroker
 import com.anchor.core.Plugin
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
@@ -31,7 +27,6 @@ import org.anchor.sdk.AnchorSession
 import org.anchor.sdk.AnchorSessionEvent
 import org.anchor.sdk.InputProtocol
 import org.anchor.sdk.VideoFrameProtocol
-import org.json.JSONObject
 
 private const val TAG = "anchor.remoteinput"
 private const val MIRROR_JPEG_QUALITY = 55
@@ -57,13 +52,11 @@ private const val CONSENT_WATCHDOG_MS = 60_000L
  * capability.
  */
 class RemoteInputPlugin(
-    private val broker: MessageBroker,
     private val context: Context,
 ) : Plugin {
 
     override val pluginId = "remoteinput"
 
-    private var listenJob: Job? = null
     private var sdkScope: CoroutineScope? = null
     private var sdkCapability: AnchorCapability? = null
     private var mirrorJob: Job? = null
@@ -80,24 +73,12 @@ class RemoteInputPlugin(
 
     override fun start(scope: CoroutineScope) {
         sdkScope = scope
-        listenJob = scope.launch {
-            broker.events.collect { event ->
-                if (event.target is AnchorTarget.Service &&
-                    (event.target as AnchorTarget.Service).id == pluginId
-                ) {
-                    handleIncoming(event)
-                }
-            }
-        }
         Log.i(TAG, "RemoteInputPlugin started")
     }
 
     override fun stop() {
-        listenJob?.cancel()
-        listenJob = null
-        mirrorJob?.cancel()
-        mirrorJob = null
         sdkCapability = null
+        stopMirror()
     }
 
     /**
@@ -194,46 +175,6 @@ class RemoteInputPlugin(
         }
     }
 
-    // ── Legacy broker JSON path ────────────────────────────────────────
-
-    private fun handleIncoming(event: AnchorEvent) {
-        val msg = event.message
-        if (msg !is AnchorMessage.Json) return
-        val json = try {
-            JSONObject(msg.payload)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse JSON: ${e.message}")
-            return
-        }
-        val svc = service() ?: return
-
-        when (json.optString("type")) {
-            "remote_tap" -> svc.tap(
-                denorm(json.optDouble("x", 0.0), svc.displaySize().first),
-                denorm(json.optDouble("y", 0.0), svc.displaySize().second)
-            )
-            "remote_pointer_down" -> svc.pointerDown(
-                denorm(json.optDouble("x", 0.0), svc.displaySize().first),
-                denorm(json.optDouble("y", 0.0), svc.displaySize().second)
-            )
-            "remote_pointer_move" -> svc.pointerMove(
-                denorm(json.optDouble("x", 0.0), svc.displaySize().first),
-                denorm(json.optDouble("y", 0.0), svc.displaySize().second)
-            )
-            "remote_pointer_up" -> svc.pointerUp()
-            "remote_scroll" -> svc.scroll(
-                json.optDouble("dx", 0.0).toFloat(),
-                json.optDouble("dy", 0.0).toFloat()
-            )
-            "remote_text" -> svc.commitText(json.optString("text"))
-            "remote_back" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-            "remote_home" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-            "remote_recents" -> svc.globalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
-            "remote_mirror" ->
-                if (json.optBoolean("enabled", true)) startMirror() else stopMirror()
-        }
-    }
-
     // ── Screen mirror ────────────────────────────────────────────────────
     //
     // Mirror frames ride an ANFR datagram flow labelled
@@ -249,10 +190,7 @@ class RemoteInputPlugin(
     private fun startMirror() {
         mirrorWanted = true
         if (videoFlow != null || mirrorJob?.isActive == true) return
-        val capability = sdkCapability ?: run {
-            Log.w(TAG, "mirror requested with no SDK input capability")
-            return
-        }
+        val capability = requireCapability() ?: return
         val service = ScreenCaptureService.instance
         if (service != null) {
             // Video supersedes stills — both ride the same flow type, so the
@@ -394,6 +332,39 @@ class RemoteInputPlugin(
         }
     }
 
+    /** Fragment a frame onto the wire; returns how many packets landed. */
+    private fun sendFramePackets(
+        flow: AnchorDatagramFlow,
+        capabilitySessionId: Long,
+        sequence: Long,
+        presentationTimeUs: Long,
+        codecConfigId: Long,
+        flags: Int,
+        data: ByteArray,
+    ): Int {
+        val packets = runCatching {
+            VideoFrameProtocol.fragmentWithParity(
+                kind = VideoFrameProtocol.KIND_SCREEN,
+                flags = flags,
+                capabilitySessionId = capabilitySessionId,
+                flowId = flow.flowId,
+                sequence = sequence,
+                presentationTimeUs = presentationTimeUs,
+                codecConfigId = codecConfigId,
+                payload = data,
+            )
+        }.getOrElse { error ->
+            Log.w(TAG, "mirror fragment failed: ${error.message}")
+            return 0
+        }
+        var sent = 0
+        for (packet in packets) {
+            if (runCatching { flow.send(packet) }.isSuccess) sent++
+            else Log.w(TAG, "mirror datagram dropped")
+        }
+        return sent
+    }
+
     private fun sendVideoFrame(
         flow: AnchorDatagramFlow,
         capabilitySessionId: Long,
@@ -405,22 +376,9 @@ class RemoteInputPlugin(
         val flags = (if (isKey) VideoFrameProtocol.FLAG_KEYFRAME else 0) or
             (if (isConfig) VideoFrameProtocol.FLAG_CODEC_CONFIG else 0)
         val sequence = videoSequence++
-        runCatching {
-            VideoFrameProtocol.fragmentWithParity(
-                kind = VideoFrameProtocol.KIND_SCREEN,
-                flags = flags,
-                capabilitySessionId = capabilitySessionId,
-                flowId = flow.flowId,
-                sequence = sequence,
-                presentationTimeUs = presentationTimeUs,
-                codecConfigId = 1,
-                payload = data,
-            ).forEach(flow::send)
-            if (sequence % 90L == 0L) {
-                Log.i(TAG, "video mirror frames sent: sequence=$sequence bytes=${data.size} key=$isKey")
-            }
-        }.onFailure { error ->
-            Log.w(TAG, "video mirror send failed: ${error.message}")
+        sendFramePackets(flow, capabilitySessionId, sequence, presentationTimeUs, 1, flags, data)
+        if (sequence % 90L == 0L) {
+            Log.i(TAG, "video mirror frames sent: sequence=$sequence bytes=${data.size} key=$isKey")
         }
     }
 
@@ -431,10 +389,7 @@ class RemoteInputPlugin(
 
     private fun startStillsMirror() {
         if (mirrorJob?.isActive == true) return
-        val capability = sdkCapability ?: run {
-            Log.w(TAG, "mirror requested with no SDK input capability")
-            return
-        }
+        val capability = requireCapability() ?: return
         if (service() == null) {
             Log.w(TAG, "stills mirror requested but accessibility service is not enabled")
             return
@@ -543,31 +498,26 @@ class RemoteInputPlugin(
         presentationTimeUs: Long,
         jpeg: ByteArray,
     ): Boolean {
-        val packets = VideoFrameProtocol.fragmentWithParity(
-            VideoFrameProtocol.KIND_SCREEN,
-            VideoFrameProtocol.FLAG_KEYFRAME,
-            capabilitySessionId,
-            flow.flowId,
-            sequence,
-            presentationTimeUs,
-            0,
-            jpeg,
+        val sent = sendFramePackets(
+            flow, capabilitySessionId, sequence, presentationTimeUs,
+            0, VideoFrameProtocol.FLAG_KEYFRAME, jpeg,
         )
-        var sent = 0
-        for (packet in packets) {
-            val ok = runCatching { flow.send(packet) }.isSuccess
-            if (ok) sent++ else Log.w(TAG, "mirror datagram dropped")
-        }
         if (sequence % 20L == 0L) {
             Log.i(
                 TAG,
-                "mirror frame $sequence: capture=${mirrorCaptureMs}ms encode=${mirrorEncodeMs}ms bytes=${jpeg.size} packets=${packets.size}",
+                "mirror frame $sequence: capture=${mirrorCaptureMs}ms encode=${mirrorEncodeMs}ms bytes=${jpeg.size} packets=$sent",
             )
         }
         return sent > 0
     }
 
     // ── Helpers ────────────────────────────────────────────────────────
+
+    private fun requireCapability(): AnchorCapability? =
+        sdkCapability ?: run {
+            Log.w(TAG, "mirror requested with no SDK input capability")
+            null
+        }
 
     private fun moveAbsolute(nx: Int, ny: Int) {
         val svc = service() ?: return
@@ -579,10 +529,6 @@ class RemoteInputPlugin(
         // contact, matching dispatchGesture semantics).
         svc.pointerMove(x, y)
     }
-
-    /** JSON path sends normalized [0,1]; map to display pixels. */
-    private fun denorm(v: Double, max: Int): Float =
-        (v.toFloat() * (max - 1)).coerceIn(0f, (max - 1).toFloat())
 
     private fun service(): AnchorAccessibilityService? {
         val svc = AnchorAccessibilityService.get()

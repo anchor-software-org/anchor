@@ -388,126 +388,69 @@ fn spawn_forwarding_thread(
     });
 }
 
-fn route_typed_sms_broadcast(
-    binding: &crate::anchorapp::sdk_sms::SdkSmsBinding,
-    bytes: &[u8],
-) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
+/// Generate the broadcast + per-device JSON→typed-record route pair for an
+/// SDK binding. The plugin_id guard mirrors what the device-side plugin
+/// dispatches on; unparseable or unrelated payloads fall through to the
+/// next route.
+macro_rules! typed_routes {
+    ($broadcast:ident, $device:ident, $binding:ty, $send_json:path, $plugin_id:literal) => {
+        fn $broadcast(binding: &$binding, bytes: &[u8]) -> bool {
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return false;
+            };
+            if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some($plugin_id) {
+                return false;
+            }
+            let mut typed = false;
+            for (_, sender) in binding.senders() {
+                typed |= $send_json(&sender, &value);
+            }
+            typed
+        }
+
+        fn $device(binding: &$binding, device_id: &str, bytes: &[u8]) -> bool {
+            let Some(sender) = binding.sender(device_id) else {
+                return false;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return false;
+            };
+            if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some($plugin_id) {
+                return false;
+            }
+            $send_json(&sender, &value)
+        }
     };
-    if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some("smsplugin") {
-        return false;
-    }
-    let mut typed = false;
-    for (_, sender) in binding.senders() {
-        typed |= crate::anchorapp::sdk_sms::send_json(&sender, &value);
-    }
-    typed
 }
 
-fn route_typed_sms_device(
-    binding: &crate::anchorapp::sdk_sms::SdkSmsBinding,
-    device_id: &str,
-    bytes: &[u8],
-) -> bool {
-    let Some(sender) = binding.sender(device_id) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    crate::anchorapp::sdk_sms::send_json(&sender, &value)
-}
-
-fn route_typed_commands_broadcast(
-    binding: &crate::anchorapp::sdk_commands::SdkCommandsBinding,
-    bytes: &[u8],
-) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    let mut typed = false;
-    for (_, sender) in binding.senders() {
-        typed |= crate::anchorapp::sdk_commands::send_json(&sender, &value);
-    }
-    typed
-}
-
-fn route_typed_commands_device(
-    binding: &crate::anchorapp::sdk_commands::SdkCommandsBinding,
-    device_id: &str,
-    bytes: &[u8],
-) -> bool {
-    let Some(sender) = binding.sender(device_id) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    crate::anchorapp::sdk_commands::send_json(&sender, &value)
-}
-
-fn route_typed_camera_broadcast(
-    binding: &crate::anchorapp::sdk_camera::SdkCameraBinding,
-    bytes: &[u8],
-) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    let mut typed = false;
-    for (_, sender) in binding.senders() {
-        typed |= crate::anchorapp::sdk_camera::send_json(&sender, &value);
-    }
-    typed
-}
-
-fn route_typed_camera_device(
-    binding: &crate::anchorapp::sdk_camera::SdkCameraBinding,
-    device_id: &str,
-    bytes: &[u8],
-) -> bool {
-    let Some(sender) = binding.sender(device_id) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    crate::anchorapp::sdk_camera::send_json(&sender, &value)
-}
-
-fn route_typed_remote_input_broadcast(
-    binding: &crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
-    bytes: &[u8],
-) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some("remoteinput") {
-        return false;
-    }
-    let mut typed = false;
-    for (_, sender) in binding.senders() {
-        typed |= crate::anchorapp::sdk_remote_input::send_json(&sender, &value);
-    }
-    typed
-}
-
-fn route_typed_remote_input_device(
-    binding: &crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
-    device_id: &str,
-    bytes: &[u8],
-) -> bool {
-    let Some(sender) = binding.sender(device_id) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return false;
-    };
-    if value.get("plugin_id").and_then(serde_json::Value::as_str) != Some("remoteinput") {
-        return false;
-    }
-    crate::anchorapp::sdk_remote_input::send_json(&sender, &value)
-}
+typed_routes!(
+    route_typed_sms_broadcast,
+    route_typed_sms_device,
+    crate::anchorapp::sdk_sms::SdkSmsBinding,
+    crate::anchorapp::sdk_sms::send_json,
+    "smsplugin"
+);
+typed_routes!(
+    route_typed_commands_broadcast,
+    route_typed_commands_device,
+    crate::anchorapp::sdk_commands::SdkCommandsBinding,
+    crate::anchorapp::sdk_commands::send_json,
+    "commands"
+);
+typed_routes!(
+    route_typed_camera_broadcast,
+    route_typed_camera_device,
+    crate::anchorapp::sdk_camera::SdkCameraBinding,
+    crate::anchorapp::sdk_camera::send_json,
+    "cameraplugin"
+);
+typed_routes!(
+    route_typed_remote_input_broadcast,
+    route_typed_remote_input_device,
+    crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
+    crate::anchorapp::sdk_remote_input::send_json,
+    "remoteinput"
+);
 
 fn route_typed_screen(
     binding: &crate::anchorapp::sdk_screen::SdkScreenBinding,

@@ -26,6 +26,18 @@ fn monotonic_us() -> i64 {
     MONOTONIC_EPOCH.elapsed().as_micros() as i64
 }
 
+/// Spawn a named thread owning a single-thread tokio runtime for `f`.
+fn spawn_io_thread(name: String, f: impl FnOnce(tokio::runtime::Runtime) + Send + 'static) {
+    let log_name = name.clone();
+    thread::Builder::new()
+        .name(name)
+        .spawn(move || match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => f(runtime),
+            Err(error) => log::error!("{log_name} runtime failed: {error}"),
+        })
+        .expect("SDK IO thread must start");
+}
+
 struct InputRecord {
     type_url: &'static str,
     payload: Vec<u8>,
@@ -41,48 +53,37 @@ impl SdkRemoteInputSender {
         // High-rate motion must not build a stale queue: a bounded channel
         // makes `send` drop the oldest-pending behavior cheap at the caller.
         let (tx, rx) = mpsc::sync_channel::<InputRecord>(256);
-        thread::Builder::new()
-            .name("anchor-sdk-remote-input-writer".into())
-            .spawn(move || {
-                let runtime =
-                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            log::error!("SDK remote-input runtime failed: {error}");
-                            return;
-                        }
-                    };
-                for first in rx.iter() {
-                    // Drain whatever queued while the last record was in
-                    // flight, then collapse each run of absolute moves to the
-                    // newest — a drag should never replay stale positions.
-                    let mut batch = vec![first];
-                    while let Ok(next) = rx.try_recv() {
-                        batch.push(next);
-                    }
-                    let mut skip = vec![false; batch.len()];
-                    let mut last_move: Option<usize> = None;
-                    for (i, record) in batch.iter().enumerate() {
-                        if record.type_url == input::POINTER_ABSOLUTE_TYPE_URL
-                            && let Some(prev) = last_move.replace(i)
-                        {
-                            skip[prev] = true;
-                        }
-                    }
-                    for (record, drop) in batch.into_iter().zip(skip) {
-                        if drop {
-                            continue;
-                        }
-                        let result = runtime.block_on(async {
-                            capability.send_record(record.type_url, record.payload).await
-                        });
-                        if let Err(error) = result {
-                            log::warn!("SDK remote-input send failed: {error}");
-                        }
+        spawn_io_thread("anchor-sdk-remote-input-writer".into(), move |runtime| {
+            for first in rx.iter() {
+                // Drain whatever queued while the last record was in
+                // flight, then collapse each run of absolute moves to the
+                // newest — a drag should never replay stale positions.
+                let mut batch = vec![first];
+                while let Ok(next) = rx.try_recv() {
+                    batch.push(next);
+                }
+                let mut skip = vec![false; batch.len()];
+                let mut last_move: Option<usize> = None;
+                for (i, record) in batch.iter().enumerate() {
+                    if record.type_url == input::POINTER_ABSOLUTE_TYPE_URL
+                        && let Some(prev) = last_move.replace(i)
+                    {
+                        skip[prev] = true;
                     }
                 }
-            })
-            .expect("SDK remote-input writer thread must start");
+                for (record, drop) in batch.into_iter().zip(skip) {
+                    if drop {
+                        continue;
+                    }
+                    let result = runtime.block_on(async {
+                        capability.send_record(record.type_url, record.payload).await
+                    });
+                    if let Err(error) = result {
+                        log::warn!("SDK remote-input send failed: {error}");
+                    }
+                }
+            }
+        });
         Self { tx }
     }
 
@@ -250,27 +251,17 @@ impl SdkRemoteInputBinding {
         let frames = Arc::clone(&self.frames);
         let frame_sequence = Arc::clone(&self.frame_sequence);
         let clock_offsets = Arc::clone(&self.clock_offsets);
-        thread::Builder::new()
-            .name(format!("anchor-sdk-mirror-frames-{device_id}"))
-            .spawn(move || {
-                let runtime =
-                    match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                        Ok(runtime) => runtime,
-                        Err(error) => {
-                            log::error!("SDK mirror frame runtime failed: {error}");
-                            return;
-                        }
-                    };
-                let mut assembler = video_frame::Reassembler::default();
-                let mut received = 0_u64;
-                // Smoothed latency for display — per-frame measurements jitter
-                // with the clock-offset error and reassembly timing, so the
-                // badge would flicker nonsense (incl. negatives) without this.
-                let mut latency_ema: Option<f64> = None;
-                // Created lazily on the first non-JPEG payload so the stills
-                // path never pays for an H.264 context it won't use.
-                let mut decoder: Option<MirrorDecoder> = None;
-                runtime.block_on(async move {
+        spawn_io_thread(format!("anchor-sdk-mirror-frames-{device_id}"), move |runtime| {
+            let mut assembler = video_frame::Reassembler::default();
+            let mut received = 0_u64;
+            // Smoothed latency for display — per-frame measurements jitter
+            // with the clock-offset error and reassembly timing, so the
+            // badge would flicker nonsense (incl. negatives) without this.
+            let mut latency_ema: Option<f64> = None;
+            // Created lazily on the first non-JPEG payload so the stills
+            // path never pays for an H.264 context it won't use.
+            let mut decoder: Option<MirrorDecoder> = None;
+            runtime.block_on(async move {
                     loop {
                         let datagram = match flow.recv().await {
                             Ok(datagram) => datagram,
@@ -367,8 +358,7 @@ impl SdkRemoteInputBinding {
                         }
                     }
                 });
-            })
-            .expect("SDK mirror frame thread must start");
+        });
     }
 
     /// Latest mirror frame after `after_sequence` (0 returns the newest).
@@ -445,54 +435,37 @@ mod tests {
         assert!(SdkRemoteInputBinding::default().senders().is_empty());
     }
 
+    /// A device's first watcher starts the stream and the last one stops it;
+    /// every other transition is a no-op, and devices don't share counts.
     #[test]
-    fn watcher_first_enable_starts() {
-        let watchers = MirrorWatchers::default();
-        assert_eq!(watchers.set("dev1", "main", true), Some(true));
+    fn watcher_lifecycle_is_refcounted_per_device() {
+        let w = MirrorWatchers::default();
+        assert_eq!(w.set("dev1", "main", true), Some(true));
+        // Second window on dev1 must not restart the stream.
+        assert_eq!(w.set("dev1", "remote-popout", true), None);
+        // dev2 transitions on its own count.
+        assert_eq!(w.set("dev2", "main", true), Some(true));
+        // Disabling a watcher that never enabled is a no-op.
+        assert_eq!(w.set("dev1", "nobody", false), None);
+        // dev1 keeps running until both windows leave.
+        assert_eq!(w.set("dev1", "main", false), None);
+        assert_eq!(w.set("dev2", "main", false), Some(false));
+        assert_eq!(w.set("dev1", "remote-popout", false), Some(false));
     }
 
+    /// A closed window is dropped from every device it watched; only devices
+    /// left with zero watchers need a STOP record.
     #[test]
-    fn watcher_second_window_does_not_restart() {
-        let watchers = MirrorWatchers::default();
-        watchers.set("dev1", "main", true);
-        assert_eq!(watchers.set("dev1", "remote-popout", true), None);
-    }
-
-    #[test]
-    fn watcher_stop_only_after_last_leaves() {
-        let watchers = MirrorWatchers::default();
-        watchers.set("dev1", "main", true);
-        watchers.set("dev1", "remote-popout", true);
-        assert_eq!(watchers.set("dev1", "main", false), None);
-        assert_eq!(watchers.set("dev1", "remote-popout", false), Some(false));
-    }
-
-    #[test]
-    fn watcher_disable_without_watch_is_noop() {
-        let watchers = MirrorWatchers::default();
-        assert_eq!(watchers.set("dev1", "main", false), None);
-        watchers.set("dev1", "main", true);
-        assert_eq!(watchers.set("dev1", "nobody", false), None);
-    }
-
-    #[test]
-    fn watcher_dropped_empties_everywhere() {
-        let watchers = MirrorWatchers::default();
-        watchers.set("dev1", "remote-popout", true);
-        watchers.set("dev2", "remote-popout", true);
-        watchers.set("dev2", "main", true);
-        let mut emptied = watchers.dropped("remote-popout");
-        emptied.sort();
-        assert_eq!(emptied, vec!["dev1".to_string()]);
+    fn watcher_drop_empties_every_watched_device() {
+        let w = MirrorWatchers::default();
+        w.set("dev1", "remote-popout", true);
+        w.set("dev2", "remote-popout", true);
+        w.set("dev2", "main", true);
+        assert_eq!(w.dropped("remote-popout"), ["dev1"]);
         // dev2 keeps running for "main" — no second start needed.
-        assert_eq!(watchers.set("dev2", "other", true), None);
-    }
-
-    #[test]
-    fn watcher_devices_are_independent() {
-        let watchers = MirrorWatchers::default();
-        watchers.set("dev1", "main", true);
-        assert_eq!(watchers.set("dev2", "main", true), Some(true));
-        assert_eq!(watchers.set("dev1", "main", false), Some(false));
+        assert_eq!(w.set("dev2", "other", true), None);
+        assert_eq!(w.set("dev2", "other", false), None);
+        assert_eq!(w.dropped("main"), ["dev2"]);
+        assert!(w.dropped("ghost").is_empty());
     }
 }

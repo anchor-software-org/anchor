@@ -71,7 +71,7 @@ class AnchorApplication : Application() {
 
     val videoPlugin by lazy { VideoPlugin(broker) }
     val inputPlugin by lazy { InputPlugin(broker) }
-    val remoteInputPlugin by lazy { RemoteInputPlugin(broker, this) }
+    val remoteInputPlugin by lazy { RemoteInputPlugin(this) }
     val clipboardPlugin by lazy { ClipboardPlugin(broker, this) }
     val notificationPlugin by lazy { NotificationPlugin(broker, this) }
     val smsPlugin by lazy { SmsPlugin(broker, this) }

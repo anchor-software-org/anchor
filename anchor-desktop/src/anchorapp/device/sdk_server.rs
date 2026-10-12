@@ -279,173 +279,8 @@ async fn handle_session(
 
     loop {
         match session.next_event().await? {
-            SessionEvent::CapabilityOpenRequested {
-                request_id,
-                capability_session_id,
-                endpoint_id,
-                capability_name,
-                capability_major,
-            } if endpoint_id == clipboard::ENDPOINT_ID
-                && capability_name == clipboard::CAPABILITY_NAME
-                && capability_major == clipboard::CAPABILITY_MAJOR =>
-            {
-                let capability = session
-                    .accept_capability(
-                        request_id,
-                        capability_session_id,
-                        &endpoint_id,
-                        &capability_name,
-                        capability_major,
-                    )
-                    .await?;
-                clipboard_binding.attach(
-                    device_id.clone(),
-                    crate::anchorapp::sdk_clipboard::SdkClipboardSender::new(capability),
-                    node_id(&device_id),
-                );
-                registry.register_sdk_capability(&device_id, &capability_name);
-                log::info!("SDK clipboard capability opened by {device_id}");
-            }
-            SessionEvent::CapabilityOpenRequested {
-                request_id,
-                capability_session_id,
-                endpoint_id,
-                capability_name,
-                capability_major,
-            } if endpoint_id == device::ENDPOINT_ID
-                && capability_name == device::CAPABILITY_NAME
-                && capability_major == device::CAPABILITY_MAJOR =>
-            {
-                let capability = session
-                    .accept_capability(
-                        request_id,
-                        capability_session_id,
-                        &endpoint_id,
-                        &capability_name,
-                        capability_major,
-                    )
-                    .await?;
-                registry.register_sdk_capability(&device_id, &capability_name);
-                device_binding.attach(device_id.clone(), SdkDeviceSender::new(capability));
-                device_sessions.insert(capability_session_id);
-                log::info!("SDK device capability opened by {device_id}");
-            }
-            SessionEvent::CapabilityOpenRequested {
-                request_id,
-                capability_session_id,
-                endpoint_id,
-                capability_name,
-                capability_major,
-            } if endpoint_id == notifications::ENDPOINT_ID
-                && capability_name == notifications::CAPABILITY_NAME
-                && capability_major == notifications::CAPABILITY_MAJOR =>
-            {
-                let capability = session
-                    .accept_capability(
-                        request_id,
-                        capability_session_id,
-                        &endpoint_id,
-                        &capability_name,
-                        capability_major,
-                    )
-                    .await?;
-                notifications_binding
-                    .attach(device_id.clone(), SdkNotificationsSender::new(capability));
-                registry.register_sdk_capability(&device_id, &capability_name);
-                log::info!("SDK notifications capability opened by {device_id}");
-            }
-            SessionEvent::CapabilityOpenRequested {
-                request_id,
-                capability_session_id,
-                endpoint_id,
-                capability_name,
-                capability_major,
-            } if endpoint_id == input::ENDPOINT_ID
-                && capability_name == input::CAPABILITY_NAME
-                && capability_major == input::CAPABILITY_MAJOR =>
-            {
-                let capability = session
-                    .accept_capability(
-                        request_id,
-                        capability_session_id,
-                        &endpoint_id,
-                        &capability_name,
-                        capability_major,
-                    )
-                    .await?;
-                input_sessions.insert(capability_session_id);
-                // The accepted capability doubles as the desktop→phone remote
-                // control channel; the sender keeps records ordered on its own
-                // writer thread.
-                let sender = SdkRemoteInputSender::new(capability);
-                remote_input_binding.attach(device_id.clone(), sender.clone());
-                {
-                    // Clock-sync probe: ping every 2 s so mirrored frames can
-                    // be aged end-to-end. Ends when the session closes and the
-                    // sender channel dies.
-                    let ping_sender = sender.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_secs(1));
-                        while ping_sender.ping() {
-                            thread::sleep(Duration::from_secs(2));
-                        }
-                    });
-                }
-                if std::env::var_os("ANCHOR_REMOTE_INPUT_DEMO").is_some() {
-                    thread::spawn(move || {
-                        // Wait for the capability to settle, start the stills
-                        // mirror once via the RemoteControl record path, then
-                        // send a home press every 5 s so the wire path can be
-                        // verified by watching the phone bounce to the launcher.
-                        thread::sleep(Duration::from_secs(2));
-                        let ok = crate::anchorapp::sdk_remote_input::send_json(
-                            &sender,
-                            &serde_json::json!({
-                                "plugin_id": "remoteinput",
-                                "type": "remote_mirror",
-                                "enabled": true,
-                            }),
-                        );
-                        log::info!("ANCHOR_REMOTE_INPUT_DEMO mirror -> {ok}");
-                        loop {
-                            let ok = crate::anchorapp::sdk_remote_input::send_json(
-                                &sender,
-                                &serde_json::json!({
-                                    "plugin_id": "remoteinput",
-                                    "type": "remote_home",
-                                }),
-                            );
-                            log::info!("ANCHOR_REMOTE_INPUT_DEMO home -> {ok}");
-                            thread::sleep(Duration::from_secs(5));
-                        }
-                    });
-                }
-                registry.register_sdk_capability(&device_id, &capability_name);
-                log::info!("SDK input capability opened by {device_id}");
-            }
-            SessionEvent::CapabilityOpenRequested {
-                request_id,
-                capability_session_id,
-                endpoint_id,
-                capability_name,
-                capability_major,
-            } if endpoint_id == media::ENDPOINT_ID
-                && capability_name == media::CAPABILITY_NAME
-                && capability_major == media::CAPABILITY_MAJOR =>
-            {
-                let capability = session
-                    .accept_capability(
-                        request_id,
-                        capability_session_id,
-                        &endpoint_id,
-                        &capability_name,
-                        capability_major,
-                    )
-                    .await?;
-                media_binding.attach(device_id.clone(), SdkMediaSender::new(capability));
-                registry.register_sdk_capability(&device_id, &capability_name);
-                log::info!("SDK media capability opened by {device_id}");
-            }
+            // All capabilities share the io.anchor.desktop endpoint at major
+            // 1 — accept once, then dispatch the per-capability wiring.
             SessionEvent::CapabilityOpenRequested {
                 request_id,
                 capability_session_id,
@@ -456,7 +291,12 @@ async fn handle_session(
                 && capability_major == 1
                 && matches!(
                     capability_name.as_str(),
-                    screen::CAPABILITY_NAME
+                    clipboard::CAPABILITY_NAME
+                        | device::CAPABILITY_NAME
+                        | notifications::CAPABILITY_NAME
+                        | input::CAPABILITY_NAME
+                        | media::CAPABILITY_NAME
+                        | screen::CAPABILITY_NAME
                         | camera::CAPABILITY_NAME
                         | files::CAPABILITY_NAME
                         | sms::CAPABILITY_NAME
@@ -474,28 +314,72 @@ async fn handle_session(
                     .await?;
                 registry.register_sdk_capability(&device_id, &capability_name);
                 log::info!("SDK {capability_name} capability opened by {device_id}");
-                if capability_name == screen::CAPABILITY_NAME {
-                    let sender = SdkScreenSender::new(capability);
-                    screen_sessions.insert(capability_session_id);
-                    screen_binding.attach_device(device_id.clone(), sender);
-                } else if capability_name == files::CAPABILITY_NAME {
-                    file_sessions.insert(capability_session_id);
-                    file_capabilities.insert(capability_session_id, capability.clone());
-                    files_binding.attach(device_id.clone(), SdkFilesSender::new(capability));
-                } else if capability_name == sms::CAPABILITY_NAME {
-                    sms_binding.attach(device_id.clone(), SdkSmsSender::new(capability));
-                } else if capability_name == commands::CAPABILITY_NAME {
-                    command_sessions.insert(capability_session_id);
-                    commands_binding.attach(device_id.clone(), SdkCommandsSender::new(capability));
-                    let _ = broker_tx.send(AnchorEvent {
-                        target: AnchorTarget::Service("commands".into()),
-                        message: AnchorMessage::Json(
-                            serde_json::json!({"plugin_id":"commands", "type":"list"}).to_string(),
-                        ),
-                    });
-                } else if capability_name == camera::CAPABILITY_NAME {
-                    camera_sessions.insert(capability_session_id);
-                    camera_binding.attach(device_id.clone(), SdkCameraSender::new(capability));
+                match capability_name.as_str() {
+                    clipboard::CAPABILITY_NAME => clipboard_binding.attach(
+                        device_id.clone(),
+                        crate::anchorapp::sdk_clipboard::SdkClipboardSender::new(capability),
+                        node_id(&device_id),
+                    ),
+                    device::CAPABILITY_NAME => {
+                        device_binding.attach(device_id.clone(), SdkDeviceSender::new(capability));
+                        device_sessions.insert(capability_session_id);
+                    }
+                    notifications::CAPABILITY_NAME => notifications_binding
+                        .attach(device_id.clone(), SdkNotificationsSender::new(capability)),
+                    media::CAPABILITY_NAME => {
+                        media_binding.attach(device_id.clone(), SdkMediaSender::new(capability))
+                    }
+                    sms::CAPABILITY_NAME => {
+                        sms_binding.attach(device_id.clone(), SdkSmsSender::new(capability))
+                    }
+                    screen::CAPABILITY_NAME => {
+                        screen_sessions.insert(capability_session_id);
+                        screen_binding
+                            .attach_device(device_id.clone(), SdkScreenSender::new(capability));
+                    }
+                    camera::CAPABILITY_NAME => {
+                        camera_sessions.insert(capability_session_id);
+                        camera_binding.attach(device_id.clone(), SdkCameraSender::new(capability));
+                    }
+                    files::CAPABILITY_NAME => {
+                        file_sessions.insert(capability_session_id);
+                        file_capabilities.insert(capability_session_id, capability.clone());
+                        files_binding.attach(device_id.clone(), SdkFilesSender::new(capability));
+                    }
+                    commands::CAPABILITY_NAME => {
+                        command_sessions.insert(capability_session_id);
+                        commands_binding
+                            .attach(device_id.clone(), SdkCommandsSender::new(capability));
+                        let _ = broker_tx.send(AnchorEvent {
+                            target: AnchorTarget::Service("commands".into()),
+                            message: AnchorMessage::Json(
+                                serde_json::json!({"plugin_id":"commands", "type":"list"})
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                    input::CAPABILITY_NAME => {
+                        input_sessions.insert(capability_session_id);
+                        // The accepted capability doubles as the desktop→phone
+                        // remote-control channel; the sender keeps records
+                        // ordered on its own writer thread.
+                        let sender = SdkRemoteInputSender::new(capability);
+                        remote_input_binding.attach(device_id.clone(), sender.clone());
+                        // Clock-sync probe: ping every 2 s so mirrored frames
+                        // can be aged end-to-end. Ends when the session closes
+                        // and the sender channel dies.
+                        let ping_sender = sender.clone();
+                        thread::spawn(move || {
+                            thread::sleep(Duration::from_secs(1));
+                            while ping_sender.ping() {
+                                thread::sleep(Duration::from_secs(2));
+                            }
+                        });
+                        if std::env::var_os("ANCHOR_REMOTE_INPUT_DEMO").is_some() {
+                            spawn_remote_input_demo(sender);
+                        }
+                    }
+                    _ => unreachable!("capability name was matched in the arm guard"),
                 }
             }
             SessionEvent::CapabilityRecord { capability_session_id, type_url, payload }
@@ -1453,6 +1337,27 @@ fn session_identity(identity: &AnchorIdentity) -> SessionIdentity {
 
 fn node_id(device_id: &str) -> [u8; 32] {
     Sha256::digest(device_id.as_bytes()).into()
+}
+
+/// ANCHOR_REMOTE_INPUT_DEMO wire check: start the mirror once via the
+/// RemoteControl record path, then send a home press every 5 s so the path
+/// can be verified by watching the phone bounce to the launcher.
+fn spawn_remote_input_demo(sender: SdkRemoteInputSender) {
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        let send = |value: serde_json::Value| {
+            let ok = crate::anchorapp::sdk_remote_input::send_json(&sender, &value);
+            log::info!("ANCHOR_REMOTE_INPUT_DEMO {} -> {ok}", value["type"]);
+            ok
+        };
+        send(
+            serde_json::json!({"plugin_id": "remoteinput", "type": "remote_mirror", "enabled": true}),
+        );
+        loop {
+            send(serde_json::json!({"plugin_id": "remoteinput", "type": "remote_home"}));
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
 }
 
 fn now_ms() -> u64 {

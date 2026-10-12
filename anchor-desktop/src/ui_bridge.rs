@@ -1131,12 +1131,19 @@ impl DesktopController {
         }
     }
 
+    /// Stamp the remoteinput plugin id onto a control payload and route it.
+    fn remote_send(
+        &self,
+        device_id: Option<String>,
+        mut value: serde_json::Value,
+    ) -> Result<(), String> {
+        value["plugin_id"] = serde_json::json!("remoteinput");
+        self.send_json(self.remote_target(device_id.as_deref())?, value)
+    }
+
     /// Remote-control a connected phone: tap at normalized [0,1] coordinates.
     pub fn remote_tap(&self, device_id: Option<String>, x: f64, y: f64) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_tap", "x": x, "y": y }),
-        )
+        self.remote_send(device_id, serde_json::json!({"type": "remote_tap", "x": x, "y": y}))
     }
 
     pub fn remote_pointer_down(
@@ -1145,9 +1152,9 @@ impl DesktopController {
         x: f64,
         y: f64,
     ) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_down", "x": x, "y": y }),
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_pointer_down", "x": x, "y": y}),
         )
     }
 
@@ -1157,31 +1164,25 @@ impl DesktopController {
         x: f64,
         y: f64,
     ) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_move", "x": x, "y": y }),
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_pointer_move", "x": x, "y": y}),
         )
     }
 
     pub fn remote_pointer_up(&self, device_id: Option<String>) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_up" }),
-        )
+        self.remote_send(device_id, serde_json::json!({"type": "remote_pointer_up"}))
     }
 
     pub fn remote_scroll(&self, device_id: Option<String>, dx: f64, dy: f64) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_scroll", "dx": dx, "dy": dy }),
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_scroll", "dx": dx, "dy": dy}),
         )
     }
 
     pub fn remote_text(&self, device_id: Option<String>, text: String) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_text", "text": text }),
-        )
+        self.remote_send(device_id, serde_json::json!({"type": "remote_text", "text": text}))
     }
 
     /// Send a USB HID usage to the phone's remote-input service.
@@ -1191,23 +1192,17 @@ impl DesktopController {
         usage: u32,
         pressed: bool,
     ) -> Result<(), String> {
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_key", "usage": usage, "pressed": pressed }),
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_key", "usage": usage, "pressed": pressed}),
         )
     }
 
     pub fn remote_nav(&self, device_id: Option<String>, action: &str) -> Result<(), String> {
-        let kind = match action {
-            "back" => "remote_back",
-            "home" => "remote_home",
-            "recents" => "remote_recents",
-            _ => return Err("Unsupported remote nav action.".into()),
-        };
-        self.send_json(
-            self.remote_target(device_id.as_deref())?,
-            serde_json::json!({ "plugin_id": "remoteinput", "type": kind }),
-        )
+        if !matches!(action, "back" | "home" | "recents") {
+            return Err("Unsupported remote nav action.".into());
+        }
+        self.remote_send(device_id, serde_json::json!({"type": format!("remote_{action}")}))
     }
 
     /// A window asks for the remote mirror. The phone is told to start only
@@ -1229,10 +1224,7 @@ impl DesktopController {
         let device_key = device_id.clone().unwrap_or_default();
         let transition = self.remote_mirror_watchers.set(&device_key, watcher, enabled);
         if transition.is_some() {
-            self.send_json(
-                target,
-                serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_mirror", "enabled": enabled }),
-            )?;
+            self.send_json(target, remote_mirror_json(enabled))?;
         }
         Ok(())
     }
@@ -1245,10 +1237,7 @@ impl DesktopController {
             } else {
                 AnchorTarget::DeviceId(device_key)
             };
-            let _ = self.send_json(
-                target,
-                serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_mirror", "enabled": false }),
-            );
+            let _ = self.send_json(target, remote_mirror_json(false));
         }
     }
 
@@ -1773,6 +1762,10 @@ fn unique_destination(folder: &Path, file_name: &str) -> PathBuf {
         }
     }
     folder.join(format!("{stem}-{}", now_ms()))
+}
+
+fn remote_mirror_json(enabled: bool) -> serde_json::Value {
+    serde_json::json!({"plugin_id": "remoteinput", "type": "remote_mirror", "enabled": enabled})
 }
 
 fn certificate_fingerprint(certificate_pem: &str) -> String {

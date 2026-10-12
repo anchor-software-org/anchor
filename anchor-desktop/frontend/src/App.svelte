@@ -388,10 +388,7 @@
     void remoteScroll(event.deltaX, event.deltaY, remoteDeviceId || undefined);
   };
 
-  const changeRemoteDevice = (id: string) => {
-    if (id === remoteDeviceId) return;
-    const previous = remoteDeviceId;
-    remoteDeviceId = id;
+  const resetRemoteView = () => {
     remoteMirrorUrl = '';
     remoteMirrorSeq = 0;
     remoteNaturalWidth = 0;
@@ -399,6 +396,13 @@
     remoteMirrorWidth = 0;
     remoteMirrorHeight = 0;
     remotePopoutFitAspect = 0;
+  };
+
+  const changeRemoteDevice = (id: string) => {
+    if (id === remoteDeviceId) return;
+    const previous = remoteDeviceId;
+    remoteDeviceId = id;
+    resetRemoteView();
     if (remoteMirrorOn) {
       // Move this window's watch to the new device — another window still
       // watching the old one keeps its stream alive via the refcount.
@@ -521,13 +525,7 @@
             // The popout re-arms on the next device below; the main pane
             // requires a fresh explicit Mirror press.
             void remoteMirror(false, previous);
-            remoteMirrorUrl = '';
-            remoteMirrorSeq = 0;
-            remoteNaturalWidth = 0;
-            remoteNaturalHeight = 0;
-            remoteMirrorWidth = 0;
-            remoteMirrorHeight = 0;
-            remotePopoutFitAspect = 0;
+            resetRemoteView();
             if (!remotePopoutWindow) remoteMirrorOn = false;
           }
         }

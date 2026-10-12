@@ -161,12 +161,7 @@ class ScreenCaptureService : Service() {
     /** Swap the encoder+surface inside the same virtual display. */
     private fun restartEncoder() {
         val display = virtualDisplay ?: return
-        runCatching { encoder?.stop() }
-        runCatching { encoder?.release() }
-        encoder = null
-        codecConfig = null
-        encoderThread?.quitSafely()
-        encoderThread = null
+        releaseEncoder()
 
         val (width, height) = displaySize()
         val (codec, surface) = createEncoder(width, height)
@@ -174,6 +169,15 @@ class ScreenCaptureService : Service() {
         display.resize(width, height, resources.displayMetrics.densityDpi)
         display.surface = surface
         Log.i(TAG, "capture resized to ${width}x${height} on rotation")
+    }
+
+    private fun releaseEncoder() {
+        runCatching { encoder?.stop() }
+        runCatching { encoder?.release() }
+        encoder = null
+        codecConfig = null
+        encoderThread?.quitSafely()
+        encoderThread = null
     }
 
     private fun startForegroundWithType() {
@@ -319,38 +323,22 @@ class ScreenCaptureService : Service() {
 
     private fun handleEncoderOutput(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
         try {
-            if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                val buf = codec.getOutputBuffer(index)
-                if (buf != null && info.size > 0) {
-                    val cfg = ByteArray(info.size)
-                    buf.position(info.offset)
-                    buf.get(cfg)
-                    codecConfig = cfg
-                    frameSink?.invoke(cfg, false, true, translatePts(info.presentationTimeUs))
-                    // A sink attached before this AU arrived asked to be
-                    // replayed — deliver now that the config exists.
-                    if (configEmitPending) {
-                        configEmitPending = false
-                        frameSink?.invoke(cfg, false, true, translatePts(info.presentationTimeUs))
-                    }
-                }
-                codec.releaseOutputBuffer(index, false)
-                return
+            val data = codec.getOutputBuffer(index)?.takeIf { info.size > 0 }?.let { buf ->
+                ByteArray(info.size).also { buf.position(info.offset); buf.get(it) }
             }
-            if (info.size <= 0) {
-                codec.releaseOutputBuffer(index, false)
-                return
-            }
-            val buf = codec.getOutputBuffer(index)
-            if (buf == null) {
-                codec.releaseOutputBuffer(index, false)
-                return
-            }
-            val data = ByteArray(info.size)
-            buf.position(info.offset)
-            buf.get(data)
             codec.releaseOutputBuffer(index, false)
-
+            if (data == null) return
+            if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
+                codecConfig = data
+                frameSink?.invoke(data, false, true, translatePts(info.presentationTimeUs))
+                // A sink attached before this AU arrived asked to be
+                // replayed — deliver now that the config exists.
+                if (configEmitPending) {
+                    configEmitPending = false
+                    frameSink?.invoke(data, false, true, translatePts(info.presentationTimeUs))
+                }
+                return
+            }
             // BUFFER_FLAG_KEY_FRAME is unreliable on some encoders (this
             // Qualcomm part never sets it) — detect the IDR NAL directly so
             // SPS/PPS still gets prepended for late-joining decoders.
@@ -410,10 +398,7 @@ class ScreenCaptureService : Service() {
         frameSink = null
         runCatching { virtualDisplay?.release() }
         virtualDisplay = null
-        runCatching { encoder?.stop() }
-        runCatching { encoder?.release() }
-        encoder = null
-        codecConfig = null
+        releaseEncoder()
         displayListener?.let {
             runCatching {
                 getSystemService(DisplayManager::class.java).unregisterDisplayListener(it)
@@ -422,8 +407,6 @@ class ScreenCaptureService : Service() {
         displayListener = null
         runCatching { projection?.stop() }
         projection = null
-        encoderThread?.quitSafely()
-        encoderThread = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.i(TAG, "capture stopped")
