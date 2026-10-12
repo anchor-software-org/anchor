@@ -496,10 +496,8 @@ impl DesktopController {
                     let camera_capable = camera_devices.contains(&device.device_id);
                     let display_size = display_sizes.get(&device.device_id).copied();
                     let battery = mobile_batteries.get(&device.device_id);
-                    let capabilities = device_capabilities
-                        .get(&device.device_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let capabilities =
+                        device_capabilities.get(&device.device_id).cloned().unwrap_or_default();
                     PairedDeviceSummary {
                         id: device.device_id,
                         name: device.device_name,
@@ -1141,14 +1139,24 @@ impl DesktopController {
         )
     }
 
-    pub fn remote_pointer_down(&self, device_id: Option<String>, x: f64, y: f64) -> Result<(), String> {
+    pub fn remote_pointer_down(
+        &self,
+        device_id: Option<String>,
+        x: f64,
+        y: f64,
+    ) -> Result<(), String> {
         self.send_json(
             self.remote_target(device_id.as_deref())?,
             serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_down", "x": x, "y": y }),
         )
     }
 
-    pub fn remote_pointer_move(&self, device_id: Option<String>, x: f64, y: f64) -> Result<(), String> {
+    pub fn remote_pointer_move(
+        &self,
+        device_id: Option<String>,
+        x: f64,
+        y: f64,
+    ) -> Result<(), String> {
         self.send_json(
             self.remote_target(device_id.as_deref())?,
             serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_pointer_move", "x": x, "y": y }),
@@ -1177,7 +1185,12 @@ impl DesktopController {
     }
 
     /// Send a USB HID usage to the phone's remote-input service.
-    pub fn remote_key(&self, device_id: Option<String>, usage: u32, pressed: bool) -> Result<(), String> {
+    pub fn remote_key(
+        &self,
+        device_id: Option<String>,
+        usage: u32,
+        pressed: bool,
+    ) -> Result<(), String> {
         self.send_json(
             self.remote_target(device_id.as_deref())?,
             serde_json::json!({ "plugin_id": "remoteinput", "type": "remote_key", "usage": usage, "pressed": pressed }),
@@ -1200,7 +1213,12 @@ impl DesktopController {
     /// A window asks for the remote mirror. The phone is told to start only
     /// on the first watcher for a device and to stop when the last one
     /// leaves — the main pane and the popout can share one stream.
-    pub fn remote_mirror(&self, watcher: &str, device_id: Option<String>, enabled: bool) -> Result<(), String> {
+    pub fn remote_mirror(
+        &self,
+        watcher: &str,
+        device_id: Option<String>,
+        enabled: bool,
+    ) -> Result<(), String> {
         // Enabling against a missing device must fail before we record
         // intent; disabling is best-effort so teardown always lands.
         let target = match self.remote_target(device_id.as_deref()) {
@@ -1209,9 +1227,7 @@ impl DesktopController {
             Err(_) => AnchorTarget::Device,
         };
         let device_key = device_id.clone().unwrap_or_default();
-        let transition = self
-            .remote_mirror_watchers
-            .set(&device_key, watcher, enabled);
+        let transition = self.remote_mirror_watchers.set(&device_key, watcher, enabled);
         if transition.is_some() {
             self.send_json(
                 target,
@@ -1239,7 +1255,11 @@ impl DesktopController {
     /// Newest mirror frame after `after_sequence` — per-device when an id is
     /// given so a second phone can't interleave frames into the view.
     /// The payload is already JPEG, so the data URL is built without a decode.
-    pub fn remote_frame(&self, device_id: Option<String>, after_sequence: u64) -> Option<ScreenPreview> {
+    pub fn remote_frame(
+        &self,
+        device_id: Option<String>,
+        after_sequence: u64,
+    ) -> Option<ScreenPreview> {
         let frame = match device_id.as_deref() {
             Some(id) => self.remote_input.frame_after(id, after_sequence),
             None => self.remote_input.latest_frame(after_sequence),

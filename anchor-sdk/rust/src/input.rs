@@ -126,9 +126,7 @@ pub fn decode_remote_control(
 pub fn encode_ping(sent_time_us: i64) -> Vec<u8> {
     v1::capabilities::input::InputPing { sent_time_us }.encode_to_vec()
 }
-pub fn decode_pong(
-    bytes: &[u8],
-) -> Result<v1::capabilities::input::InputPong, prost::DecodeError> {
+pub fn decode_pong(bytes: &[u8]) -> Result<v1::capabilities::input::InputPong, prost::DecodeError> {
     v1::capabilities::input::InputPong::decode(bytes)
 }
 

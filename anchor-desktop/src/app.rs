@@ -139,8 +139,7 @@ impl AnchorAppInstance {
         let sdk_commands = crate::anchorapp::sdk_commands::SdkCommandsBinding::default();
         let sdk_camera = crate::anchorapp::sdk_camera::SdkCameraBinding::default();
         let sdk_device = crate::anchorapp::sdk_device::SdkDeviceBinding::default();
-        let sdk_remote_input =
-            crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding::default();
+        let sdk_remote_input = crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding::default();
         let device_manager = DeviceManager::new(
             config_dir,
             broker_tx.clone(),

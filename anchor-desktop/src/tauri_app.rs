@@ -193,9 +193,7 @@ fn remote_popout(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn remote_popout_fit(app: tauri::AppHandle, width: f64, height: f64) {
     if let Some(window) = app.get_webview_window("remote-popout") {
-        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(
-            width, height,
-        )));
+        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width, height)));
     }
 }
 

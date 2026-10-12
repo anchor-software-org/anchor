@@ -63,10 +63,10 @@ impl SdkRemoteInputSender {
                     let mut skip = vec![false; batch.len()];
                     let mut last_move: Option<usize> = None;
                     for (i, record) in batch.iter().enumerate() {
-                        if record.type_url == input::POINTER_ABSOLUTE_TYPE_URL {
-                            if let Some(prev) = last_move.replace(i) {
-                                skip[prev] = true;
-                            }
+                        if record.type_url == input::POINTER_ABSOLUTE_TYPE_URL
+                            && let Some(prev) = last_move.replace(i)
+                        {
+                            skip[prev] = true;
                         }
                     }
                     for (record, drop) in batch.into_iter().zip(skip) {
@@ -87,25 +87,17 @@ impl SdkRemoteInputSender {
     }
 
     fn send(&self, type_url: &'static str, payload: Vec<u8>) -> bool {
-        self.tx
-            .try_send(InputRecord { type_url, payload })
-            .is_ok()
+        self.tx.try_send(InputRecord { type_url, payload }).is_ok()
     }
 
     fn move_absolute(&self, x_norm: f64, y_norm: f64) -> bool {
         let x = (x_norm.clamp(0.0, 1.0) * 65535.0).round() as u32;
         let y = (y_norm.clamp(0.0, 1.0) * 65535.0).round() as u32;
-        self.send(
-            input::POINTER_ABSOLUTE_TYPE_URL,
-            input::encode_pointer_absolute(x, y, ""),
-        )
+        self.send(input::POINTER_ABSOLUTE_TYPE_URL, input::encode_pointer_absolute(x, y, ""))
     }
 
     fn pointer_button(&self, button: i32, pressed: bool) -> bool {
-        self.send(
-            input::POINTER_BUTTON_TYPE_URL,
-            input::encode_pointer_button(button, pressed),
-        )
+        self.send(input::POINTER_BUTTON_TYPE_URL, input::encode_pointer_button(button, pressed))
     }
 
     fn tap(&self, x_norm: f64, y_norm: f64) -> bool {
@@ -115,10 +107,7 @@ impl SdkRemoteInputSender {
     }
 
     fn remote_control(&self, kind: i32) -> bool {
-        self.send(
-            input::REMOTE_CONTROL_TYPE_URL,
-            input::encode_remote_control(kind),
-        )
+        self.send(input::REMOTE_CONTROL_TYPE_URL, input::encode_remote_control(kind))
     }
 
     /// Latency probe — the device echoes this with its own monotonic
@@ -242,9 +231,7 @@ impl SdkRemoteInputBinding {
         // roughly pong.sent + RTT/2.
         let offset = now - (pong.sent_time_us + rtt_us / 2);
         let mut offsets = self.clock_offsets.lock().unwrap();
-        let keep = offsets
-            .get(device_id)
-            .is_none_or(|&(_, best_rtt)| rtt_us <= best_rtt);
+        let keep = offsets.get(device_id).is_none_or(|&(_, best_rtt)| rtt_us <= best_rtt);
         if keep {
             offsets.insert(device_id.to_string(), (offset, rtt_us));
         }
@@ -418,27 +405,19 @@ pub fn send_json(sender: &SdkRemoteInputSender, value: &serde_json::Value) -> bo
         }
         "remote_pointer_move" => sender.move_absolute(num("x"), num("y")),
         "remote_pointer_up" => sender.pointer_button(POINTER_BUTTON_LEFT, false),
-        "remote_scroll" => sender.send(
-            input::SCROLL_TYPE_URL,
-            input::encode_scroll(num("dx") as i32, num("dy") as i32),
-        ),
+        "remote_scroll" => sender
+            .send(input::SCROLL_TYPE_URL, input::encode_scroll(num("dx") as i32, num("dy") as i32)),
         "remote_text" => sender.send(
             input::TEXT_TYPE_URL,
             input::encode_text(
-                value
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
+                value.get("text").and_then(serde_json::Value::as_str).unwrap_or_default(),
             ),
         ),
         "remote_key" => sender.send(
             input::KEY_TYPE_URL,
             input::encode_key(
                 num("usage") as u32,
-                value
-                    .get("pressed")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true),
+                value.get("pressed").and_then(serde_json::Value::as_bool).unwrap_or(true),
             ),
         ),
         // Navigation actions have no HID usage — they ride RemoteControl.
@@ -446,11 +425,7 @@ pub fn send_json(sender: &SdkRemoteInputSender, value: &serde_json::Value) -> bo
         "remote_home" => sender.remote_control(input::REMOTE_CONTROL_HOME),
         "remote_recents" => sender.remote_control(input::REMOTE_CONTROL_RECENTS),
         "remote_mirror" => sender.remote_control(
-            if value
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true)
-            {
+            if value.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(true) {
                 input::REMOTE_CONTROL_MIRROR_START
             } else {
                 input::REMOTE_CONTROL_MIRROR_STOP

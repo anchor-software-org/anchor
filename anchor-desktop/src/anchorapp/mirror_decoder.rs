@@ -52,7 +52,7 @@ impl MirrorDecoder {
             // partial frames after fragment loss rather than stalling the
             // reference chain until the next keyframe.
             (*ctx).flags |= ffi::AV_CODEC_FLAG_OUTPUT_CORRUPT as i32;
-            (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL as i32;
+            (*ctx).flags2 |= ffi::AV_CODEC_FLAG2_SHOW_ALL;
             (*ctx).err_recognition = 0;
             if ffi::avcodec_open2(ctx, codec, std::ptr::null_mut()) < 0 {
                 ffi::avcodec_free_context(&mut (ctx as *mut _));
@@ -149,16 +149,7 @@ impl MirrorDecoder {
                     return None;
                 }
                 let coeffs = ffi::sws_getCoefficients((*self.frame).colorspace as i32);
-                ffi::sws_setColorspaceDetails(
-                    self.sws,
-                    coeffs,
-                    0,
-                    coeffs,
-                    0,
-                    0,
-                    1 << 16,
-                    1 << 16,
-                );
+                ffi::sws_setColorspaceDetails(self.sws, coeffs, 0, coeffs, 0, 0, 1 << 16, 1 << 16);
                 let (wu, hu) = (w as usize, h as usize);
                 self.yuv_dims = (wu, hu);
                 self.yuv.resize(wu * hu * 3 / 2, 0);

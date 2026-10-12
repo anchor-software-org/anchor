@@ -253,11 +253,8 @@ mod tests {
         }
         let devices = registry.connected_devices();
         assert_eq!(devices.len(), 1);
-        let reported: std::collections::HashSet<&str> = devices[0]
-            .capabilities
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let reported: std::collections::HashSet<&str> =
+            devices[0].capabilities.iter().map(String::as_str).collect();
         for name in all {
             assert!(reported.contains(name), "snapshot missing {name}");
         }
