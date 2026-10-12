@@ -116,6 +116,11 @@
   let clipboardFeedbackTimer = 0;
   const remotePopoutWindow = getCurrentWindow().label === 'remote-popout';
   let remotePopoutFitAspect = 0;
+  // Resize events within this window after our own remote_popout_fit are
+  // settling, not user intent — a resize outside it counts as manual and
+  // wins until the aspect changes again.
+  let remotePopoutUserSized = false;
+  let remotePopoutLastFitAt = 0;
   let remoteDeviceId = '';
   let remoteMirrorArmed = false;
   let remotePadDown = false;
@@ -199,14 +204,15 @@
     remoteNaturalHeight = img.naturalHeight;
     refitRemotePad();
 
-    // In the popout, refit the window to the frame once per orientation so
-    // the pad fills it with no dead space after a rotation. Non-wrap space
-    // is the fixed chrome (title row, nav buttons, page padding). No-op on
-    // tiling compositors; the pad still tracks the window via refitRemotePad.
+    // In the popout, refit the window to the frame's aspect — on orientation
+    // change AND when the window drifted from the target (the popout window
+    // is reused, so a stale/manual size outlives remotePopoutFitAspect).
+    // A manual resize wins until the aspect changes. No-op on tiling
+    // compositors; the pad still tracks the window via refitRemotePad.
     const wrap = remotePadEl?.parentElement;
     const aspect = img.naturalWidth / img.naturalHeight;
-    if (remotePopoutWindow && wrap && Math.abs(aspect - remotePopoutFitAspect) > 0.01) {
-      remotePopoutFitAspect = aspect;
+    const aspectChanged = Math.abs(aspect - remotePopoutFitAspect) > 0.01;
+    if (remotePopoutWindow && wrap && (aspectChanged || !remotePopoutUserSized)) {
       const chromeW = Math.max(0, window.innerWidth - wrap.clientWidth);
       const chromeH = Math.max(0, window.innerHeight - wrap.clientHeight);
       const fit = Math.min(
@@ -214,10 +220,16 @@
         (window.screen.availHeight * 0.7) / img.naturalHeight,
         1,
       );
-      void remotePopoutFit(
-        Math.round(img.naturalWidth * fit + chromeW),
-        Math.round(img.naturalHeight * fit + chromeH),
-      );
+      const targetW = Math.round(img.naturalWidth * fit + chromeW);
+      const targetH = Math.round(img.naturalHeight * fit + chromeH);
+      const drift =
+        Math.abs(window.innerWidth - targetW) > 16 || Math.abs(window.innerHeight - targetH) > 16;
+      if (aspectChanged || drift) {
+        remotePopoutFitAspect = aspect;
+        remotePopoutUserSized = false;
+        remotePopoutLastFitAt = performance.now();
+        void remotePopoutFit(targetW, targetH);
+      }
     }
   };
 
@@ -396,6 +408,7 @@
     remoteMirrorWidth = 0;
     remoteMirrorHeight = 0;
     remotePopoutFitAspect = 0;
+    remotePopoutUserSized = false;
   };
 
   const changeRemoteDevice = (id: string) => {
@@ -563,7 +576,14 @@
     }
     window.addEventListener('keydown', remoteKeyDown);
     window.addEventListener('keyup', remoteKeyUp);
-    window.addEventListener('resize', refitRemotePad);
+    window.addEventListener('resize', () => {
+      refitRemotePad();
+      // A resize not settling one of our own fits is a manual window
+      // resize — respect it until the aspect changes.
+      if (remotePopoutWindow && performance.now() - remotePopoutLastFitAt > 500) {
+        remotePopoutUserSized = true;
+      }
+    });
     let stopped = false;
     let stateDirtyTimer = 0;
     let startupReconcileTimer = 0;
