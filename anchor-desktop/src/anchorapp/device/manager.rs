@@ -15,7 +15,6 @@ use crate::anchorapp::{
 
 use super::{
     DeviceCheckResult, DeviceRegistry, FrameBroadcaster,
-    adb::start_adb_scanner,
     camera_receiver::{CameraTxCell, new_camera_tx_cell, spawn_camera_receiver},
     loopback_setup::{
         LoopbackError, LoopbackStatus, anchor_device_path, ensure_loopback_nopass,
@@ -209,7 +208,6 @@ impl DeviceManager {
             device_id: self.identity.device_id.clone(),
         };
 
-        start_adb_scanner(broker_tx.clone());
         sdk_screen.set_broadcaster(broadcaster.clone());
         sdk_camera.set_camera_tx_cell(camera_tx_cell.clone());
         spawn_forwarding_thread(

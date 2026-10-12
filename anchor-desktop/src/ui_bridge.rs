@@ -1631,7 +1631,6 @@ fn clipboard_preview(content: &str, content_type: &ClipboardContentType) -> Stri
 /// Tauri controller.
 pub fn start_desktop_controller() -> DesktopController {
     let log_buffer = crate::anchorapp::log_collector::init_logger(log::LevelFilter::Info);
-    crate::anchorapp::log_collector::start_adb_logcat_collector(log_buffer.clone());
     fd_probe::start();
 
     let config_dir = dirs::config_dir().expect("Could not find config directory").join("anchor");

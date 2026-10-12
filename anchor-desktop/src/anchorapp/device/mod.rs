@@ -1,4 +1,3 @@
-mod adb;
 mod broadcaster;
 pub(crate) mod camera_receiver;
 pub mod loopback_setup;

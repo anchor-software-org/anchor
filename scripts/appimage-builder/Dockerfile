@@ -7,7 +7,6 @@ ARG RUST_VERSION=1.98.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        adb \
         build-essential \
         ca-certificates \
         clang \
