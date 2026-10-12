@@ -156,29 +156,6 @@ if [ -z "$X264_PATH" ]; then
 fi
 cp -L "$X264_PATH" "$APPDIR/usr/lib/$(basename "$X264_PATH")"
 
-# Bundle adb and its non-glibc dependency closure in an isolated library
-# directory. Its Ubuntu libraries must not enter Anchor's GTK/WebKit process.
-if ADB_PATH=$(command -v adb); then
-    mkdir -p "$APPDIR/usr/lib/adb"
-    cp "$ADB_PATH" "$APPDIR/usr/bin/adb.real"
-    while read -r lib; do
-        case "$(basename "$lib")" in
-            libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*) ;;
-            *) cp -Ln "$lib" "$APPDIR/usr/lib/adb/" ;;
-        esac
-    done < <(ldd "$APPDIR/usr/bin/adb.real" | awk '/=> \// { print $3 }')
-    cat > "$APPDIR/usr/bin/adb" << 'ADB_RUN'
-#!/usr/bin/env bash
-HERE="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-export LD_LIBRARY_PATH="$HERE/../lib/adb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$HERE/adb.real" "$@"
-ADB_RUN
-    chmod +x "$APPDIR/usr/bin/adb"
-    "$APPDIR/usr/bin/adb" version
-else
-    echo "WARN: adb not found on host; AppImage will not bundle adb"
-fi
-
 # Desktop entry
 cat > "$APPDIR/usr/share/applications/anchor.desktop" << 'EOF'
 [Desktop Entry]
@@ -249,8 +226,7 @@ APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" run_appimage_tool "$APPIMAGETOOL" \
     AppDir "Anchor-$ARCH.AppImage"
 
 # Verify the image actually works: extract it (no FUSE needed), confirm the
-# packaged binary resolves every library with the bundled lib dir on the path,
-# and prove the bundled adb runs using only its private lib closure.
+# packaged binary resolves every library with the bundled lib dir on the path.
 echo "==> Verifying AppImage contents..."
 VERIFY_DIR="$APPIMAGE_DIR/verify"
 rm -rf "$VERIFY_DIR"
@@ -259,7 +235,7 @@ mkdir -p "$VERIFY_DIR"
     "$APPIMAGE_DIR/Anchor-$ARCH.AppImage" --appimage-extract >/dev/null)
 SQFS="$VERIFY_DIR/squashfs-root"
 
-for required in "$SQFS/AppRun" "$SQFS/usr/bin/anchor" "$SQFS/usr/bin/adb" \
+for required in "$SQFS/AppRun" "$SQFS/usr/bin/anchor" \
     "$SQFS/usr/share/applications/anchor.desktop" \
     "$SQFS/usr/share/icons/hicolor/256x256/apps/anchor.png"; do
     if [ ! -e "$required" ]; then
@@ -272,7 +248,6 @@ if LD_LIBRARY_PATH="$SQFS/usr/lib" ldd "$SQFS/usr/bin/anchor" | grep "not found"
     echo "AppImage verification failed: anchor has unresolved libraries" >&2
     exit 1
 fi
-"$SQFS/usr/bin/adb" version >/dev/null
 
 rm -rf "$VERIFY_DIR"
-echo "==> Done: $(ls -lh "Anchor-$ARCH.AppImage") (verified: extracts cleanly, all libraries resolve, bundled adb runs)"
+echo "==> Done: $(ls -lh "Anchor-$ARCH.AppImage") (verified: extracts cleanly, all libraries resolve)"

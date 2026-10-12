@@ -35,7 +35,6 @@
     curl
     file
     imagemagick
-    android-tools
 
     # Tauri and GTK runtime/build dependencies.
     webkitgtk_4_1
