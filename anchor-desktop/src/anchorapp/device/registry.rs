@@ -229,6 +229,40 @@ mod tests {
     }
 
     #[test]
+    fn every_capability_name_roundtrips_and_clears_on_disconnect() {
+        let (registry, _directory) = registry();
+        let connection = registry.connect_sdk("phone");
+        let all = [
+            anchor_sdk::camera::CAPABILITY_NAME,
+            anchor_sdk::clipboard::CAPABILITY_NAME,
+            anchor_sdk::commands::CAPABILITY_NAME,
+            anchor_sdk::device::CAPABILITY_NAME,
+            anchor_sdk::files::CAPABILITY_NAME,
+            anchor_sdk::input::CAPABILITY_NAME,
+            anchor_sdk::media::CAPABILITY_NAME,
+            anchor_sdk::notifications::CAPABILITY_NAME,
+            anchor_sdk::screen::CAPABILITY_NAME,
+            anchor_sdk::sms::CAPABILITY_NAME,
+        ];
+        for name in all {
+            assert!(
+                name.starts_with("org.anchor."),
+                "capability constant '{name}' is not a canonical org.anchor.* name"
+            );
+            registry.register_sdk_capability("phone", name);
+        }
+        let devices = registry.connected_devices();
+        assert_eq!(devices.len(), 1);
+        let reported: std::collections::HashSet<&str> =
+            devices[0].capabilities.iter().map(String::as_str).collect();
+        for name in all {
+            assert!(reported.contains(name), "snapshot missing {name}");
+        }
+        drop(connection);
+        assert!(registry.connected_devices().is_empty());
+    }
+
+    #[test]
     fn sdk_connection_tracks_online_state_until_last_session_closes() {
         let (registry, directory) = registry();
         let first = registry.connect_sdk("phone");

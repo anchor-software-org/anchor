@@ -68,6 +68,7 @@ mpris = "2.1"
 souvlaki = "0.7"
 tauri = { version = "2", features = ["tray-icon", "image-png", "custom-protocol"] }
 tauri-plugin-single-instance = "2"
+turbojpeg = "1.5.1"
 
 [dev-dependencies]
 proptest = "1"

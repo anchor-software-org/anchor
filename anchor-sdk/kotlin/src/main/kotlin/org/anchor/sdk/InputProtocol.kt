@@ -6,8 +6,11 @@ import org.anchor.sdk.v1.capabilities.input.InputKey
 import org.anchor.sdk.v1.capabilities.input.InputPointerAbsolute
 import org.anchor.sdk.v1.capabilities.input.InputPointerRelative
 import org.anchor.sdk.v1.capabilities.input.InputPointerButton
+import org.anchor.sdk.v1.capabilities.input.InputPing
+import org.anchor.sdk.v1.capabilities.input.InputPong
 import org.anchor.sdk.v1.capabilities.input.InputScroll
 import org.anchor.sdk.v1.capabilities.input.InputText
+import org.anchor.sdk.v1.capabilities.input.RemoteControl
 
 /** Canonical v1 input capability helpers. */
 object InputProtocol {
@@ -33,13 +36,29 @@ object InputProtocol {
     const val POINTER_BUTTON_BACK = 4
     const val POINTER_BUTTON_FORWARD = 5
     const val SCROLL_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.InputScroll"
+    const val REMOTE_CONTROL_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.RemoteControl"
+    const val PING_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.InputPing"
+    const val PONG_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.InputPong"
+    /** Datagram payload label for mirrored device screen frames (ANFR/JPEG). */
+    const val MIRROR_FRAME_TYPE_URL = "type.googleapis.com/anchor.v1.capabilities.input.RemoteScreenFrame"
+
+    const val REMOTE_CONTROL_MIRROR_START = 1
+    const val REMOTE_CONTROL_MIRROR_STOP = 2
+    const val REMOTE_CONTROL_BACK = 3
+    const val REMOTE_CONTROL_HOME = 4
+    const val REMOTE_CONTROL_RECENTS = 5
 
     fun advertisement(): CapabilityAdvertisement = CapabilityAdvertisement.newBuilder()
         .setName(CAPABILITY_NAME).setMajor(CAPABILITY_MAJOR)
         .addRecordTypeUrls(KEY_TYPE_URL).addRecordTypeUrls(TEXT_TYPE_URL)
         .addRecordTypeUrls(POINTER_ABSOLUTE_TYPE_URL).addRecordTypeUrls(POINTER_RELATIVE_TYPE_URL)
         .addRecordTypeUrls(POINTER_BUTTON_TYPE_URL)
-        .addRecordTypeUrls(SCROLL_TYPE_URL).build()
+        .addRecordTypeUrls(SCROLL_TYPE_URL)
+        .addRecordTypeUrls(REMOTE_CONTROL_TYPE_URL)
+        .addRecordTypeUrls(MIRROR_FRAME_TYPE_URL)
+        .addRecordTypeUrls(PING_TYPE_URL)
+        .addRecordTypeUrls(PONG_TYPE_URL)
+        .setSupportsDatagrams(true).build()
 
     fun endpointAdvertisement(): EndpointAdvertisement = EndpointAdvertisement.newBuilder()
         .setEndpointId(ENDPOINT_ID).addCapabilities(advertisement()).build()
@@ -99,4 +118,12 @@ object InputProtocol {
         .let { PointerButton(it.buttonValue, it.pressed) }
     fun decodeScroll(bytes: ByteArray): Scroll = InputScroll.parseFrom(bytes)
         .let { Scroll(it.horizontal120Ths, it.vertical120Ths) }
+    fun decodeRemoteControl(bytes: ByteArray): Int =
+        RemoteControl.parseFrom(bytes).kindValue
+    fun decodePing(bytes: ByteArray): Long = InputPing.parseFrom(bytes).sentTimeUs
+    fun encodePong(pingSentTimeUs: Long, sentTimeUs: Long): ByteArray =
+        InputPong.newBuilder()
+            .setPingSentTimeUs(pingSentTimeUs)
+            .setSentTimeUs(sentTimeUs)
+            .build().toByteArray()
 }

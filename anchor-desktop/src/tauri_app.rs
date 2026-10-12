@@ -145,6 +145,66 @@ controller_action!(delete_command(id: String) => delete_command(&id));
 controller_action!(update_command(id: String, name: String, command: String, description: String, detach: bool) => update_command(&id, name, command, description, detach));
 controller_action!(run_command(id: String) => run_command(&id));
 controller_action!(media_command(source: String, command: String) => media_command(&source, &command));
+controller_action!(remote_tap(device_id: Option<String>, x: f64, y: f64) => remote_tap(device_id, x, y));
+controller_action!(remote_pointer_down(device_id: Option<String>, x: f64, y: f64) => remote_pointer_down(device_id, x, y));
+controller_action!(remote_pointer_move(device_id: Option<String>, x: f64, y: f64) => remote_pointer_move(device_id, x, y));
+controller_action!(remote_pointer_up(device_id: Option<String>) => remote_pointer_up(device_id));
+controller_action!(remote_scroll(device_id: Option<String>, dx: f64, dy: f64) => remote_scroll(device_id, dx, dy));
+controller_action!(remote_text(device_id: Option<String>, text: String) => remote_text(device_id, text));
+controller_action!(remote_key(device_id: Option<String>, usage: u32, pressed: bool) => remote_key(device_id, usage, pressed));
+controller_action!(remote_nav(device_id: Option<String>, action: String) => remote_nav(device_id, &action));
+
+/// `watcher` is the calling webview's label — mirror teardown is refcounted
+/// per window so the pane and the popout share one phone stream.
+#[tauri::command]
+fn remote_mirror(
+    webview: tauri::Webview,
+    controller: ControllerState<'_>,
+    device_id: Option<String>,
+    enabled: bool,
+) -> Result<(), String> {
+    controller.remote_mirror(webview.label(), device_id, enabled)
+}
+
+/// Focus the detached remote-control window, creating it on first use.
+#[tauri::command]
+fn remote_popout(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("remote-popout") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        return window.set_focus().map_err(|error| error.to_string());
+    }
+    tauri::webview::WebviewWindowBuilder::new(
+        &app,
+        "remote-popout",
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("Anchor Remote")
+    .inner_size(420.0, 860.0)
+    .min_inner_size(220.0, 320.0)
+    .decorations(false)
+    .build()
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+/// Resize the popout's webview to the remote pad's current size, keeping the
+/// mirrored frame tight to the window when the phone rotates.
+#[tauri::command]
+fn remote_popout_fit(app: tauri::AppHandle, width: f64, height: f64) {
+    if let Some(window) = app.get_webview_window("remote-popout") {
+        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(width, height)));
+    }
+}
+
+#[tauri::command]
+fn remote_frame(
+    controller: ControllerState<'_>,
+    device_id: Option<String>,
+    after_sequence: u64,
+) -> Option<ScreenPreview> {
+    controller.remote_frame(device_id, after_sequence)
+}
 
 #[tauri::command]
 fn clear_logs(controller: ControllerState<'_>) {
@@ -186,11 +246,21 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "main"
-                && let tauri::WindowEvent::CloseRequested { api, .. } = event
-            {
-                api.prevent_close();
-                let _ = window.hide();
+            match event {
+                tauri::WindowEvent::CloseRequested { api, .. } if window.label() == "main" => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                // A destroyed popout can no longer watch the mirror — drop
+                // its intent so the stream stops when it was the last one.
+                tauri::WindowEvent::Destroyed if window.label() == "remote-popout" => {
+                    if let Some(controller) =
+                        window.app_handle().try_state::<Arc<DesktopController>>()
+                    {
+                        controller.remote_mirror_watcher_dropped("remote-popout");
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -223,6 +293,18 @@ pub fn run() {
             update_command,
             run_command,
             media_command,
+            remote_tap,
+            remote_pointer_down,
+            remote_pointer_move,
+            remote_pointer_up,
+            remote_scroll,
+            remote_text,
+            remote_key,
+            remote_nav,
+            remote_mirror,
+            remote_popout,
+            remote_popout_fit,
+            remote_frame,
             clear_logs,
             setup_camera,
             set_camera_device,
