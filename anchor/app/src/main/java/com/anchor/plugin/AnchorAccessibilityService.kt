@@ -316,9 +316,11 @@ class AnchorAccessibilityService : AccessibilityService() {
     }
 
     companion object {
-        private const val TAP_MS = 50L
-        private const val STEP_MS = 100L
-        private const val SCROLL_MS = 300L
+        // Short segments = taps complete fast and drag continuations track
+        // at ~40Hz instead of stepping in 100ms chunks.
+        private const val TAP_MS = 30L
+        private const val STEP_MS = 25L
+        private const val SCROLL_MS = 150L
 
         @Volatile
         private var instance: AnchorAccessibilityService? = null

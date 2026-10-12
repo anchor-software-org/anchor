@@ -3,21 +3,30 @@
 //! The phone's MediaProjection producer sends Annex-B access units on the
 //! same ANFR datagram flow the JPEG stills used; this decoder converts each
 //! decoded frame to JPEG so the UI's `data:image/jpeg` path stays unchanged.
+//!
+//! Speed matters — a 30fps stream that can't be consumed fast enough backs
+//! up datagrams all the way to the phone's send queue, and mirror latency
+//! grows without bound. The path therefore stays in the YUV domain:
+//! decode → sws range-convert to full-range YUVJ420P scratch (chroma moves
+//! at quarter res, no 3MB RGBA expand) → libjpeg-turbo compress_yuv_planes
+//! (SIMD, single-digit ms per frame).
 //! Follows the raw-FFI pattern from camera_receiver.rs.
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg_next::ffi;
 
-/// Lazily-opened H.264 software decoder. Single-threaded by contract — the
-/// mirror reassembly thread owns it exclusively.
+/// Lazily-opened H.264 software decoder + libjpeg-turbo re-encoder.
+/// Single-threaded by contract — the mirror reassembly thread owns it.
 pub struct MirrorDecoder {
     ctx: *mut ffi::AVCodecContext,
     pkt: *mut ffi::AVPacket,
     frame: *mut ffi::AVFrame,
     sws: *mut ffi::SwsContext,
     sws_signature: (i32, i32, i32),
-    rgba: Vec<u8>,
-    rgba_dims: (usize, usize),
+    // Packed YUVJ420P scratch the converter writes and turbojpeg reads.
+    yuv: Vec<u8>,
+    yuv_dims: (usize, usize),
+    compressor: turbojpeg::Compressor,
 }
 
 // The decoder only ever runs on the mirror receive thread.
@@ -67,8 +76,9 @@ impl MirrorDecoder {
                 frame,
                 sws: std::ptr::null_mut(),
                 sws_signature: (0, 0, 0),
-                rgba: Vec::new(),
-                rgba_dims: (0, 0),
+                yuv: Vec::new(),
+                yuv_dims: (0, 0),
+                compressor: turbojpeg::Compressor::new().ok()?,
             })
         }
     }
@@ -116,8 +126,11 @@ impl MirrorDecoder {
             }
             let sig = (w, h, fmt);
             if self.sws_signature != sig {
-                // SWS_FAST_BILINEAR — same flag the camera receiver uses.
-                const SWS_FLAGS: i32 = 1;
+                // Convert whatever the decoder emits (yuv420p/nv12/…) to
+                // full-range YUVJ420P — turbojpeg writes JPEG as full-range,
+                // so the range conversion keeps colors correct, and chroma
+                // moves at quarter resolution.
+                const SWS_FLAGS: i32 = 1; // SWS_FAST_BILINEAR
                 self.sws = ffi::sws_getCachedContext(
                     self.sws,
                     w,
@@ -125,7 +138,7 @@ impl MirrorDecoder {
                     std::mem::transmute::<i32, ffi::AVPixelFormat>(fmt),
                     w,
                     h,
-                    ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+                    ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P,
                     SWS_FLAGS,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
@@ -135,8 +148,6 @@ impl MirrorDecoder {
                     log::warn!("mirror: sws_getCachedContext failed for {w}x{h} fmt={fmt}");
                     return None;
                 }
-                // Honor the stream's tagged colorspace so screen RGB stays
-                // correct whether the encoder marks 601 or 709.
                 let coeffs = ffi::sws_getCoefficients((*self.frame).colorspace as i32);
                 ffi::sws_setColorspaceDetails(
                     self.sws,
@@ -148,13 +159,24 @@ impl MirrorDecoder {
                     1 << 16,
                     1 << 16,
                 );
+                let (wu, hu) = (w as usize, h as usize);
+                self.yuv_dims = (wu, hu);
+                self.yuv.resize(wu * hu * 3 / 2, 0);
                 self.sws_signature = sig;
-                self.rgba_dims = (w as usize, h as usize);
-                self.rgba.resize(w as usize * h as usize * 4, 0);
             }
-            let stride = w as usize * 4;
-            let mut dst = [self.rgba.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
-            let dst_stride = [stride as i32, 0, 0, 0, 0, 0, 0, 0];
+            let (wu, hu) = self.yuv_dims;
+            let (y_len, uv_w) = (wu * hu, wu / 2);
+            let mut dst = [
+                self.yuv.as_mut_ptr(),
+                self.yuv.as_mut_ptr().add(y_len),
+                self.yuv.as_mut_ptr().add(y_len + y_len / 4),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ];
+            let dst_stride = [wu as i32, uv_w as i32, uv_w as i32, 0, 0, 0, 0, 0];
             let scaled = ffi::sws_scale(
                 self.sws,
                 (*self.frame).data.as_ptr().cast(),
@@ -167,13 +189,20 @@ impl MirrorDecoder {
             if scaled <= 0 {
                 return None;
             }
-            let (w_u, h_u) = self.rgba_dims;
-            let image = image::RgbaImage::from_raw(w_u as u32, h_u as u32, self.rgba.clone())?;
-            let mut jpeg = Vec::with_capacity(96 * 1024);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 75)
-                .encode_image(&image)
-                .ok()?;
-            Some(jpeg)
+            let image = turbojpeg::YuvPlanesImage {
+                y_plane: &self.yuv[..y_len],
+                u_plane: &self.yuv[y_len..y_len + y_len / 4],
+                v_plane: &self.yuv[y_len + y_len / 4..],
+                width: wu,
+                height: hu,
+                y_stride: wu,
+                u_stride: uv_w,
+                v_stride: uv_w,
+                subsamp: turbojpeg::Subsamp::Sub2x2,
+            };
+            // q80 — screen content (text/UI) stays crisp; a few ms per frame.
+            self.compressor.set_quality(80).ok()?;
+            self.compressor.compress_yuv_planes_to_vec(&image).ok()
         }
     }
 }

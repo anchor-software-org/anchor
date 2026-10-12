@@ -24,11 +24,14 @@
     openSharedFolder,
     openTransfer,
     remoteFrame,
+    remoteKey,
     remoteMirror,
     remoteNav,
     remotePointerDown,
     remotePointerMove,
     remotePointerUp,
+    remotePopout,
+    remotePopoutFit,
     remoteScroll,
     remoteText,
     respondToPairing,
@@ -111,14 +114,17 @@
   let virtualHeight = 1080;
   let copiedClipboardHash = '';
   let clipboardFeedbackTimer = 0;
-  let remoteTextDraft = '';
+  const remotePopoutWindow = getCurrentWindow().label === 'remote-popout';
+  let remotePopoutFitAspect = 0;
+  let remoteDeviceId = '';
+  let remoteMirrorArmed = false;
   let remotePadDown = false;
   let remotePadEl: HTMLDivElement | undefined;
   let remoteMirrorOn = false;
   let remoteMirrorSeq = 0;
   let remoteMirrorUrl = '';
-  let remoteMirrorAspect = '';
-  let remoteMirrorLandscape = false;
+  let remoteMirrorWidth = 0;
+  let remoteMirrorHeight = 0;
   let remoteMirrorLatency = 0;
   let remoteMirrorTimer = 0;
   let remoteClicks: { id: number; x: number; y: number }[] = [];
@@ -132,7 +138,7 @@
   const refreshRemoteFrame = async () => {
     if (!remoteMirrorOn || active !== 'remote' || !windowFocused) return;
     try {
-      const frame = await remoteFrame(remoteMirrorSeq);
+      const frame = await remoteFrame(remoteMirrorSeq, remoteDeviceId || undefined);
       if (frame) {
         remoteMirrorSeq = frame.sequence;
         remoteMirrorUrl = frame.dataUrl;
@@ -156,7 +162,7 @@
     const next = !remoteMirrorOn;
     remoteMirrorOn = next;
     try {
-      await remoteMirror(next);
+      await remoteMirror(next, remoteDeviceId || undefined);
     } catch {
       remoteMirrorOn = false;
       return;
@@ -170,12 +176,123 @@
     }
   };
 
+  let remoteNaturalWidth = 0;
+  let remoteNaturalHeight = 0;
+
+  // Fit the pad to the current container at the frame's exact aspect. Runs
+  // on frame load AND on window resize — the mirror can go idle on a static
+  // screen, so onload alone cannot be trusted to track layout changes.
+  const refitRemotePad = () => {
+    const wrap = remotePadEl?.parentElement;
+    if (!wrap || remoteNaturalWidth <= 0 || remoteNaturalHeight <= 0) return;
+    const maxW = remotePopoutWindow ? wrap.clientWidth : Math.min(wrap.clientWidth, 900);
+    const maxH = remotePopoutWindow ? wrap.clientHeight : Math.min(560, window.innerHeight * 0.7);
+    const scale = Math.min(maxW / remoteNaturalWidth, maxH / remoteNaturalHeight);
+    remoteMirrorWidth = Math.round(remoteNaturalWidth * scale);
+    remoteMirrorHeight = Math.round(remoteNaturalHeight * scale);
+  };
+
   const onRemoteFrameLoad = (event: Event) => {
     const img = event.currentTarget as HTMLImageElement;
-    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
-      remoteMirrorAspect = `${img.naturalWidth} / ${img.naturalHeight}`;
-      remoteMirrorLandscape = img.naturalWidth > img.naturalHeight;
+    if (img.naturalWidth <= 0 || img.naturalHeight <= 0) return;
+    remoteNaturalWidth = img.naturalWidth;
+    remoteNaturalHeight = img.naturalHeight;
+    refitRemotePad();
+
+    // In the popout, refit the window to the frame once per orientation so
+    // the pad fills it with no dead space after a rotation. Non-wrap space
+    // is the fixed chrome (title row, nav buttons, page padding). No-op on
+    // tiling compositors; the pad still tracks the window via refitRemotePad.
+    const wrap = remotePadEl?.parentElement;
+    const aspect = img.naturalWidth / img.naturalHeight;
+    if (remotePopoutWindow && wrap && Math.abs(aspect - remotePopoutFitAspect) > 0.01) {
+      remotePopoutFitAspect = aspect;
+      const chromeW = Math.max(0, window.innerWidth - wrap.clientWidth);
+      const chromeH = Math.max(0, window.innerHeight - wrap.clientHeight);
+      const fit = Math.min(
+        (window.screen.availWidth * 0.6) / img.naturalWidth,
+        (window.screen.availHeight * 0.7) / img.naturalHeight,
+        1,
+      );
+      void remotePopoutFit(
+        Math.round(img.naturalWidth * fit + chromeW),
+        Math.round(img.naturalHeight * fit + chromeH),
+      );
     }
+  };
+
+  // USB HID usage IDs for non-printable keys — mirrors the phone's
+  // hidUsageForKey table. Printable characters ride remote_text instead.
+  const REMOTE_HID: Record<string, number> = {
+    Enter: 0x28,
+    Escape: 0x29,
+    Backspace: 0x2a,
+    Tab: 0x2b,
+    Delete: 0x4c,
+    Home: 0x4a,
+    End: 0x4d,
+    PageUp: 0x4b,
+    PageDown: 0x4e,
+    ArrowLeft: 0x50,
+    ArrowRight: 0x4f,
+    ArrowDown: 0x51,
+    ArrowUp: 0x52,
+    F1: 0x3a, F2: 0x3b, F3: 0x3c, F4: 0x3d, F5: 0x3e, F6: 0x3f,
+    F7: 0x40, F8: 0x41, F9: 0x42, F10: 0x43, F11: 0x44, F12: 0x45,
+    Control: 0xe0,
+    Shift: 0xe1,
+    Alt: 0xe2,
+    Meta: 0xe3,
+  };
+
+  const remoteKeyUsage = (event: KeyboardEvent): number | undefined => {
+    const key = event.key;
+    if (key.length === 1) {
+      const lower = key.toLowerCase();
+      if (lower >= 'a' && lower <= 'z') return 0x04 + lower.charCodeAt(0) - 97;
+      if (key >= '1' && key <= '9') return 0x1e + key.charCodeAt(0) - 49;
+      if (key === '0') return 0x27;
+      return undefined;
+    }
+    return REMOTE_HID[key];
+  };
+
+  // While the remote pane is visible the window owns the keyboard: printable
+  // keys commit as text, everything else goes through as HID usages.
+  const remoteKeyDown = (event: KeyboardEvent) => {
+    if (active !== 'remote' || !remoteDeviceId) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('input, textarea, [contenteditable="true"]')) return;
+
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v') {
+      event.preventDefault();
+      void navigator.clipboard.readText().then((text) => {
+        if (text) void remoteText(text, remoteDeviceId);
+      }).catch(() => {});
+      return;
+    }
+    if (
+      event.key.length === 1 &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      (!event.altKey || event.getModifierState('AltGraph'))
+    ) {
+      event.preventDefault();
+      void remoteText(event.key, remoteDeviceId);
+      return;
+    }
+    const usage = remoteKeyUsage(event);
+    if (usage !== undefined) {
+      event.preventDefault();
+      void remoteKey(usage, true, remoteDeviceId);
+    }
+  };
+
+  const remoteKeyUp = (event: KeyboardEvent) => {
+    if (active !== 'remote' || !remoteDeviceId) return;
+    const usage = remoteKeyUsage(event);
+    // Only modifier releases matter today; the service drops key releases.
+    if (usage !== undefined && usage >= 0xe0) void remoteKey(usage, false, remoteDeviceId);
   };
 
   const remoteNorm = (event: PointerEvent): [number, number] => {
@@ -215,6 +332,7 @@
   };
 
   const remoteDown = (event: PointerEvent) => {
+    if (!remoteDeviceId) return;
     remotePadDown = true;
     remotePadEl?.setPointerCapture(event.pointerId);
     const [x, y] = remoteNorm(event);
@@ -229,7 +347,7 @@
       { id: remoteActiveDrag, points: [{ x, y, t: performance.now() }] },
     ];
     ensureDragTimer();
-    void remotePointerDown(x, y);
+    void remotePointerDown(x, y, remoteDeviceId || undefined);
   };
 
   const remoteMove = (event: PointerEvent) => {
@@ -253,7 +371,7 @@
     if (now - remoteLastMoveSent < 25) return;
     remoteLastMoveSent = now;
     const [x, y] = remoteNorm(event);
-    void remotePointerMove(x, y);
+    void remotePointerMove(x, y, remoteDeviceId || undefined);
   };
 
   const remoteUp = () => {
@@ -261,12 +379,32 @@
     remotePadDown = false;
     // The expiry timer recedes the trail tail on its own.
     remoteActiveDrag = 0;
-    void remotePointerUp();
+    void remotePointerUp(remoteDeviceId || undefined);
   };
 
   const remoteWheel = (event: WheelEvent) => {
+    if (!remoteDeviceId) return;
     event.preventDefault();
-    void remoteScroll(event.deltaX, event.deltaY);
+    void remoteScroll(event.deltaX, event.deltaY, remoteDeviceId || undefined);
+  };
+
+  const changeRemoteDevice = (id: string) => {
+    if (id === remoteDeviceId) return;
+    const previous = remoteDeviceId;
+    remoteDeviceId = id;
+    remoteMirrorUrl = '';
+    remoteMirrorSeq = 0;
+    remoteNaturalWidth = 0;
+    remoteNaturalHeight = 0;
+    remoteMirrorWidth = 0;
+    remoteMirrorHeight = 0;
+    remotePopoutFitAspect = 0;
+    if (remoteMirrorOn) {
+      // Move this window's watch to the new device — another window still
+      // watching the old one keeps its stream alive via the refcount.
+      if (previous) void remoteMirror(false, previous);
+      void remoteMirror(true, id);
+    }
   };
   const attemptedNotificationIcons = new Set<string>();
   const attemptedSmsPhotos = new Set<number>();
@@ -370,6 +508,38 @@
       if (!displayDevices.some((device) => device.id === virtualDeviceId)) {
         virtualDeviceId = displayDevices[0]?.id ?? '';
       }
+      const remoteDevices = state.devices
+        .filter((device) => device.online && device.capabilities.includes('org.anchor.input'))
+        .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+      if (!remoteDevices.some((device) => device.id === remoteDeviceId)) {
+        const previous = remoteDeviceId;
+        remoteDeviceId = remoteDevices[0]?.id ?? '';
+        if (remoteDeviceId !== previous) {
+          remoteMirrorArmed = false;
+          if (previous && remoteMirrorOn) {
+            // The watched device went away — drop this window's watch on it.
+            // The popout re-arms on the next device below; the main pane
+            // requires a fresh explicit Mirror press.
+            void remoteMirror(false, previous);
+            remoteMirrorUrl = '';
+            remoteMirrorSeq = 0;
+            remoteNaturalWidth = 0;
+            remoteNaturalHeight = 0;
+            remoteMirrorWidth = 0;
+            remoteMirrorHeight = 0;
+            remotePopoutFitAspect = 0;
+            if (!remotePopoutWindow) remoteMirrorOn = false;
+          }
+        }
+      }
+      // The popout arms its mirror watch as soon as a device is known —
+      // mount-time arming raced the first state refresh and lost.
+      if (remotePopoutWindow && remoteDeviceId && remoteMirrorOn && !remoteMirrorArmed) {
+        remoteMirrorArmed = true;
+        void remoteMirror(true, remoteDeviceId).catch(() => {
+          remoteMirrorArmed = false;
+        });
+      }
       appVersion = state.version;
       sectionLoading = false;
       if (section === 'sideboat') schedulePreview();
@@ -383,6 +553,19 @@
   };
 
   onMount(() => {
+    if (remotePopoutWindow) {
+      // The detached remote window is a single-pane view: it always shows the
+      // remote section. Mirror intent is set here so frames already live
+      // from another window show up; refresh() registers this window's watch
+      // once a device is known (arming before that raced the first refresh).
+      document.body.classList.add('remote-popout-body');
+      active = 'remote';
+      remoteMirrorOn = true;
+      scheduleRemoteFrame();
+    }
+    window.addEventListener('keydown', remoteKeyDown);
+    window.addEventListener('keyup', remoteKeyUp);
+    window.addEventListener('resize', refitRemotePad);
     let stopped = false;
     let stateDirtyTimer = 0;
     let startupReconcileTimer = 0;
@@ -451,6 +634,9 @@
     });
     return () => {
       stopped = true;
+      window.removeEventListener('keydown', remoteKeyDown);
+      window.removeEventListener('keyup', remoteKeyUp);
+      window.removeEventListener('resize', refitRemotePad);
       window.clearTimeout(stateDirtyTimer);
       window.clearTimeout(startupReconcileTimer);
       window.clearTimeout(previewTimer);
@@ -508,6 +694,9 @@
 
   const selectSection = async (section: Section) => {
     if (section === active) return;
+    // Leaving the remote pane releases this window's mirror watch — a popout
+    // still watching keeps the stream alive via the backend refcount.
+    if (active === 'remote' && remoteMirrorOn) void toggleRemoteMirror();
     const sideboatVisibilityChanged = (active === 'sideboat') !== (section === 'sideboat');
     if (section === 'messages' && active !== 'messages') lastMessageRenderKey = '';
     if (section === 'logs' && active !== 'logs') lastLogRenderKey = '';
@@ -533,6 +722,11 @@
 
   const displayDevices = () => (desktop?.devices ?? [])
     .filter((device) => device.online && device.displayWidth && device.displayHeight)
+    .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+  // Remote control needs the device's `org.anchor.input` session — display
+  // dims alone just mean it can receive Sideboat frames (e.g. an iPad).
+  const remoteDevices = () => (desktop?.devices ?? [])
+    .filter((device) => device.online && device.capabilities.includes('org.anchor.input'))
     .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
   const selectedDisplayDevice = () => displayDevices().find((device) => device.id === virtualDeviceId);
   const selectedDisplayDeviceOption = () => {
@@ -716,7 +910,8 @@
   <meta name="description" content="Anchor desktop controls" />
 </svelte:head>
 
-<main class="shell">
+<main class="shell" class:remote-popout={remotePopoutWindow}>
+  {#if !remotePopoutWindow}
   <aside class="sidebar" aria-label="Anchor navigation">
     <div class="brand">Anchor</div>
     <nav>
@@ -728,11 +923,14 @@
     </nav>
     <div class="sidebar-footer">v{appVersion ?? '…'}</div>
   </aside>
+  {/if}
 
   <section class="workspace">
+    {#if !remotePopoutWindow}
     <header class="topbar">
       <h1>{pageTitle()}</h1>
     </header>
+    {/if}
 
     <div class="page">
       {#if active === 'sideboat'}
@@ -850,18 +1048,44 @@
 
       {:else if active === 'remote'}
         <section class="section-block">
-          <div class="section-title">
-            <div><h2>Phone remote control</h2><p>Pointer pad drives the connected phone through its accessibility service. Press-and-release is a tap; drag moves with contact.</p></div>
-            <button class="button" class:on={remoteMirrorOn} onclick={() => void toggleRemoteMirror()}>
-              {remoteMirrorOn ? 'Stop mirror' : 'Mirror screen'}
-            </button>
-          </div>
+          {#if remotePopoutWindow}
+            <div class="popout-title" data-tauri-drag-region>
+              <div class="remote-actions">
+                <button class="popout-btn" title="Back" disabled={!remoteDeviceId} onclick={() => void remoteNav('back', remoteDeviceId)}>‹</button>
+                <button class="popout-btn" title="Home" disabled={!remoteDeviceId} onclick={() => void remoteNav('home', remoteDeviceId)}>○</button>
+                <button class="popout-btn" title="Recents" disabled={!remoteDeviceId} onclick={() => void remoteNav('recents', remoteDeviceId)}>▢</button>
+              </div>
+              <div class="remote-actions">
+                <button class="popout-btn" class:on={remoteMirrorOn} title="Toggle mirror" disabled={!remoteDeviceId} onclick={() => void toggleRemoteMirror()}>
+                  {remoteMirrorOn ? '■' : '▶'}
+                </button>
+                <button class="popout-btn popout-close" title="Close" onclick={() => void getCurrentWindow().close()}>✕</button>
+              </div>
+            </div>
+          {:else}
+            <div class="section-title">
+              <div><h2>Phone remote control</h2><p>Tap, drag, scroll, and type — while this pane is up the keyboard goes straight to the phone. Ctrl+V pastes.</p></div>
+              <div class="remote-actions">
+                {#if remoteDevices().length > 1}
+                  <Select
+                    ariaLabel="Remote device"
+                    value={remoteDeviceId}
+                    options={remoteDevices().map(displayDeviceOption)}
+                    onselect={changeRemoteDevice}
+                  />
+                {/if}
+                <button class="button" disabled={!remoteDeviceId} onclick={() => void remotePopout()}>Pop out</button>
+                <button class="button" class:on={remoteMirrorOn} disabled={!remoteDeviceId} onclick={() => void toggleRemoteMirror()}>
+                  {remoteMirrorOn ? 'Stop mirror' : 'Mirror screen'}
+                </button>
+              </div>
+            </div>
+          {/if}
           <div class="remote-pad-wrap">
             <div
               class="remote-pad"
               class:remote-pad-live={Boolean(remoteMirrorUrl)}
-              class:remote-pad-landscape={remoteMirrorLandscape}
-              style={remoteMirrorAspect ? `aspect-ratio: ${remoteMirrorAspect};` : ''}
+              style={remoteMirrorWidth > 0 ? `width: ${remoteMirrorWidth}px; height: ${remoteMirrorHeight}px;` : ''}
               bind:this={remotePadEl}
               onpointerdown={remoteDown}
               onpointermove={remoteMove}
@@ -883,20 +1107,17 @@
                   <span class="remote-click" style="left: {click.x * 100}%; top: {click.y * 100}%"></span>
                 {/each}
               {:else}
-                <span>{remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone'}</span>
+                <span>{remoteDeviceId ? (remoteMirrorOn ? 'Waiting for frames…' : 'Tap / drag / scroll here to control the phone') : 'No device connected'}</span>
               {/if}
             </div>
           </div>
-          <div class="form-row remote-nav-row">
-            <button class="button" onclick={() => void remoteNav('back')}>Back</button>
-            <button class="button" onclick={() => void remoteNav('home')}>Home</button>
-            <button class="button" onclick={() => void remoteNav('recents')}>Recents</button>
-          </div>
-          <div class="form-row">
-            <input class="remote-text-input" placeholder="Type text into the focused field…" bind:value={remoteTextDraft}
-              onkeydown={(event) => { if (event.key === 'Enter' && remoteTextDraft) { void remoteText(remoteTextDraft); remoteTextDraft = ''; } }} />
-            <button class="button" disabled={!remoteTextDraft} onclick={() => { void remoteText(remoteTextDraft); remoteTextDraft = ''; }}>Send text</button>
-          </div>
+          {#if !remotePopoutWindow}
+            <div class="form-row remote-nav-row">
+              <button class="button" disabled={!remoteDeviceId} onclick={() => void remoteNav('back', remoteDeviceId)}>Back</button>
+              <button class="button" disabled={!remoteDeviceId} onclick={() => void remoteNav('home', remoteDeviceId)}>Home</button>
+              <button class="button" disabled={!remoteDeviceId} onclick={() => void remoteNav('recents', remoteDeviceId)}>Recents</button>
+            </div>
+          {/if}
         </section>
 
       {:else if active === 'messages'}

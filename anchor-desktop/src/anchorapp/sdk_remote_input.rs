@@ -6,7 +6,7 @@
 //! so callers send [0,1] fractions which this module scales to the wire's
 //! [0, 65535] range.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -142,6 +142,57 @@ pub struct MirrorFrame {
     /// desktop receive time minus (device pts + offset).
     pub latency_ms: Option<f64>,
     pub jpeg: Arc<Vec<u8>>,
+}
+
+/// Per-device set of UI windows that asked for the remote mirror. The stream
+/// starts when a device's first watcher appears and stops when the last one
+/// leaves, so a popout and the main window can share one mirror without
+/// racing each other's stop requests.
+#[derive(Default)]
+pub struct MirrorWatchers {
+    /// device key (device_id, or "" for the broadcast default) → window labels
+    inner: Mutex<HashMap<String, HashSet<String>>>,
+}
+
+impl MirrorWatchers {
+    /// Returns Some(true) when the device transitions watched from zero,
+    /// Some(false) when it drops to zero watchers — i.e. when a START/STOP
+    /// record should go on the wire. None means no state change.
+    pub fn set(&self, device_key: &str, watcher: &str, enabled: bool) -> Option<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        if enabled {
+            let set = inner.entry(device_key.to_string()).or_default();
+            let start = set.is_empty();
+            set.insert(watcher.to_string());
+            return start.then_some(true);
+        }
+        let set = inner.get_mut(device_key)?;
+        if !set.remove(watcher) {
+            return None;
+        }
+        if set.is_empty() {
+            inner.remove(device_key);
+            return Some(false);
+        }
+        None
+    }
+
+    /// Drop a watcher from every device (window closed). Returns the device
+    /// keys that transitioned to zero watchers and need a STOP.
+    pub fn dropped(&self, watcher: &str) -> Vec<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut emptied = Vec::new();
+        inner.retain(|device_key, set| {
+            set.remove(watcher);
+            if set.is_empty() {
+                emptied.push(device_key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        emptied
+    }
 }
 
 #[derive(Clone, Default)]
@@ -296,6 +347,9 @@ impl SdkRemoteInputBinding {
                         };
                         for jpeg in jpegs {
                             let sequence = frame_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                            if std::env::var("ANCHOR_DUMP_MIRROR").is_ok() {
+                                let _ = std::fs::write("/tmp/anchor-mirror-latest.jpg", &jpeg);
+                            }
                             let jpeg = Arc::new(jpeg);
                             frames.lock().unwrap().insert(
                                 device_id.clone(),
@@ -377,6 +431,16 @@ pub fn send_json(sender: &SdkRemoteInputSender, value: &serde_json::Value) -> bo
                     .unwrap_or_default(),
             ),
         ),
+        "remote_key" => sender.send(
+            input::KEY_TYPE_URL,
+            input::encode_key(
+                num("usage") as u32,
+                value
+                    .get("pressed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+            ),
+        ),
         // Navigation actions have no HID usage — they ride RemoteControl.
         "remote_back" => sender.remote_control(input::REMOTE_CONTROL_BACK),
         "remote_home" => sender.remote_control(input::REMOTE_CONTROL_HOME),
@@ -404,5 +468,56 @@ mod tests {
     #[test]
     fn binding_starts_empty() {
         assert!(SdkRemoteInputBinding::default().senders().is_empty());
+    }
+
+    #[test]
+    fn watcher_first_enable_starts() {
+        let watchers = MirrorWatchers::default();
+        assert_eq!(watchers.set("dev1", "main", true), Some(true));
+    }
+
+    #[test]
+    fn watcher_second_window_does_not_restart() {
+        let watchers = MirrorWatchers::default();
+        watchers.set("dev1", "main", true);
+        assert_eq!(watchers.set("dev1", "remote-popout", true), None);
+    }
+
+    #[test]
+    fn watcher_stop_only_after_last_leaves() {
+        let watchers = MirrorWatchers::default();
+        watchers.set("dev1", "main", true);
+        watchers.set("dev1", "remote-popout", true);
+        assert_eq!(watchers.set("dev1", "main", false), None);
+        assert_eq!(watchers.set("dev1", "remote-popout", false), Some(false));
+    }
+
+    #[test]
+    fn watcher_disable_without_watch_is_noop() {
+        let watchers = MirrorWatchers::default();
+        assert_eq!(watchers.set("dev1", "main", false), None);
+        watchers.set("dev1", "main", true);
+        assert_eq!(watchers.set("dev1", "nobody", false), None);
+    }
+
+    #[test]
+    fn watcher_dropped_empties_everywhere() {
+        let watchers = MirrorWatchers::default();
+        watchers.set("dev1", "remote-popout", true);
+        watchers.set("dev2", "remote-popout", true);
+        watchers.set("dev2", "main", true);
+        let mut emptied = watchers.dropped("remote-popout");
+        emptied.sort();
+        assert_eq!(emptied, vec!["dev1".to_string()]);
+        // dev2 keeps running for "main" — no second start needed.
+        assert_eq!(watchers.set("dev2", "other", true), None);
+    }
+
+    #[test]
+    fn watcher_devices_are_independent() {
+        let watchers = MirrorWatchers::default();
+        watchers.set("dev1", "main", true);
+        assert_eq!(watchers.set("dev2", "main", true), Some(true));
+        assert_eq!(watchers.set("dev1", "main", false), Some(false));
     }
 }

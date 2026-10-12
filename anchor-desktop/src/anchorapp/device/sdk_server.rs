@@ -303,7 +303,7 @@ async fn handle_session(
                     crate::anchorapp::sdk_clipboard::SdkClipboardSender::new(capability),
                     node_id(&device_id),
                 );
-                registry.register_sdk_capability(&device_id, "clipboard");
+                registry.register_sdk_capability(&device_id, &capability_name);
                 log::info!("SDK clipboard capability opened by {device_id}");
             }
             SessionEvent::CapabilityOpenRequested {
@@ -325,7 +325,7 @@ async fn handle_session(
                         capability_major,
                     )
                     .await?;
-                registry.register_sdk_capability(&device_id, "device");
+                registry.register_sdk_capability(&device_id, &capability_name);
                 device_binding.attach(device_id.clone(), SdkDeviceSender::new(capability));
                 device_sessions.insert(capability_session_id);
                 log::info!("SDK device capability opened by {device_id}");
@@ -351,7 +351,7 @@ async fn handle_session(
                     .await?;
                 notifications_binding
                     .attach(device_id.clone(), SdkNotificationsSender::new(capability));
-                registry.register_sdk_capability(&device_id, "notifications");
+                registry.register_sdk_capability(&device_id, &capability_name);
                 log::info!("SDK notifications capability opened by {device_id}");
             }
             SessionEvent::CapabilityOpenRequested {
@@ -420,7 +420,7 @@ async fn handle_session(
                         }
                     });
                 }
-                registry.register_sdk_capability(&device_id, "input");
+                registry.register_sdk_capability(&device_id, &capability_name);
                 log::info!("SDK input capability opened by {device_id}");
             }
             SessionEvent::CapabilityOpenRequested {
@@ -443,7 +443,7 @@ async fn handle_session(
                     )
                     .await?;
                 media_binding.attach(device_id.clone(), SdkMediaSender::new(capability));
-                registry.register_sdk_capability(&device_id, "media");
+                registry.register_sdk_capability(&device_id, &capability_name);
                 log::info!("SDK media capability opened by {device_id}");
             }
             SessionEvent::CapabilityOpenRequested {
@@ -1278,6 +1278,16 @@ async fn handle_session(
                 screen_binding.detach_device(&device_id);
                 return Ok(());
             }
+            SessionEvent::DatagramFlowOpenRequested {
+                capability_session_id,
+                flow_id,
+                payload_type_url,
+                ..
+            } => {
+                log::warn!(
+                    "SDK datagram flow open ignored for {device_id}: capability_session={capability_session_id} flow={flow_id} type={payload_type_url} (no bound session)"
+                );
+            }
             _ => {}
         }
     }
@@ -1578,6 +1588,25 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&anchor_sdk::clipboard::CAPABILITY_NAME));
         assert!(names.contains(&anchor_sdk::device::CAPABILITY_NAME));
+    }
+
+    #[test]
+    fn advertised_capabilities_are_all_canonical_names() {
+        let identity = crate::anchorapp::tls::generate_test_identity();
+        let session_identity = super::session_identity(&identity);
+        let names: Vec<_> = session_identity
+            .endpoints
+            .iter()
+            .flat_map(|endpoint| endpoint.capabilities.iter())
+            .map(|capability| capability.name.as_str())
+            .collect();
+        assert!(!names.is_empty());
+        for name in names {
+            assert!(
+                name.starts_with("org.anchor."),
+                "advertised capability '{name}' is not a canonical org.anchor.* name"
+            );
+        }
     }
 
     #[test]

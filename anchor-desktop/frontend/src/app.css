@@ -366,14 +366,23 @@ input:focus, select:focus { border-color: var(--accent); }
 .remote-pad-wrap { display: flex; justify-content: center; }
 .remote-pad { position: relative; display: grid; place-items: center; flex: none; aspect-ratio: 9 / 19; height: min(560px, 70vh); width: auto; max-width: 100%; border: 1px solid var(--rock-stroke); color: var(--rock); background: var(--ink); font-size: 11px; touch-action: none; user-select: none; cursor: crosshair; overflow: hidden; }
 .remote-pad:active { border-color: var(--sky); }
-.remote-pad-landscape { height: auto; width: min(100%, 900px); }
 .remote-pad-live { padding: 0; }
-.remote-frame { width: 100%; height: 100%; object-fit: fill; pointer-events: none; -webkit-user-drag: none; }
+.remote-frame { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; pointer-events: none; -webkit-user-drag: none; }
 .remote-latency { position: absolute; top: 6px; right: 8px; padding: 2px 7px; border-radius: 4px; background: rgba(0, 0, 0, 0.62); color: var(--sky); font-size: 11px; font-variant-numeric: tabular-nums; pointer-events: none; z-index: 1; }
 .remote-click { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; border: 1.5px solid var(--sky); background: rgba(56, 189, 248, 0.25); pointer-events: none; z-index: 2; animation: remote-click-ping 0.35s ease-out forwards; }
 @keyframes remote-click-ping { from { transform: scale(0.6); opacity: 0.9; } to { transform: scale(1.4); opacity: 0; } }
 .remote-drag-layer { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
 .remote-drag-layer path { fill: none; stroke: var(--sky); stroke-width: 2px; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; opacity: 0.5; }
 .remote-nav-row { justify-content: center; }
-.remote-text-input { flex: 1; }
+.remote-actions { display: flex; gap: 8px; }
+
+.remote-popout-body { min-width: 0; min-height: 0; }
+.remote-popout { grid-template-columns: minmax(0, 1fr); }
+.remote-popout .page { display: flex; flex-direction: column; height: 100vh; padding: 0; overflow: hidden; }
+.remote-popout .section-block { display: flex; flex: 1; min-height: 0; flex-direction: column; margin: 0; border: 0; }
+.remote-popout .remote-pad-wrap { display: flex; flex: 1; min-height: 0; align-items: center; justify-content: center; }
+.popout-title { display: flex; flex: none; align-items: center; justify-content: space-between; height: 30px; padding: 0 4px; border-bottom: 1px solid var(--rock-stroke); cursor: grab; }
+.popout-btn { min-height: 0; padding: 3px 9px; border: 0; color: var(--rock-highlight); background: transparent; font-size: 13px; line-height: 1; }
+.popout-btn:hover { color: var(--splash); background: var(--water-mid); }
+.popout-btn.on { color: var(--sky); }
 .button.on { border-color: var(--sky); color: var(--sky); }

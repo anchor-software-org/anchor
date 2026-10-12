@@ -39,6 +39,9 @@ private const val MIRROR_MAX_WIDTH = 720
 private const val MIRROR_INTERVAL_MS = 80L
 private const val CONSENT_CHANNEL_ID = "anchor_capture"
 private const val CONSENT_NOTIFICATION_ID = 41
+private const val STALE_FRAME_US = 150_000L
+private const val KEYFRAME_REQUEST_MIN_NS = 400_000_000L
+private const val CONSENT_WATCHDOG_MS = 60_000L
 
 /**
  * Remote input plugin — receives desktop → phone pointer/key/text events and
@@ -69,6 +72,8 @@ class RemoteInputPlugin(
     @Volatile private var consentPending = false
     private var videoFlow: AnchorDatagramFlow? = null
     private var videoSequence = 0L
+    private var lastKeyRequestNs = 0L
+    private var droppedVideoFrames = 0L
     @Volatile private var mirrorCaptureMs = -1L
     @Volatile private var mirrorEncodeMs = -1L
     private val screenshotExecutor = Executors.newSingleThreadExecutor()
@@ -93,6 +98,19 @@ class RemoteInputPlugin(
         mirrorJob?.cancel()
         mirrorJob = null
         sdkCapability = null
+    }
+
+    /**
+     * Transport teardown — the QUIC session is gone, so the remote-control
+     * request ends with it: drop the dead flow, detach the encoder sink, and
+     * release the projection instead of zombie-encoding into a black hole.
+     * The next session must be asked to mirror again explicitly.
+     */
+    fun onTransportStopped() {
+        if (!mirrorWanted && videoFlow == null && mirrorJob == null && sdkCapability == null) return
+        Log.i(TAG, "transport stopped — tearing down remote mirror")
+        sdkCapability = null
+        stopMirror()
     }
 
     fun attachSdkSession(session: AnchorSession, capability: AnchorCapability) {
@@ -237,6 +255,10 @@ class RemoteInputPlugin(
         }
         val service = ScreenCaptureService.instance
         if (service != null) {
+            // Video supersedes stills — both ride the same flow type, so the
+            // stills loop must stop before the H.264 sink attaches.
+            mirrorJob?.cancel()
+            mirrorJob = null
             startVideoMirror(capability, service)
             return
         }
@@ -275,6 +297,16 @@ class RemoteInputPlugin(
     private fun requestCaptureConsent() {
         if (consentPending) return
         consentPending = true
+        // The trampoline is noHistory — if it's interrupted (another app
+        // foregrounds, user dismisses) it dies without delivering a result.
+        // Watchdog so consentPending can't wedge the mirror toggle forever.
+        sdkScope?.launch {
+            delay(CONSENT_WATCHDOG_MS)
+            if (consentPending) {
+                consentPending = false
+                Log.w(TAG, "consent result watchdog expired — re-arming mirror requests")
+            }
+        }
         val intent = Intent(context, com.anchor.ScreenCaptureConsentActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching { context.startActivity(intent) }
@@ -329,9 +361,31 @@ class RemoteInputPlugin(
             videoFlow = flow
             videoSequence = 0
             Log.i(TAG, "video mirror flow opened (flow=${flow.flowId}, session=${capability.sessionId})")
-            service.frameSink = { data, isKey, isConfig, ptsUs ->
+            service.frameSink = sink@{ data, isKey, isConfig, ptsUs ->
+                // Bounded latency: if the wire fell behind (sendDatagram
+                // blocks the encoder thread when msquic's queue is deep), a
+                // stale P-frame is worthless — drop it and request a fresh
+                // keyframe so the decoder recovers instead of artifacting.
+                val ageUs = SystemClock.elapsedRealtimeNanos() / 1_000 - ptsUs
+                if (!isKey && !isConfig && ageUs > STALE_FRAME_US) {
+                    val now = SystemClock.elapsedRealtimeNanos()
+                    if (now - lastKeyRequestNs > KEYFRAME_REQUEST_MIN_NS) {
+                        lastKeyRequestNs = now
+                        service.requestKeyFrame()
+                    }
+                    droppedVideoFrames++
+                    if (droppedVideoFrames % 90L == 1L) {
+                        Log.w(TAG, "video mirror dropping stale frames (total=$droppedVideoFrames)")
+                    }
+                    return@sink
+                }
                 sendVideoFrame(flow, capability.sessionId, data, isKey, isConfig, ptsUs)
             }
+            // The codec-config AU may have fired before the flow attached —
+            // replay it, and ask for an IDR too (sync requests are advisory
+            // on some encoders, so both paths are armed).
+            service.emitConfigFrame()
+            service.requestKeyFrame()
             service.onProjectionStopped = {
                 Log.i(TAG, "projection stopped — closing video mirror flow")
                 videoFlow = null

@@ -106,7 +106,10 @@ class AnchorApplication : Application() {
             onSdkSmsReady = { capability -> smsPlugin.attachSdkSession(capability) },
             onSdkCommandsReady = { capability -> commandsPlugin.attachSdkSession(capability) },
             onSdkFilesReady = { capability -> fileTransferPlugin.attachSdkSession(capability) },
-            onSdkTransportStopped = { fileTransferPlugin.onTransportStopped() },
+            onSdkTransportStopped = {
+                fileTransferPlugin.onTransportStopped()
+                remoteInputPlugin.onTransportStopped()
+            },
             onSdkRecord = { event ->
                 clipboardPlugin.handleSdkRecord(event)
                 fileTransferPlugin.handleSdkEvent(event)

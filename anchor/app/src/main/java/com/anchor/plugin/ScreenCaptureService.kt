@@ -15,6 +15,7 @@ import android.media.MediaFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
@@ -60,7 +61,10 @@ class ScreenCaptureService : Service() {
     private var virtualDisplay: VirtualDisplay? = null
     private var encoder: MediaCodec? = null
     private var encoderThread: HandlerThread? = null
+    @Volatile
     private var codecConfig: ByteArray? = null
+    @Volatile
+    private var configEmitPending = false
     private var capturedRotation = -1
     private var displayListener: DisplayManager.DisplayListener? = null
     /** nanoTime → elapsedRealtime translation for codec output timestamps. */
@@ -273,6 +277,33 @@ class ScreenCaptureService : Service() {
         return codec to surface
     }
 
+    /** Re-emit the cached SPS/PPS config AU so a fresh sink can decode. If
+     *  the config AU hasn't arrived yet, emit it as soon as it does. */
+    fun emitConfigFrame() {
+        val cfg = codecConfig
+        if (cfg != null) {
+            frameSink?.invoke(cfg, false, true, translatePts(System.nanoTime() / 1_000))
+        } else {
+            configEmitPending = true
+        }
+    }
+
+    /** Ask the encoder to emit a sync frame ASAP (recovery after drops). */
+    fun requestKeyFrame() {
+        val codec = encoder ?: return
+        encoderThread?.let { thread ->
+            Handler(thread.looper).post {
+                runCatching {
+                    codec.setParameters(
+                        Bundle().apply {
+                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                        },
+                    )
+                }
+            }
+        }
+    }
+
     private fun startEncoder() {
         val (width, height) = displaySize()
         val (codec, surface) = createEncoder(width, height)
@@ -296,6 +327,12 @@ class ScreenCaptureService : Service() {
                     buf.get(cfg)
                     codecConfig = cfg
                     frameSink?.invoke(cfg, false, true, translatePts(info.presentationTimeUs))
+                    // A sink attached before this AU arrived asked to be
+                    // replayed — deliver now that the config exists.
+                    if (configEmitPending) {
+                        configEmitPending = false
+                        frameSink?.invoke(cfg, false, true, translatePts(info.presentationTimeUs))
+                    }
                 }
                 codec.releaseOutputBuffer(index, false)
                 return
@@ -314,7 +351,11 @@ class ScreenCaptureService : Service() {
             buf.get(data)
             codec.releaseOutputBuffer(index, false)
 
-            val isKey = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
+            // BUFFER_FLAG_KEY_FRAME is unreliable on some encoders (this
+            // Qualcomm part never sets it) — detect the IDR NAL directly so
+            // SPS/PPS still gets prepended for late-joining decoders.
+            val isKey = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0 ||
+                containsIdr(data)
             // Same convention as CameraPlugin: keyframes carry SPS/PPS so a
             // late-joining or loss-recovering decoder can start on the IDR.
             val payload = if (isKey && codecConfig != null && !startsWithParamSet(data)) {
@@ -329,6 +370,25 @@ class ScreenCaptureService : Service() {
 
     /** Codec pts is in the nanoTime domain; the wire contract is elapsedRealtime. */
     private fun translatePts(codecPtsUs: Long): Long = codecPtsUs + clockDeltaUs
+
+    /** True if the Annex-B access unit contains an IDR slice (NAL type 5). */
+    private fun containsIdr(data: ByteArray): Boolean {
+        var i = 0
+        while (i + 4 < data.size) {
+            if (data[i] == 0.toByte() && data[i + 1] == 0.toByte()) {
+                val nalOff = when {
+                    data[i + 2] == 1.toByte() -> i + 3
+                    data[i + 2] == 0.toByte() && data[i + 3] == 1.toByte() -> i + 4
+                    else -> { i++; continue }
+                }
+                if (nalOff < data.size && (data[nalOff].toInt() and 0x1F) == 5) return true
+                i = nalOff
+            } else {
+                i++
+            }
+        }
+        return false
+    }
 
     private fun startsWithParamSet(data: ByteArray): Boolean {
         val i = when {
