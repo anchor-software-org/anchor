@@ -10,6 +10,48 @@ use crate::anchorapp::event::{AnchorEvent, AnchorMessage, AnchorTarget};
 use crate::anchorapp::plugin::{Plugin, SharedFrameBuffer};
 use crate::anchorwayland::input::{InputBackend, OutputGeometry, WaylandInput};
 
+/// Decoded input events delivered without a JSON serialize/parse round trip.
+/// Fields carry the same values the `anchor.input.*` JSON packets carried;
+/// `time` is the producer's `now_ms()` truncated to u32 on receipt.
+#[derive(Debug, Clone)]
+pub enum InputPluginMsg {
+    /// Normalized stream coordinates in `[0, 1]`. An empty `output_name`
+    /// selects the default output mapping.
+    MotionAbsolute {
+        x: f64,
+        y: f64,
+        output_name: String,
+        time: u32,
+    },
+    /// Pointer deltas in logical pixels.
+    MotionRelative {
+        dx: f64,
+        dy: f64,
+        time: u32,
+    },
+    /// `button` is a Linux evdev code (e.g. 272 = left).
+    Button {
+        button: u32,
+        pressed: bool,
+        time: u32,
+    },
+    /// `axis`: 0 = vertical, 1 = horizontal.
+    Axis {
+        axis: u32,
+        value: f64,
+        time: u32,
+    },
+    KeyHid {
+        hid_usage: u32,
+        pressed: bool,
+        time: u32,
+    },
+    Text {
+        text: String,
+        time: u32,
+    },
+}
+
 pub struct AnchorPluginInput {
     pub plugin_rx: Option<Receiver<AnchorEvent>>,
     pub broker_tx: Option<Sender<AnchorEvent>>,
@@ -180,136 +222,213 @@ fn run_input_loop(rx: Receiver<AnchorEvent>, broker_tx: Sender<AnchorEvent>) {
         })
         .ok();
 
-    // Main event loop.
+    // Main event loop. Typed `AnchorMessage::Input` events skip JSON entirely;
+    // the `Json` path stays for lower-rate control messages (output_layout,
+    // stream_info) and any other producers.
     let mut perf = InputTimingStats::default();
     for event in rx.iter() {
-        let json_str = match &event.message {
-            AnchorMessage::Json(s) => s.as_str(),
+        match &event.message {
+            AnchorMessage::Input(msg) => {
+                let event_started = Instant::now();
+                let was_motion_absolute =
+                    dispatch_typed(&mut backend, msg, event_started, &mut perf);
+                finish_input_event(&mut backend, &mut perf, event_started, was_motion_absolute);
+            }
+            AnchorMessage::Json(json_str) => {
+                let payload: serde_json::Value = match serde_json::from_str(json_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::warn!("Input: bad JSON: {}", e);
+                        continue;
+                    }
+                };
+
+                let msg_type = match payload.get("type").and_then(|t| t.as_str()) {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let time = payload.get("time").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
+                let event_started = Instant::now();
+                dispatch_json(&mut backend, &payload, msg_type, time, event_started, &mut perf);
+                finish_input_event(
+                    &mut backend,
+                    &mut perf,
+                    event_started,
+                    msg_type == "anchor.input.motion_absolute",
+                );
+            }
             _ => continue,
-        };
-
-        let payload: serde_json::Value = match serde_json::from_str(json_str) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("Input: bad JSON: {}", e);
-                continue;
-            }
-        };
-
-        let msg_type = match payload.get("type").and_then(|t| t.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        let time = payload.get("time").and_then(|t| t.as_u64()).unwrap_or(0) as u32;
-        let event_started = Instant::now();
-
-        match msg_type {
-            "output_layout" => {
-                if let Some(outputs) = parse_output_layout(&payload) {
-                    backend.set_output_layout(&outputs);
-                } else {
-                    log::warn!("Input: ignoring malformed output_layout message");
-                }
-            }
-            "stream_info" => {
-                if let (Some(w), Some(h)) = (
-                    payload.get("width").and_then(|v| v.as_u64()),
-                    payload.get("height").and_then(|v| v.as_u64()),
-                ) {
-                    let output_name =
-                        payload.get("output_name").and_then(|v| v.as_str()).unwrap_or("");
-                    let output_x =
-                        payload.get("output_x").and_then(|v| v.as_i64()).map(|v| v as i32);
-                    let output_y =
-                        payload.get("output_y").and_then(|v| v.as_i64()).map(|v| v as i32);
-                    backend.set_stream_info(output_name, w as u32, h as u32, output_x, output_y);
-                }
-            }
-            "anchor.input.motion" => {
-                perf.record_motion_relative(event_started);
-                let dx = payload.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let dy = payload.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                backend.pointer_motion(time, dx, dy);
-            }
-            "anchor.input.motion_absolute" => {
-                perf.record_motion_absolute(event_started);
-                let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let output_name = payload
-                    .get("output_name")
-                    .and_then(|v| v.as_str())
-                    .filter(|name| !name.is_empty());
-                backend.pointer_motion_absolute_targeted(time, x, y, output_name);
-            }
-            "anchor.input.button" => {
-                perf.record_button(event_started);
-                let button = payload.get("button").and_then(|v| v.as_u64()).unwrap_or(272) as u32;
-                let pressed = payload.get("state").and_then(|v| v.as_u64()).unwrap_or(0) != 0;
-                backend.pointer_button(time, button, pressed);
-            }
-            "anchor.input.axis" => {
-                perf.record_axis(event_started);
-                let axis_val = payload.get("axis").and_then(|v| v.as_u64()).unwrap_or(0);
-                let value = payload.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                backend.pointer_axis(time, axis_val == 1, value);
-            }
-            "anchor.input.frame" => {
-                backend.pointer_frame();
-            }
-            "anchor.input.text" => {
-                if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
-                    backend.type_text(time, text);
-                }
-            }
-            "anchor.input.key" => {
-                if let Some(key) = payload.get("key").and_then(|v| v.as_str()) {
-                    backend.key_special(time, key);
-                }
-            }
-            "anchor.input.key_hid" => {
-                let hid_usage =
-                    payload.get("hid_usage").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let pressed = payload.get("pressed").and_then(|v| v.as_bool()).unwrap_or(false);
-                if !backend.key_hid(time, hid_usage, pressed) {
-                    log::debug!("Input: unhandled HID usage {}", hid_usage);
-                }
-            }
-            "anchor.input.key_combo" => {
-                let mods = payload
-                    .get("modifiers")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
-                backend.key_combo(time, &mods, key);
-            }
-            _ => {
-                log::debug!("Input: unhandled message type: {}", msg_type);
-            }
         }
-
-        backend.flush();
-        let event_cost_us = event_started.elapsed().as_micros();
-        perf.record_cost(event_cost_us);
-        if msg_type == "anchor.input.motion_absolute" && event_cost_us >= INPUT_SLOW_EVENT_WARN_US {
-            let (total_w, total_h) = backend.total_extent();
-            let (sw, sh, sx, sy) = backend.stream_mapping();
-            log::warn!(
-                "[input.perf] slow_abs_event_us={} extent={}x{} mapped_output={}x{}+{},{}",
-                event_cost_us,
-                total_w,
-                total_h,
-                sw,
-                sh,
-                sx,
-                sy
-            );
-        }
-        perf.maybe_log_and_reset(Instant::now());
     }
+}
+
+/// Handles one typed input event. Returns true for motion_absolute so the
+/// caller's epilogue can apply the slow-event warning to the same event kind
+/// the JSON path watches.
+fn dispatch_typed(
+    backend: &mut impl InputBackend,
+    msg: &InputPluginMsg,
+    event_started: Instant,
+    perf: &mut InputTimingStats,
+) -> bool {
+    match msg {
+        InputPluginMsg::MotionAbsolute { x, y, output_name, time } => {
+            perf.record_motion_absolute(event_started);
+            backend.pointer_motion_absolute_targeted(
+                *time,
+                *x,
+                *y,
+                (!output_name.is_empty()).then_some(output_name.as_str()),
+            );
+            true
+        }
+        InputPluginMsg::MotionRelative { dx, dy, time } => {
+            perf.record_motion_relative(event_started);
+            backend.pointer_motion(*time, *dx, *dy);
+            false
+        }
+        InputPluginMsg::Button { button, pressed, time } => {
+            perf.record_button(event_started);
+            backend.pointer_button(*time, *button, *pressed);
+            false
+        }
+        InputPluginMsg::Axis { axis, value, time } => {
+            perf.record_axis(event_started);
+            backend.pointer_axis(*time, *axis == 1, *value);
+            false
+        }
+        InputPluginMsg::KeyHid { hid_usage, pressed, time } => {
+            if !backend.key_hid(*time, *hid_usage, *pressed) {
+                log::debug!("Input: unhandled HID usage {}", hid_usage);
+            }
+            false
+        }
+        InputPluginMsg::Text { text, time } => {
+            backend.type_text(*time, text);
+            false
+        }
+    }
+}
+
+/// Handles one JSON `anchor.input.*` / control message (the pre-typed wire
+/// format, still used by low-rate senders like output_layout and stream_info).
+fn dispatch_json(
+    backend: &mut impl InputBackend,
+    payload: &serde_json::Value,
+    msg_type: &str,
+    time: u32,
+    event_started: Instant,
+    perf: &mut InputTimingStats,
+) {
+    match msg_type {
+        "output_layout" => {
+            if let Some(outputs) = parse_output_layout(payload) {
+                backend.set_output_layout(&outputs);
+            } else {
+                log::warn!("Input: ignoring malformed output_layout message");
+            }
+        }
+        "stream_info" => {
+            if let (Some(w), Some(h)) = (
+                payload.get("width").and_then(|v| v.as_u64()),
+                payload.get("height").and_then(|v| v.as_u64()),
+            ) {
+                let output_name = payload.get("output_name").and_then(|v| v.as_str()).unwrap_or("");
+                let output_x = payload.get("output_x").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let output_y = payload.get("output_y").and_then(|v| v.as_i64()).map(|v| v as i32);
+                backend.set_stream_info(output_name, w as u32, h as u32, output_x, output_y);
+            }
+        }
+        "anchor.input.motion" => {
+            perf.record_motion_relative(event_started);
+            let dx = payload.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let dy = payload.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            backend.pointer_motion(time, dx, dy);
+        }
+        "anchor.input.motion_absolute" => {
+            perf.record_motion_absolute(event_started);
+            let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let output_name =
+                payload.get("output_name").and_then(|v| v.as_str()).filter(|name| !name.is_empty());
+            backend.pointer_motion_absolute_targeted(time, x, y, output_name);
+        }
+        "anchor.input.button" => {
+            perf.record_button(event_started);
+            let button = payload.get("button").and_then(|v| v.as_u64()).unwrap_or(272) as u32;
+            let pressed = payload.get("state").and_then(|v| v.as_u64()).unwrap_or(0) != 0;
+            backend.pointer_button(time, button, pressed);
+        }
+        "anchor.input.axis" => {
+            perf.record_axis(event_started);
+            let axis_val = payload.get("axis").and_then(|v| v.as_u64()).unwrap_or(0);
+            let value = payload.get("value").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            backend.pointer_axis(time, axis_val == 1, value);
+        }
+        "anchor.input.frame" => {
+            backend.pointer_frame();
+        }
+        "anchor.input.text" => {
+            if let Some(text) = payload.get("text").and_then(|v| v.as_str()) {
+                backend.type_text(time, text);
+            }
+        }
+        "anchor.input.key" => {
+            if let Some(key) = payload.get("key").and_then(|v| v.as_str()) {
+                backend.key_special(time, key);
+            }
+        }
+        "anchor.input.key_hid" => {
+            let hid_usage = payload.get("hid_usage").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let pressed = payload.get("pressed").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !backend.key_hid(time, hid_usage, pressed) {
+                log::debug!("Input: unhandled HID usage {}", hid_usage);
+            }
+        }
+        "anchor.input.key_combo" => {
+            let mods = payload
+                .get("modifiers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let key = payload.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            backend.key_combo(time, &mods, key);
+        }
+        _ => {
+            log::debug!("Input: unhandled message type: {}", msg_type);
+        }
+    }
+}
+
+/// Shared per-event epilogue: flush the backend, record cost metrics, and warn
+/// on slow absolute-motion events. Same for typed and JSON events.
+fn finish_input_event(
+    backend: &mut impl InputBackend,
+    perf: &mut InputTimingStats,
+    event_started: Instant,
+    was_motion_absolute: bool,
+) {
+    backend.flush();
+    let event_cost_us = event_started.elapsed().as_micros();
+    perf.record_cost(event_cost_us);
+    if was_motion_absolute && event_cost_us >= INPUT_SLOW_EVENT_WARN_US {
+        let (total_w, total_h) = backend.total_extent();
+        let (sw, sh, sx, sy) = backend.stream_mapping();
+        log::warn!(
+            "[input.perf] slow_abs_event_us={} extent={}x{} mapped_output={}x{}+{},{}",
+            event_cost_us,
+            total_w,
+            total_h,
+            sw,
+            sh,
+            sx,
+            sy
+        );
+    }
+    perf.maybe_log_and_reset(Instant::now());
 }
 
 fn parse_output_layout(payload: &serde_json::Value) -> Option<Vec<OutputGeometry>> {
@@ -385,6 +504,170 @@ mod tests {
                 ]
             });
             assert_eq!(parse_output_layout(&payload), None);
+        }
+    }
+
+    /// Records backend calls so typed and JSON dispatch can be compared.
+    #[derive(Default)]
+    struct RecordingBackend {
+        calls: Vec<String>,
+    }
+
+    impl InputBackend for RecordingBackend {
+        fn total_extent(&self) -> (u32, u32) {
+            (0, 0)
+        }
+        fn stream_mapping(&self) -> (u32, u32, i32, i32) {
+            (0, 0, 0, 0)
+        }
+        fn has_keyboard(&self) -> bool {
+            true
+        }
+        fn set_stream_info(
+            &mut self,
+            output_name: &str,
+            width: u32,
+            height: u32,
+            output_x: Option<i32>,
+            output_y: Option<i32>,
+        ) {
+            self.calls.push(format!(
+                "stream_info {output_name} {width}x{height} {output_x:?} {output_y:?}"
+            ));
+        }
+        fn set_output_layout(&mut self, outputs: &[OutputGeometry]) {
+            self.calls.push(format!("output_layout {outputs:?}"));
+        }
+        fn pointer_motion(&mut self, time: u32, dx: f64, dy: f64) {
+            self.calls.push(format!("motion {time} {dx} {dy}"));
+        }
+        fn pointer_motion_absolute(&mut self, time: u32, x_norm: f64, y_norm: f64) {
+            self.calls.push(format!("motion_abs {time} {x_norm} {y_norm}"));
+        }
+        fn pointer_motion_absolute_targeted(
+            &mut self,
+            time: u32,
+            x_norm: f64,
+            y_norm: f64,
+            output_name: Option<&str>,
+        ) {
+            self.calls.push(format!("motion_abs {time} {x_norm} {y_norm} {output_name:?}"));
+        }
+        fn pointer_button(&mut self, time: u32, button: u32, pressed: bool) {
+            self.calls.push(format!("button {time} {button} {pressed}"));
+        }
+        fn pointer_axis(&mut self, time: u32, horizontal: bool, value: f64) {
+            self.calls.push(format!("axis {time} {horizontal} {value}"));
+        }
+        fn pointer_frame(&mut self) {
+            self.calls.push("frame".into());
+        }
+        fn type_text(&mut self, time: u32, text: &str) {
+            self.calls.push(format!("text {time} {text}"));
+        }
+        fn key_special(&mut self, time: u32, key: &str) -> bool {
+            self.calls.push(format!("key {time} {key}"));
+            true
+        }
+        fn key_combo(&mut self, time: u32, modifiers: &[String], key: &str) {
+            self.calls.push(format!("combo {time} {modifiers:?} {key}"));
+        }
+        fn key_hid(&mut self, time: u32, hid_usage: u32, pressed: bool) -> bool {
+            self.calls.push(format!("key_hid {time} {hid_usage} {pressed}"));
+            true
+        }
+        fn flush(&mut self) {
+            self.calls.push("flush".into());
+        }
+    }
+
+    /// Every input event kind must drive the identical backend call whether it
+    /// arrives as a typed `InputPluginMsg` or the legacy `anchor.input.*` JSON.
+    #[test]
+    fn typed_and_json_dispatch_drive_identical_backend_calls() {
+        let cases: Vec<(serde_json::Value, InputPluginMsg)> = vec![
+            (
+                serde_json::json!({"type":"anchor.input.motion_absolute","x":0.5,"y":0.25,"output_name":"HEADLESS-1","time":7}),
+                InputPluginMsg::MotionAbsolute {
+                    x: 0.5,
+                    y: 0.25,
+                    output_name: "HEADLESS-1".into(),
+                    time: 7,
+                },
+            ),
+            (
+                // Empty output_name maps to the untargeted default in both paths.
+                serde_json::json!({"type":"anchor.input.motion_absolute","x":0.5,"y":0.25,"output_name":"","time":7}),
+                InputPluginMsg::MotionAbsolute {
+                    x: 0.5,
+                    y: 0.25,
+                    output_name: String::new(),
+                    time: 7,
+                },
+            ),
+            (
+                serde_json::json!({"type":"anchor.input.motion","dx":1.25,"dy":-0.875,"time":8}),
+                InputPluginMsg::MotionRelative { dx: 1.25, dy: -0.875, time: 8 },
+            ),
+            (
+                serde_json::json!({"type":"anchor.input.button","button":272,"state":1,"time":9}),
+                InputPluginMsg::Button { button: 272, pressed: true, time: 9 },
+            ),
+            (
+                serde_json::json!({"type":"anchor.input.button","button":273,"state":0,"time":10}),
+                InputPluginMsg::Button { button: 273, pressed: false, time: 10 },
+            ),
+            (
+                serde_json::json!({"type":"anchor.input.axis","axis":0,"value":-120,"time":11}),
+                InputPluginMsg::Axis { axis: 0, value: -120.0, time: 11 },
+            ),
+            (
+                serde_json::json!({"type":"anchor.input.key_hid","hid_usage":44,"pressed":true,"time":12}),
+                InputPluginMsg::KeyHid { hid_usage: 44, pressed: true, time: 12 },
+            ),
+            (
+                serde_json::json!({"type":"anchor.input.text","text":"Hello","time":13}),
+                InputPluginMsg::Text { text: "Hello".into(), time: 13 },
+            ),
+        ];
+
+        for (payload, msg) in cases {
+            let mut json_backend = RecordingBackend::default();
+            let mut typed_backend = RecordingBackend::default();
+            let mut json_perf = InputTimingStats::default();
+            let mut typed_perf = InputTimingStats::default();
+            let started = Instant::now();
+            let time = payload.get("time").and_then(|v| v.as_u64()).unwrap() as u32;
+
+            dispatch_json(
+                &mut json_backend,
+                &payload,
+                payload.get("type").and_then(|v| v.as_str()).unwrap(),
+                time,
+                started,
+                &mut json_perf,
+            );
+            dispatch_typed(&mut typed_backend, &msg, started, &mut typed_perf);
+
+            assert_eq!(
+                json_backend.calls, typed_backend.calls,
+                "backend calls diverge for payload {payload}"
+            );
+            assert_eq!(
+                (
+                    json_perf.motion_absolute_events,
+                    json_perf.motion_relative_events,
+                    json_perf.button_events,
+                    json_perf.axis_events
+                ),
+                (
+                    typed_perf.motion_absolute_events,
+                    typed_perf.motion_relative_events,
+                    typed_perf.button_events,
+                    typed_perf.axis_events
+                ),
+                "perf counters diverge for payload {payload}"
+            );
         }
     }
 }

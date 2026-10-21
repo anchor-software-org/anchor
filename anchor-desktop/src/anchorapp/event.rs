@@ -1,5 +1,6 @@
 //! Core message types passed between plugins through the broker.
 
+use crate::anchorapp::input_plugin::InputPluginMsg;
 use crate::anchorwayland::wayland_plugin::WaylandPluginMsg;
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,8 @@ pub enum AnchorTarget {
 #[derive(Debug, Clone)]
 pub enum AnchorMessage {
     Wayland(WaylandPluginMsg),
+    /// Decoded input events carried without a JSON round trip.
+    Input(InputPluginMsg),
     Generic(String),
     Json(String),
 }
