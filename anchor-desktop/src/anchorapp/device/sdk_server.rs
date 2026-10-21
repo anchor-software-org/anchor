@@ -21,6 +21,7 @@ use super::DeviceRegistry;
 use crate::anchorapp::{
     clipboard_plugin::SdkClipboardBinding,
     event::{AnchorEvent, AnchorMessage, AnchorTarget, PairingRequest, SharedPairingRequest},
+    input_plugin::InputPluginMsg,
     sdk_camera::{SdkCameraBinding, SdkCameraSender},
     sdk_commands::{SdkCommandsBinding, SdkCommandsSender},
     sdk_device::{SdkDeviceBinding, SdkDeviceSender},
@@ -878,10 +879,14 @@ async fn handle_session(
                     && type_url == input::POINTER_ABSOLUTE_TYPE_URL =>
             {
                 if let Ok(message) = input::decode_pointer_absolute(&payload) {
-                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.motion_absolute", "x": message.x as f64 / 65535.0, "y": message.y as f64 / 65535.0, "output_name": message.target_output_name, "time": now_ms()});
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
-                        message: AnchorMessage::Json(packet.to_string()),
+                        message: AnchorMessage::Input(InputPluginMsg::MotionAbsolute {
+                            x: message.x as f64 / 65535.0,
+                            y: message.y as f64 / 65535.0,
+                            output_name: message.target_output_name,
+                            time: now_ms() as u32,
+                        }),
                     });
                 }
             }
@@ -890,10 +895,13 @@ async fn handle_session(
                     && type_url == input::POINTER_RELATIVE_TYPE_URL =>
             {
                 if let Ok(message) = input::decode_pointer_relative(&payload) {
-                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.motion", "dx": message.dx_1000ths as f64 / 1000.0, "dy": message.dy_1000ths as f64 / 1000.0, "time": now_ms()});
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
-                        message: AnchorMessage::Json(packet.to_string()),
+                        message: AnchorMessage::Input(InputPluginMsg::MotionRelative {
+                            dx: message.dx_1000ths as f64 / 1000.0,
+                            dy: message.dy_1000ths as f64 / 1000.0,
+                            time: now_ms() as u32,
+                        }),
                     });
                 }
             }
@@ -902,10 +910,13 @@ async fn handle_session(
                     && type_url == input::KEY_TYPE_URL =>
             {
                 if let Ok(message) = input::decode_key(&payload) {
-                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.key_hid", "hid_usage": message.hid_usage, "pressed": message.pressed, "time": now_ms()});
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
-                        message: AnchorMessage::Json(packet.to_string()),
+                        message: AnchorMessage::Input(InputPluginMsg::KeyHid {
+                            hid_usage: message.hid_usage,
+                            pressed: message.pressed,
+                            time: now_ms() as u32,
+                        }),
                     });
                 }
             }
@@ -934,10 +945,13 @@ async fn handle_session(
                             "SDK input button from {device_id}: button={button} pressed={}",
                             message.pressed
                         );
-                        let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.button", "button": button, "state": if message.pressed { 1 } else { 0 }, "time": now_ms()});
                         let _ = broker_tx.send(AnchorEvent {
                             target: AnchorTarget::Service("input".into()),
-                            message: AnchorMessage::Json(packet.to_string()),
+                            message: AnchorMessage::Input(InputPluginMsg::Button {
+                                button,
+                                pressed: message.pressed,
+                                time: now_ms() as u32,
+                            }),
                         });
                     } else {
                         log::warn!(
@@ -952,10 +966,13 @@ async fn handle_session(
                     && type_url == input::SCROLL_TYPE_URL =>
             {
                 if let Ok(message) = input::decode_scroll(&payload) {
-                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.axis", "axis": 0, "value": message.vertical_120ths, "time": now_ms()});
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
-                        message: AnchorMessage::Json(packet.to_string()),
+                        message: AnchorMessage::Input(InputPluginMsg::Axis {
+                            axis: 0,
+                            value: message.vertical_120ths as f64,
+                            time: now_ms() as u32,
+                        }),
                     });
                 }
             }
@@ -964,10 +981,12 @@ async fn handle_session(
                     && type_url == input::TEXT_TYPE_URL =>
             {
                 if let Ok(message) = input::decode_text(&payload) {
-                    let packet = serde_json::json!({"plugin_id":"input", "type":"anchor.input.text", "text": message.text_utf8, "time": now_ms()});
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
-                        message: AnchorMessage::Json(packet.to_string()),
+                        message: AnchorMessage::Input(InputPluginMsg::Text {
+                            text: message.text_utf8,
+                            time: now_ms() as u32,
+                        }),
                     });
                 }
             }
@@ -1176,16 +1195,11 @@ async fn handle_session(
                 for button in pressed_buttons.drain() {
                     let _ = broker_tx.send(AnchorEvent {
                         target: AnchorTarget::Service("input".into()),
-                        message: AnchorMessage::Json(
-                            serde_json::json!({
-                                "plugin_id": "input",
-                                "type": "anchor.input.button",
-                                "button": button,
-                                "state": 0,
-                                "time": now_ms(),
-                            })
-                            .to_string(),
-                        ),
+                        message: AnchorMessage::Input(InputPluginMsg::Button {
+                            button,
+                            pressed: false,
+                            time: now_ms() as u32,
+                        }),
                     });
                     log::warn!("Released SDK input button {button} after session close");
                 }
