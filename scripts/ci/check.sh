@@ -16,19 +16,27 @@ features=()
 if [[ "${VENDOR_FFMPEG:-0}" == "1" ]]; then
     echo "==> FFmpeg mode: vendored source build (release parity)"
 else
-    echo "==> FFmpeg mode: pinned prebuilt (CI parity; VENDOR_FFMPEG=1 for source)"
+    echo "==> FFmpeg mode: pinned prebuilt when available, otherwise vendored source"
     ffmpeg_dir="${XDG_CACHE_HOME:-$HOME/.cache}/anchor/ffmpeg-prebuilt"
     if [[ ! -f "$ffmpeg_dir/lib/libavcodec.so" ]]; then
         mkdir -p "$ffmpeg_dir"
         tmp="$ffmpeg_dir/ffmpeg-prebuilt.tar.xz"
-        curl -fsSL -o "$tmp" "$FFMPEG_URL"
-        echo "$FFMPEG_SHA256  $tmp" | sha256sum -c -
-        tar xf "$tmp" -C "$ffmpeg_dir" --strip-components=1
-        rm "$tmp"
+        # Upstream prunes old autobuild releases. A fresh CI runner must
+        # still work after the pinned binary expires; use our locked source
+        # build in that case. Keep checksum failures fatal.
+        if curl -fsSL --retry 3 -o "$tmp" "$FFMPEG_URL"; then
+            echo "$FFMPEG_SHA256  $tmp" | sha256sum -c -
+            tar xf "$tmp" -C "$ffmpeg_dir" --strip-components=1
+        else
+            echo "==> FFmpeg prebuilt unavailable; building vendored source"
+        fi
+        rm -f "$tmp"
     fi
-    export FFMPEG_DIR="$ffmpeg_dir"
-    export LD_LIBRARY_PATH="$ffmpeg_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    features=(--no-default-features --features ffmpeg-prebuilt)
+    if [[ -f "$ffmpeg_dir/lib/libavcodec.so" ]]; then
+        export FFMPEG_DIR="$ffmpeg_dir"
+        export LD_LIBRARY_PATH="$ffmpeg_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        features=(--no-default-features --features ffmpeg-prebuilt)
+    fi
 fi
 
 cd "$frontend"
