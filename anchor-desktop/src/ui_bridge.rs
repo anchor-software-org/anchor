@@ -114,6 +114,10 @@ pub struct CaptureMetrics {
 pub struct ScreenPreview {
     pub sequence: u64,
     pub data_url: String,
+    /// Remote-mirror frames carry a measured glass-to-glass latency; local
+    /// screen previews leave this unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +130,9 @@ pub struct PairedDeviceSummary {
     pub battery_charging: bool,
     pub fingerprint: String,
     pub camera_capable: bool,
+    /// Canonical capability names the live session attached
+    /// (`org.anchor.*`); empty when the device is offline.
+    pub capabilities: Vec<String>,
     pub display_width: Option<u32>,
     pub display_height: Option<u32>,
 }
@@ -322,6 +329,8 @@ pub struct DesktopController {
     mobile_batteries: crate::anchorapp::battery::MobileBatteryMap,
     input_capabilities: Mutex<InputCapabilities>,
     frame_buffer: std::sync::Arc<Mutex<Option<SharedFrameBuffer>>>,
+    remote_input: crate::anchorapp::sdk_remote_input::SdkRemoteInputBinding,
+    remote_mirror_watchers: crate::anchorapp::sdk_remote_input::MirrorWatchers,
 }
 
 impl DesktopController {
@@ -343,6 +352,7 @@ impl DesktopController {
             commands,
             camera_setup,
             frame_buffer,
+            remote_input,
         } = runtime;
         Self {
             broker_tx,
@@ -378,6 +388,8 @@ impl DesktopController {
             command_runs: Mutex::new(HashMap::new()),
             camera_setup,
             frame_buffer,
+            remote_input,
+            remote_mirror_watchers: crate::anchorapp::sdk_remote_input::MirrorWatchers::default(),
             mobile_batteries: crate::anchorapp::battery::new_mobile_battery_map(),
             input_capabilities: Mutex::new(InputCapabilities::default()),
             camera_preferences: Mutex::new(CameraPreferences {
@@ -410,6 +422,10 @@ impl DesktopController {
         let display_sizes: HashMap<_, _> = connected_devices
             .iter()
             .filter_map(|device| device.display_size.map(|size| (device.id.clone(), size)))
+            .collect();
+        let device_capabilities: HashMap<_, _> = connected_devices
+            .iter()
+            .map(|device| (device.id.clone(), device.capabilities.clone()))
             .collect();
         let camera_devices: HashSet<String> = if section == "settings" {
             connected_devices
@@ -480,6 +496,8 @@ impl DesktopController {
                     let camera_capable = camera_devices.contains(&device.device_id);
                     let display_size = display_sizes.get(&device.device_id).copied();
                     let battery = mobile_batteries.get(&device.device_id);
+                    let capabilities =
+                        device_capabilities.get(&device.device_id).cloned().unwrap_or_default();
                     PairedDeviceSummary {
                         id: device.device_id,
                         name: device.device_name,
@@ -488,6 +506,7 @@ impl DesktopController {
                         battery_charging: battery.is_some_and(|battery| battery.charging),
                         fingerprint: certificate_fingerprint(&device.certificate_pem),
                         camera_capable,
+                        capabilities,
                         display_width: display_size.map(|(width, _)| width),
                         display_height: display_size.map(|(_, height)| height),
                     }
@@ -1092,6 +1111,158 @@ impl DesktopController {
         )
     }
 
+    /// Resolve where a remote-control record goes. An explicit device id
+    /// must correspond to a live input sender; the broadcast fallback
+    /// requires at least one connected device.
+    fn remote_target(&self, device_id: Option<&str>) -> Result<AnchorTarget, String> {
+        match device_id {
+            Some(id) => {
+                if self.remote_input.sender(id).is_none() {
+                    return Err("That phone is not connected for remote control.".into());
+                }
+                Ok(AnchorTarget::DeviceId(id.to_string()))
+            }
+            None => {
+                if self.remote_input.senders().is_empty() {
+                    return Err("No connected phone for remote control.".into());
+                }
+                Ok(AnchorTarget::Device)
+            }
+        }
+    }
+
+    /// Stamp the remoteinput plugin id onto a control payload and route it.
+    fn remote_send(
+        &self,
+        device_id: Option<String>,
+        mut value: serde_json::Value,
+    ) -> Result<(), String> {
+        value["plugin_id"] = serde_json::json!("remoteinput");
+        self.send_json(self.remote_target(device_id.as_deref())?, value)
+    }
+
+    /// Remote-control a connected phone: tap at normalized [0,1] coordinates.
+    pub fn remote_tap(&self, device_id: Option<String>, x: f64, y: f64) -> Result<(), String> {
+        self.remote_send(device_id, serde_json::json!({"type": "remote_tap", "x": x, "y": y}))
+    }
+
+    pub fn remote_pointer_down(
+        &self,
+        device_id: Option<String>,
+        x: f64,
+        y: f64,
+    ) -> Result<(), String> {
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_pointer_down", "x": x, "y": y}),
+        )
+    }
+
+    pub fn remote_pointer_move(
+        &self,
+        device_id: Option<String>,
+        x: f64,
+        y: f64,
+    ) -> Result<(), String> {
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_pointer_move", "x": x, "y": y}),
+        )
+    }
+
+    pub fn remote_pointer_up(&self, device_id: Option<String>) -> Result<(), String> {
+        self.remote_send(device_id, serde_json::json!({"type": "remote_pointer_up"}))
+    }
+
+    pub fn remote_scroll(&self, device_id: Option<String>, dx: f64, dy: f64) -> Result<(), String> {
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_scroll", "dx": dx, "dy": dy}),
+        )
+    }
+
+    pub fn remote_text(&self, device_id: Option<String>, text: String) -> Result<(), String> {
+        self.remote_send(device_id, serde_json::json!({"type": "remote_text", "text": text}))
+    }
+
+    /// Send a USB HID usage to the phone's remote-input service.
+    pub fn remote_key(
+        &self,
+        device_id: Option<String>,
+        usage: u32,
+        pressed: bool,
+    ) -> Result<(), String> {
+        self.remote_send(
+            device_id,
+            serde_json::json!({"type": "remote_key", "usage": usage, "pressed": pressed}),
+        )
+    }
+
+    pub fn remote_nav(&self, device_id: Option<String>, action: &str) -> Result<(), String> {
+        if !matches!(action, "back" | "home" | "recents") {
+            return Err("Unsupported remote nav action.".into());
+        }
+        self.remote_send(device_id, serde_json::json!({"type": format!("remote_{action}")}))
+    }
+
+    /// A window asks for the remote mirror. The phone is told to start only
+    /// on the first watcher for a device and to stop when the last one
+    /// leaves — the main pane and the popout can share one stream.
+    pub fn remote_mirror(
+        &self,
+        watcher: &str,
+        device_id: Option<String>,
+        enabled: bool,
+    ) -> Result<(), String> {
+        // Enabling against a missing device must fail before we record
+        // intent; disabling is best-effort so teardown always lands.
+        let target = match self.remote_target(device_id.as_deref()) {
+            Ok(target) => target,
+            Err(error) if enabled => return Err(error),
+            Err(_) => AnchorTarget::Device,
+        };
+        let device_key = device_id.clone().unwrap_or_default();
+        let transition = self.remote_mirror_watchers.set(&device_key, watcher, enabled);
+        if transition.is_some() {
+            self.send_json(target, remote_mirror_json(enabled))?;
+        }
+        Ok(())
+    }
+
+    /// A window closed without untoggling its mirror request.
+    pub fn remote_mirror_watcher_dropped(&self, watcher: &str) {
+        for device_key in self.remote_mirror_watchers.dropped(watcher) {
+            let target = if device_key.is_empty() {
+                AnchorTarget::Device
+            } else {
+                AnchorTarget::DeviceId(device_key)
+            };
+            let _ = self.send_json(target, remote_mirror_json(false));
+        }
+    }
+
+    /// Newest mirror frame after `after_sequence` — per-device when an id is
+    /// given so a second phone can't interleave frames into the view.
+    /// The payload is already JPEG, so the data URL is built without a decode.
+    pub fn remote_frame(
+        &self,
+        device_id: Option<String>,
+        after_sequence: u64,
+    ) -> Option<ScreenPreview> {
+        let frame = match device_id.as_deref() {
+            Some(id) => self.remote_input.frame_after(id, after_sequence),
+            None => self.remote_input.latest_frame(after_sequence),
+        }?;
+        Some(ScreenPreview {
+            sequence: frame.sequence,
+            data_url: format!(
+                "data:image/jpeg;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(frame.jpeg.as_slice())
+            ),
+            latency_ms: frame.latency_ms,
+        })
+    }
+
     fn send_camera_control(&self, command: &str, value: serde_json::Value) -> Result<(), String> {
         self.send_json(
             AnchorTarget::Device,
@@ -1460,6 +1631,7 @@ pub fn encode_screen_preview(frame: SharedFrameBuffer) -> Result<ScreenPreview, 
             "data:image/jpeg;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(jpeg)
         ),
+        latency_ms: None,
     })
 }
 
@@ -1590,6 +1762,10 @@ fn unique_destination(folder: &Path, file_name: &str) -> PathBuf {
         }
     }
     folder.join(format!("{stem}-{}", now_ms()))
+}
+
+fn remote_mirror_json(enabled: bool) -> serde_json::Value {
+    serde_json::json!({"plugin_id": "remoteinput", "type": "remote_mirror", "enabled": enabled})
 }
 
 fn certificate_fingerprint(certificate_pem: &str) -> String {

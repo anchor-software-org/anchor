@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">anchor</string>
+    <string name="remote_control_service_label">anchor remote control</string>
+    <string name="remote_control_service_description">Lets a paired Anchor desktop tap, swipe, type, and capture this screen when you start remote control. Only enable it if you use remote control with a trusted computer.</string>
 </resources>
