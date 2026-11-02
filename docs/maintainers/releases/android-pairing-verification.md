@@ -23,6 +23,10 @@ The nearby-device path logged the identity failure without displaying a
 desktop prompt; direct-address pairing displayed an identity-creation error.
 Existing identities skip key generation, which can hide the regression.
 
+The [issue #69 evidence catalog](evidence/issue-69/README.md) includes the
+original log excerpts, APK hashes, native-library comparison, packaged-class
+checks and the saved UI state from the successful test.
+
 The SDK now exports rules for the EC and X.509 provider classes in
 `anchor-sdk/kotlin/consumer-rules.pro`. Keep the explicit provider: switching
 back to Android's built-in BC provider can produce private-key encodings that
@@ -57,15 +61,12 @@ This is a structural guard, not a substitute for the device smoke test below.
    and desktop share a multicast-capable network; direct-address pairing is
    useful for a VM behind NAT.
 5. Restart Android and confirm it reuses its identity and reconnects.
-6. Leave a desktop request unanswered until its deadline. The desktop prompt
-   must disappear, and the next request must be usable. Disconnecting the
-   requesting peer must also remove its pending prompt.
 
 The November 1 reproduction used a checksum-verified official Pop!_OS 24.04
 live ISO in libvirt and a separate Android x86_64 emulator. The downloaded
 F-Droid APK failed identity creation; a minified APK with the SDK consumer
 rules displayed the COSMIC prompt and completed authenticated pairing with
-both the unchanged desktop 1.0.0 AppImage and the updated desktop build.
+the unchanged desktop 1.0.0 AppImage.
 For that Android test, the native libraries were reused unchanged from the
 F-Droid APK to isolate the R8 change; normal release/CI builds compile them
 from the pinned sources.
