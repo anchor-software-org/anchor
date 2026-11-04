@@ -818,13 +818,16 @@
         <div class="settings-page">
           <section class="settings-section">
             <div class="settings-heading"><div><h2>Appearance</h2></div></div>
-            <label class="setting-check">
+            <label class="appearance-setting">
+              <span class="appearance-setting-copy"><strong>Show window controls</strong><small>Minimize, maximize, close, and resize the window.</small></span>
+              <span class="appearance-switch">
               <input type="checkbox" checked={showWindowControls} disabled={!desktop || busy} onchange={(event) => {
                 const enabled = event.currentTarget.checked;
                 event.currentTarget.checked = showWindowControls;
                 void runAction(() => setWindowControls(enabled));
               }} />
-              <span><strong>Show window controls</strong><small>Show minimize, maximize, close, and resize handles.</small></span>
+              <span class="appearance-switch-track" aria-hidden="true"></span>
+              </span>
             </label>
           </section>
           <section class="settings-section">
