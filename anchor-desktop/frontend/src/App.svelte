@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import Select from './lib/Select.svelte';
   import TransportIcon from './lib/TransportIcon.svelte';
+  import WindowChrome from './lib/WindowChrome.svelte';
   import {
     clearClipboard,
     clearLogs,
@@ -552,7 +553,7 @@
 
 <main class="shell">
   <aside class="sidebar" aria-label="Anchor navigation">
-    <div class="brand">Anchor</div>
+    <div class="brand" data-tauri-drag-region>Anchor</div>
     <nav>
       {#each navigation as item}
         <button class:active={active === item.id} onclick={() => void selectSection(item.id)} aria-current={active === item.id ? 'page' : undefined}>
@@ -564,9 +565,7 @@
   </aside>
 
   <section class="workspace">
-    <header class="topbar">
-      <h1>{pageTitle()}</h1>
-    </header>
+    <WindowChrome title={pageTitle()} onerror={(error) => { actionError = String(error); }} />
 
     <div class="page">
       {#if active === 'sideboat'}
