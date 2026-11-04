@@ -1,0 +1,5 @@
+Anchor 1.0.2 fixes pairing on new installs.
+
+• Fixed pairing when the app is installed for the first time
+• Kept crypto classes that the release optimizer removed
+• Improved datagram send performance
