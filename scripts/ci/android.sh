@@ -35,13 +35,19 @@ if [[ "$missing" == "1" ]]; then
 fi
 
 cd "$repo_root/anchor"
-./gradlew :anchorSdk:testDebugUnitTest :app:testDebugUnitTest :app:assembleDebug --no-daemon "$@"
+./gradlew :anchorSdk:testDebugUnitTest :app:testDebugUnitTest :app:assembleDebug :app:assembleRelease --no-daemon "$@"
+
+# R8 can remove reflection-only crypto providers while every debug test passes.
+# Verify the actual minified APK, including on CI where no signing key is used.
+release_apk=$(ls -t app/build/outputs/apk/release/*.apk | head -n 1)
+python3 "$repo_root/scripts/ci/verify-android-pairing.py" "$release_apk"
 
 # Verify the packaged APK actually carries the native transport.
 apk=$(ls -t app/build/outputs/apk/debug/*.apk | head -n 1)
 for abi in $abis; do
     for lib in libmsquic.so libanchor_msquic_jni.so; do
-        unzip -l "$apk" | grep -q "lib/$abi/$lib" \
+        # Consume the full listing: grep -q can SIGPIPE unzip under pipefail.
+        unzip -l "$apk" | grep "lib/$abi/$lib" >/dev/null \
             || { echo "ci: $apk is missing lib/$abi/$lib" >&2; exit 1; }
     done
 done

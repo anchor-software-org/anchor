@@ -1,0 +1,4 @@
+11-01 09:53:13.757 10318 10318 I anchor  : Loaded 0 trusted devices
+11-01 09:53:49.142 10318 10318 I anchor  : Connect button requested: host=192.168.122.22
+11-01 09:53:49.142 10318 10318 I anchor  : Starting direct pairing for new host=192.168.122.22
+11-01 09:53:49.145 10318 10346 W anchor  : SDK identity could not be created for direct pairing: no such algorithm: EC for provider BC

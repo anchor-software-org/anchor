@@ -2,7 +2,7 @@ name: Verification Artifacts
 
 # Build verification artifacts on every pull request and main push:
 #   - the Linux Tauri desktop binary (`anchor`, release build)
-#   - the Android debug APK
+#   - the Android debug APK, plus a minified release pairing-provider check
 # These are CI outputs only. This workflow does not sign or distribute a
 # release, and it must not receive Play credentials.
 on:
@@ -105,7 +105,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build debug APK
+      - name: Build Android APKs and verify release pairing providers
         working-directory: .
         run: bash scripts/ci/android.sh
 
