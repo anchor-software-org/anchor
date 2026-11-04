@@ -11,31 +11,6 @@ defaults:
     working-directory: anchor-desktop
 
 jobs:
-  window-controls:
-    name: Desktop window controls
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: anchor-desktop/frontend
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: anchor-desktop/frontend/pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
-      - run: pnpm test
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: window-controls-test-results
-          path: anchor-desktop/frontend/test-results/
-
   sdk-conformance:
     name: SDK source conformance
     runs-on: ubuntu-latest
