@@ -40,6 +40,7 @@
     setCameraZoom,
     setSideboatVisible,
     setStreaming,
+    setWindowControls,
     setupCamera,
     switchCamera,
     unpairDevice,
@@ -65,6 +66,7 @@
 
   let active: Section = 'sideboat';
   let desktop: DesktopState | undefined;
+  let showWindowControls = false;
   let appVersion: string | undefined;
   let actionError = '';
   let busy = false;
@@ -199,6 +201,7 @@
       const shouldScrollLogs = logRenderKey !== '' && logRenderKey !== lastLogRenderKey;
       if (section === 'logs') lastLogRenderKey = logRenderKey;
       desktop = state;
+      showWindowControls = state.showWindowControls;
       const displayDevices = state.devices
         .filter((device) => device.online && device.displayWidth && device.displayHeight)
         .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
@@ -565,7 +568,7 @@
   </aside>
 
   <section class="workspace">
-    <WindowChrome title={pageTitle()} onerror={(error) => { actionError = String(error); }} />
+    <WindowChrome title={pageTitle()} enabled={showWindowControls} onerror={(error) => { actionError = String(error); }} />
 
     <div class="page">
       {#if active === 'sideboat'}
@@ -813,6 +816,17 @@
 
       {:else if active === 'settings'}
         <div class="settings-page">
+          <section class="settings-section">
+            <div class="settings-heading"><div><h2>Appearance</h2></div></div>
+            <label class="setting-check">
+              <input type="checkbox" checked={showWindowControls} disabled={!desktop || busy} onchange={(event) => {
+                const enabled = event.currentTarget.checked;
+                event.currentTarget.checked = showWindowControls;
+                void runAction(() => setWindowControls(enabled));
+              }} />
+              <span><strong>Show window controls</strong><small>Show minimize, maximize, close, and resize handles.</small></span>
+            </label>
+          </section>
           <section class="settings-section">
             <div class="settings-heading"><div><h2>Paired devices</h2><p>Approve nearby pairing requests from this screen.</p></div><div class="actions"><span>{desktop?.devices.filter((device) => device.online).length ?? 0} connected</span></div></div>
             <div class="device-list">

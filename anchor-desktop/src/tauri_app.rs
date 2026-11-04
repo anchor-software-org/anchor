@@ -81,6 +81,7 @@ async fn screen_preview(
 }
 
 controller_action!(set_sideboat_visible(visible: bool) => set_sideboat_visible(visible));
+controller_action!(set_window_controls(enabled: bool) => set_window_controls(enabled));
 
 #[tauri::command]
 fn unpair_device(controller: ControllerState<'_>, device_id: String) {
@@ -201,6 +202,7 @@ pub fn run() {
             destroy_virtual_display,
             screen_preview,
             set_sideboat_visible,
+            set_window_controls,
             unpair_device,
             respond_to_pairing,
             dismiss_notification,

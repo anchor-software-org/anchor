@@ -97,3 +97,35 @@ test('native failures are reported', async ({ page }) => {
   await page.getByRole('button', { name: 'Minimize window', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('Window action denied');
 });
+
+test('Settings defaults controls on and can persistently disable and re-enable them', async ({ page }) => {
+  await page.goto('/tests/fixtures/window.html?app');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  const toggle = page.getByRole('checkbox', { name: 'Show window controls' });
+  await expect(toggle).toBeChecked();
+  await toggle.uncheck();
+  await expect(toggle).not.toBeChecked();
+  await expect(page.locator('.window-controls')).toHaveCount(0);
+  await expect(page.locator('.window-resize-grip')).toHaveCount(0);
+  await expect(page.locator('.window-resize-edge')).toHaveCount(0);
+  await page.reload();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(toggle).not.toBeChecked();
+  await expect(page.locator('.window-controls')).toHaveCount(0);
+  await toggle.check();
+  await expect(page.getByRole('button', { name: 'Maximize window', exact: true })).toBeVisible();
+  await expect(page.locator('.window-resize-grip')).toBeVisible();
+  await expect(page.locator('.window-resize-edge')).toHaveCount(7);
+});
+
+test('a failed settings save preserves the enabled controls and reports the error', async ({ page }) => {
+  await page.goto('/tests/fixtures/window.html?app');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.evaluate(() => { window.testWindow.failCommand = 'set_window_controls'; });
+  const toggle = page.getByRole('checkbox', { name: 'Show window controls' });
+  await toggle.click();
+  await expect(page.locator('.toast')).toContainText('Window action denied');
+  await expect(toggle).toBeChecked();
+  await expect(page.locator('.window-controls')).toBeVisible();
+  await expect(page.locator('.window-resize-grip')).toBeVisible();
+});

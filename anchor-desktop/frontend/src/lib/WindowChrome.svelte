@@ -5,6 +5,7 @@
   type ResizeDirection = Parameters<ReturnType<typeof getCurrentWindow>['startResizeDragging']>[0];
 
   export let title: string;
+  export let enabled = true;
   export let onerror: (error: unknown) => void;
 
   let maximized = false;
@@ -42,6 +43,7 @@
   <div class="window-drag-region" data-tauri-drag-region>
     <h1 data-tauri-drag-region>{title}</h1>
   </div>
+  {#if enabled}
   <div class="window-controls" aria-label="Window controls">
     <button aria-label="Minimize window" title="Minimize" onclick={() => run(() => getCurrentWindow().minimize())}>
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 11h10" /></svg>
@@ -55,9 +57,10 @@
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 3 10 10M13 3 3 13" /></svg>
     </button>
   </div>
+  {/if}
 </header>
 
-{#if !maximized}
+{#if enabled && !maximized}
   {#each edges as edge}
     <button class="window-resize-edge" data-edge={edge} aria-label={`Resize window ${edge}`} tabindex="-1" onmousedown={(event) => resize(event, edge)}></button>
   {/each}
