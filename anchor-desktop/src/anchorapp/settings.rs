@@ -55,6 +55,19 @@ pub struct AppSettings {
     pub clipboard: ClipboardSettings,
     pub camera: CameraSettings,
     pub file_transfer: FileTransferSettings,
+    pub window: WindowSettings,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct WindowSettings {
+    pub show_controls: bool,
+}
+
+impl Default for WindowSettings {
+    fn default() -> Self {
+        Self { show_controls: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -457,6 +470,12 @@ pub fn save_camera_auto_load(value: bool) -> Result<(), String> {
     save_settings(&current)
 }
 
+pub fn save_window_controls(enabled: bool) -> Result<(), String> {
+    let mut current = load_settings();
+    current.window.show_controls = enabled;
+    save_settings(&current)
+}
+
 /// Update camera streaming parameters on disk. Returns the new persisted values.
 pub fn save_camera_stream_params(fps: u32, bitrate_kbps: u32) -> Result<(u32, u32), String> {
     let fps = fps.clamp(1, 120);
@@ -497,6 +516,12 @@ const DEFAULTS_DOC: &str = r#"# Anchor Settings Reference
 
 Settings file: `~/.config/anchor/settings.json`
 Delete the file to regenerate defaults. Restart the app after editing.
+
+## window
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `show_controls` | `true` | Show window buttons and resize handles. Can also be changed immediately in Settings → Appearance → Show window controls. |
 
 ## capture
 
@@ -587,5 +612,22 @@ mod tests {
     fn empty_json_gives_defaults() {
         let s: AppSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.encoding.bitrate_bps, 15_000_000);
+    }
+
+    #[test]
+    fn window_controls_default_on_for_existing_settings() {
+        for json in ["{}", r#"{"window": {}}"#, r#"{"camera": {"auto_load": true}}"#] {
+            let s: AppSettings = serde_json::from_str(json).unwrap();
+            assert!(s.window.show_controls);
+        }
+    }
+
+    #[test]
+    fn disabled_window_controls_survive_settings_roundtrip() {
+        let s: AppSettings =
+            serde_json::from_str(r#"{"window": {"show_controls": false}}"#).unwrap();
+        let saved = serde_json::to_string(&s).unwrap();
+        let restored: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.window.show_controls);
     }
 }

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::{
     Mutex,
-    atomic::{AtomicI64, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,7 +34,8 @@ use crate::anchorapp::media_plugin::{
 };
 use crate::anchorapp::plugin::SharedFrameBuffer;
 use crate::anchorapp::settings::{
-    init_settings, save_camera_auto_load, save_camera_stream_params, save_settings, settings,
+    init_settings, load_settings, save_camera_auto_load, save_camera_stream_params, save_settings,
+    save_window_controls, settings,
 };
 use crate::anchorapp::sms_models::SmsThread;
 use crate::anchorapp::sms_plugin::SharedSmsThreads;
@@ -46,6 +47,7 @@ use crate::foghorn::SharedNotifications;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopState {
+    pub show_window_controls: bool,
     pub app_name: String,
     pub version: String,
     pub build: String,
@@ -298,6 +300,7 @@ struct ConversationMessage {
 /// Owns only the control-plane boundary between a frontend and Anchor's
 /// existing desktop services.
 pub struct DesktopController {
+    show_window_controls: AtomicBool,
     broker_tx: std::sync::mpsc::Sender<AnchorEvent>,
     gui_events: Mutex<std::sync::mpsc::Receiver<AnchorEvent>>,
     device_registry: DeviceRegistry,
@@ -357,6 +360,7 @@ impl DesktopController {
                 metrics: None,
             }),
             virtual_displays: Mutex::new(Vec::new()),
+            show_window_controls: AtomicBool::new(settings().window.show_controls),
             log_buffer,
             foghorn_notifications,
             sms_threads,
@@ -456,6 +460,7 @@ impl DesktopController {
         let input_capabilities = self.input_capabilities.lock().unwrap().clone();
 
         DesktopState {
+            show_window_controls: self.show_window_controls.load(Ordering::Relaxed),
             app_name: "Anchor".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             build: env!("GIT_HASH").into(),
@@ -905,7 +910,7 @@ impl DesktopController {
         };
         let folder = path.to_string_lossy().into_owned();
         *self.filetransfer_folder.lock().unwrap() = path;
-        let mut updated = settings().clone();
+        let mut updated = load_settings();
         updated.file_transfer.folder = folder;
         save_settings(&updated).map_err(|error| format!("Could not save shared folder: {error}"))
     }
@@ -1025,6 +1030,12 @@ impl DesktopController {
             self.camera_setup.create_camera()
         };
         result.map(|_| ()).map_err(|error| error.to_string())
+    }
+
+    pub fn set_window_controls(&self, enabled: bool) -> Result<(), String> {
+        save_window_controls(enabled)?;
+        self.show_window_controls.store(enabled, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn set_camera_device(&self, device_id: Option<String>) {

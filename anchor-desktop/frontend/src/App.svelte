@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import Select from './lib/Select.svelte';
   import TransportIcon from './lib/TransportIcon.svelte';
+  import WindowChrome from './lib/WindowChrome.svelte';
   import {
     clearClipboard,
     clearLogs,
@@ -39,6 +40,7 @@
     setCameraZoom,
     setSideboatVisible,
     setStreaming,
+    setWindowControls,
     setupCamera,
     switchCamera,
     unpairDevice,
@@ -64,6 +66,7 @@
 
   let active: Section = 'sideboat';
   let desktop: DesktopState | undefined;
+  let showWindowControls = false;
   let appVersion: string | undefined;
   let actionError = '';
   let busy = false;
@@ -198,6 +201,7 @@
       const shouldScrollLogs = logRenderKey !== '' && logRenderKey !== lastLogRenderKey;
       if (section === 'logs') lastLogRenderKey = logRenderKey;
       desktop = state;
+      showWindowControls = state.showWindowControls;
       const displayDevices = state.devices
         .filter((device) => device.online && device.displayWidth && device.displayHeight)
         .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
@@ -552,7 +556,7 @@
 
 <main class="shell">
   <aside class="sidebar" aria-label="Anchor navigation">
-    <div class="brand">Anchor</div>
+    <div class="brand" data-tauri-drag-region>Anchor</div>
     <nav>
       {#each navigation as item}
         <button class:active={active === item.id} onclick={() => void selectSection(item.id)} aria-current={active === item.id ? 'page' : undefined}>
@@ -564,9 +568,7 @@
   </aside>
 
   <section class="workspace">
-    <header class="topbar">
-      <h1>{pageTitle()}</h1>
-    </header>
+    <WindowChrome title={pageTitle()} enabled={showWindowControls} onerror={(error) => { actionError = String(error); }} />
 
     <div class="page">
       {#if active === 'sideboat'}
@@ -814,6 +816,20 @@
 
       {:else if active === 'settings'}
         <div class="settings-page">
+          <section class="settings-section">
+            <div class="settings-heading"><div><h2>Appearance</h2></div></div>
+            <label class="appearance-setting">
+              <span class="appearance-setting-copy"><strong>Show window controls</strong><small>Minimize, maximize, close, and resize the window.</small></span>
+              <span class="appearance-switch">
+              <input type="checkbox" checked={showWindowControls} disabled={!desktop || busy} onchange={(event) => {
+                const enabled = event.currentTarget.checked;
+                event.currentTarget.checked = showWindowControls;
+                void runAction(() => setWindowControls(enabled));
+              }} />
+              <span class="appearance-switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+          </section>
           <section class="settings-section">
             <div class="settings-heading"><div><h2>Paired devices</h2><p>Approve nearby pairing requests from this screen.</p></div><div class="actions"><span>{desktop?.devices.filter((device) => device.online).length ?? 0} connected</span></div></div>
             <div class="device-list">
