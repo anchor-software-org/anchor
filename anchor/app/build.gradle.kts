@@ -55,8 +55,8 @@ android {
         applicationId = "com.anchor.software"
         minSdk = 30
         targetSdk = 36
-        versionCode = 101
-        versionName = "1.0.1"
+        versionCode = 102
+        versionName = "1.0.2"
 
         // Keep packaged ABIs aligned with the native MsQuic transport built by
         // scripts/build-android-native.sh. Some AndroidX dependencies publish
