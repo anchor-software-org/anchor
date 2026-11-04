@@ -19,7 +19,7 @@ jobs:
     name: Desktop binary (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system deps
         run: |
@@ -84,7 +84,7 @@ jobs:
     name: Android APK
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # versionName/protocol are derived from git in build.gradle.kts;
           # full history keeps those reads well-defined. Submodules carry
