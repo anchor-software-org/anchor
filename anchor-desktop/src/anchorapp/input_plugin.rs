@@ -53,6 +53,7 @@ pub enum InputPluginMsg {
 }
 
 pub struct AnchorPluginInput {
+    pub available: bool,
     pub plugin_rx: Option<Receiver<AnchorEvent>>,
     pub broker_tx: Option<Sender<AnchorEvent>>,
 }
@@ -164,30 +165,38 @@ impl Plugin for AnchorPluginInput {
         broker_tx: Option<Sender<AnchorEvent>>,
         _frame_buffer: Arc<Mutex<Option<SharedFrameBuffer>>>,
     ) -> Self {
-        AnchorPluginInput { plugin_rx, broker_tx }
+        AnchorPluginInput { plugin_rx, broker_tx, available: false }
     }
 
     fn run(&mut self) -> Option<JoinHandle<()>> {
         let rx = self.plugin_rx.take().expect("input plugin_rx not set");
         let broker_tx = self.broker_tx.take().expect("input broker_tx not set");
 
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = thread::Builder::new()
             .name("input-plugin".to_string())
             .spawn(move || {
                 log::debug!("Input plugin thread started");
-                run_input_loop(rx, broker_tx);
+                run_input_loop(rx, broker_tx, ready_tx);
                 log::info!("Input plugin thread exiting");
             })
             .expect("failed to spawn input plugin thread");
 
+        // Advertise input only after backend initialization succeeds.
+        self.available = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);
         Some(handle)
     }
 }
 
-fn run_input_loop(rx: Receiver<AnchorEvent>, broker_tx: Sender<AnchorEvent>) {
+fn run_input_loop(
+    rx: Receiver<AnchorEvent>,
+    broker_tx: Sender<AnchorEvent>,
+    ready_tx: Sender<bool>,
+) {
     let mut backend = match WaylandInput::new() {
         Ok(b) => b,
         Err(e) => {
+            let _ = ready_tx.send(false);
             log::error!("Input: {}", e);
             broker_tx
                 .send(AnchorEvent {
@@ -205,6 +214,7 @@ fn run_input_loop(rx: Receiver<AnchorEvent>, broker_tx: Sender<AnchorEvent>) {
         }
     };
 
+    let _ = ready_tx.send(true);
     let (total_w, total_h) = backend.total_extent();
     broker_tx
         .send(AnchorEvent {

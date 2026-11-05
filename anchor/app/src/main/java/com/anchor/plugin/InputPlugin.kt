@@ -10,6 +10,8 @@ import com.anchor.core.Plugin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import org.anchor.sdk.AnchorCapability
 import org.anchor.sdk.AnchorSession
 import org.anchor.sdk.InputProtocol
@@ -23,6 +25,8 @@ private const val TIMING_TAG = "anchor.timing"
 
 class InputPlugin(private val broker: MessageBroker) : Plugin {
     override val pluginId = "input"
+    private val _isAvailable = MutableStateFlow(false)
+    val isAvailable = _isAvailable.asStateFlow()
     private val outboundSeq = AtomicLong(0)
     private var lastMotionEnqueueNs = 0L
     private var sdkScope: CoroutineScope? = null
@@ -40,10 +44,14 @@ class InputPlugin(private val broker: MessageBroker) : Plugin {
     private val sdkControlDispatcher = Dispatchers.IO.limitedParallelism(1)
 
     override fun start(scope: CoroutineScope) { sdkScope = scope }
-    override fun stop() { sdkCapability = null }
+    override fun stop() {
+        sdkCapability = null
+        _isAvailable.value = false
+    }
 
     fun attachSdkSession(session: AnchorSession, capability: AnchorCapability) {
         sdkCapability = capability
+        _isAvailable.value = true
         Log.i(TAG, "SDK input capability attached (session=${capability.sessionId})")
         val staleButtons = sdkPressedButtons.toList()
         if (staleButtons.isNotEmpty()) {

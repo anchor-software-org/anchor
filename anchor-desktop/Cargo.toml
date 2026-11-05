@@ -13,6 +13,7 @@ ffmpeg-vendor = [
     "ffmpeg-next/build",
     "ffmpeg-next/build-license-gpl",
     "ffmpeg-next/build-lib-x264",
+    "ffmpeg-sys-next/build-portable",
     "ffmpeg-sys-next/build-drm",
     "ffmpeg-sys-next/build-vaapi",
 ]

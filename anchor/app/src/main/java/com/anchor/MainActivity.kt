@@ -2699,6 +2699,18 @@ fun RemoteInputScreen(viewModel: MainViewModel, onBack: () -> Unit = {}, onMenuC
             )
         }
     ) { padding ->
+        val inputAvailable by viewModel.inputPlugin.isAvailable.collectAsState()
+        if (!inputAvailable) {
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                Text(
+                    "Remote input is unavailable for this connection.\n" +
+                        "The desktop must support remote mouse and keyboard control.",
+                    color = OffWhite,
+                    modifier = Modifier.padding(24.dp),
+                )
+            }
+            return@Scaffold
+        }
         val sens by viewModel.touchpadSensitivity.collectAsState()
         val hapticsEnabled by viewModel.hapticsEnabled.collectAsState()
         val haptics = rememberHaptics(hapticsEnabled)
