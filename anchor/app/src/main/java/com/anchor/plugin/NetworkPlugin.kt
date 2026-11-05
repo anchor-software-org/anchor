@@ -25,6 +25,7 @@ import org.json.JSONObject
 import org.anchor.sdk.AnchorCapability
 import org.anchor.sdk.AnchorPairingSession
 import org.anchor.sdk.AnchorSession
+import org.anchor.sdk.AnchorSessionException
 import org.anchor.sdk.AnchorSessionEvent
 import org.anchor.sdk.ClipboardProtocol
 import org.anchor.sdk.MsQuicTransport
@@ -454,6 +455,7 @@ class NetworkPlugin(
             )))
             return
         }
+        onSdkTransportStopped()
         sdkSessionJob?.cancel()
         val generation = sdkSessionGeneration.incrementAndGet()
         val identity = try {
@@ -570,13 +572,17 @@ class NetworkPlugin(
                 )
                 onSdkNotificationsReady(session, notificationsCapability)
                 Log.i(TAG, "SDK notifications capability attached (session=${notificationsCapability.sessionId})")
-                val inputCapability = session.openCapability(
-                    InputProtocol.ENDPOINT_ID,
-                    InputProtocol.CAPABILITY_NAME,
-                    InputProtocol.CAPABILITY_MAJOR,
-                )
-                onSdkInputReady(session, inputCapability)
-                Log.i(TAG, "SDK input capability attached (session=${inputCapability.sessionId})")
+                try {
+                    val inputCapability = session.openCapability(
+                        InputProtocol.ENDPOINT_ID,
+                        InputProtocol.CAPABILITY_NAME,
+                        InputProtocol.CAPABILITY_MAJOR,
+                    )
+                    onSdkInputReady(session, inputCapability)
+                    Log.i(TAG, "SDK input capability attached (session=${inputCapability.sessionId})")
+                } catch (error: AnchorSessionException) {
+                    Log.i(TAG, "Remote input unavailable: ${error.message}")
+                }
                 val mediaCapability = session.openCapability(
                     MediaProtocol.ENDPOINT_ID,
                     MediaProtocol.CAPABILITY_NAME,
