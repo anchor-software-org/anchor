@@ -45,7 +45,7 @@
     switchCamera,
     unpairDevice,
     updateCommand,
-    openSource,
+    openProjectLink,
     type DesktopState,
     type Media,
     type PairedDevice,
@@ -69,24 +69,7 @@
   let desktop: DesktopState | undefined;
   let showWindowControls = false;
   let appVersion: string | undefined;
-  let supportDetailsField: HTMLTextAreaElement | undefined;
-  let supportCopyStatus = '';
-  $: supportDetails = desktop
-    ? `${desktop.appName} ${desktop.version || 'Unknown version'}\nSource commit: ${desktop.build || 'Unknown'}\nCompositor: ${desktop.compositor || 'Unknown'}`
-    : '';
   $: sourceCommit = desktop?.build && /^[0-9a-f]{7,40}$/i.test(desktop.build) ? desktop.build : undefined;
-
-  const copySupportDetails = async () => {
-    supportCopyStatus = '';
-    try {
-      await navigator.clipboard.writeText(supportDetails);
-      supportCopyStatus = 'Copied';
-    } catch {
-      supportDetailsField?.focus();
-      supportDetailsField?.select();
-      supportCopyStatus = 'Press Ctrl+C to copy the selected details.';
-    }
-  };
   let actionError = '';
   let busy = false;
   let smsDraft = '';
@@ -911,11 +894,15 @@
             <dl class="about-grid">
               <div>
                 <dt>Source commit</dt>
-                <dd class="mono">{#if sourceCommit}<a href={`https://github.com/anchor-software-org/anchor/commit/${sourceCommit}`} target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openSource(sourceCommit)); }}>{sourceCommit} ↗</a>{:else}Unavailable{/if}</dd>
+                <dd class="mono">{#if sourceCommit}<a href={`https://github.com/anchor-software-org/anchor/commit/${sourceCommit}`} target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('commit', sourceCommit)); }}>{sourceCommit} ↗</a>{:else}Unavailable{/if}</dd>
               </div>
               <div>
                 <dt>Source code</dt>
-                <dd><a href="https://github.com/anchor-software-org/anchor" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openSource()); }}>anchor-software-org/anchor ↗</a></dd>
+                <dd><a href="https://github.com/anchor-software-org/anchor" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('source')); }}>anchor-software-org/anchor ↗</a></dd>
+              </div>
+              <div>
+                <dt>Website</dt>
+                <dd><a href="https://anchor-software.org" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('website')); }}>anchor-software.org ↗</a></dd>
               </div>
               <div class="environment-cell">
                 <dt>Compositor</dt>
@@ -948,12 +935,7 @@
             <div class="settings-heading support-heading">
               <div>
                 <h3>Support &amp; feedback</h3>
-                <p>Email <a href="mailto:devs@anchor-software.org?subject=Anchor%20desktop%20feedback">devs@anchor-software.org</a> with these details and a description of the problem.</p>
-                <div class="support-details">
-                  <label for="support-details">App &amp; environment details</label>
-                  <textarea id="support-details" bind:this={supportDetailsField} readonly rows="3" value={supportDetails} placeholder="App details unavailable"></textarea>
-                  <div class="support-copy"><button class="button" disabled={!desktop} onclick={copySupportDetails}>Copy details</button><span role="status">{supportCopyStatus}</span></div>
-                </div>
+                <p><a href="https://github.com/anchor-software-org/anchor/issues/new/choose" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('issues')); }}>Open an issue on GitHub ↗</a></p>
               </div>
             </div>
           </section>

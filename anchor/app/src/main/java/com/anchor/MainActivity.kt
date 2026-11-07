@@ -2333,34 +2333,7 @@ fun SettingsScreen(
                         Text("Terms of service", modifier = Modifier.weight(1f))
                         Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
                     }
-                    HorizontalDivider()
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                val subject = Uri.encode(
-                                    "Anchor Android feedback (v${BuildConfig.VERSION_NAME}, ${BuildConfig.GIT_HASH})"
-                                )
-                                context.startActivity(
-                                    Intent(
-                                        Intent.ACTION_SENDTO,
-                                        Uri.parse("mailto:devs@anchor-software.org?subject=$subject")
-                                    )
-                                )
-                            }
-                            .padding(vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Support & feedback")
-                            Text(
-                                "Email devs@anchor-software.org. Please omit private messages and credentials.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = AnchorGray
-                            )
-                        }
-                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
-                    }
+
                 }
             }
 
@@ -2371,8 +2344,19 @@ fun SettingsScreen(
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("About", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(12.dp))
-                    SettingsRow("Commit", BuildConfig.GIT_HASH)
-                    SettingsRow("Protocol", BuildConfig.PROTOCOL)
+                    SettingsRow("Version", BuildConfig.VERSION_NAME)
+                    SettingsRow("Build number", BuildConfig.VERSION_CODE.toString())
+                    if (BuildConfig.GIT_HASH.matches(Regex("[0-9a-fA-F]{7,40}"))) {
+                        SettingsLinkRow("Source commit", BuildConfig.GIT_HASH, "https://github.com/anchor-software-org/anchor/commit/${BuildConfig.GIT_HASH}")
+                    } else {
+                        SettingsRow("Source commit", "Unavailable")
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    SettingsLinkRow("Website", "anchor-software.org", "https://anchor-software.org")
+                    SettingsLinkRow("Source code", "anchor-software-org/anchor", "https://github.com/anchor-software-org/anchor")
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    Text("Support & feedback", style = MaterialTheme.typography.titleSmall)
+                    SettingsLinkRow("Open an issue on GitHub", null, "https://github.com/anchor-software-org/anchor/issues/new/choose")
                 }
             }
 
@@ -3070,6 +3054,29 @@ fun PairingDialog(pairingState: PairingState.Requested, onAccept: () -> Unit, on
 }
 
 // ─── Utility (keep) ─────────────────────────────────────────────────────
+
+@Composable
+private fun SettingsLinkRow(label: String, value: String?, url: String) {
+    val context = LocalContext.current
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable {
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            } catch (_: ActivityNotFoundException) {
+                android.widget.Toast.makeText(context, "No browser available to open this link.", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }.padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+            if (value != null) {
+                Text(value, style = MaterialTheme.typography.bodySmall, color = AnchorGray)
+            }
+        }
+        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
+    }
+}
 
 @Composable
 fun SettingsRow(label: String, value: String) {
