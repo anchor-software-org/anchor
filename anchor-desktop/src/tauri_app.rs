@@ -166,6 +166,30 @@ controller_action!(set_camera_exposure(value: i32) => set_camera_exposure(value)
 controller_action!(set_camera_torch(enabled: bool) => set_camera_torch(enabled));
 controller_action!(switch_camera() => switch_camera());
 
+fn project_url(page: &str, commit: Option<&str>) -> Result<String, String> {
+    let repository = "https://github.com/anchor-software-org/anchor";
+    match (page, commit) {
+        ("source", _) => Ok(repository.into()),
+        ("website", _) => Ok("https://anchor-software.org".into()),
+        ("issues", _) => Ok(format!("{repository}/issues/new/choose")),
+        ("commit", Some(hash))
+            if (7..=40).contains(&hash.len()) && hash.bytes().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            Ok(format!("{repository}/commit/{hash}"))
+        }
+        _ => Err("Project link is unavailable.".into()),
+    }
+}
+
+#[tauri::command]
+fn open_project_link(page: String, commit: Option<String>) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(project_url(&page, commit.as_deref())?)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open project link: {error}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -196,6 +220,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_state,
+            open_project_link,
             set_streaming,
             select_output,
             create_virtual_display,
@@ -237,4 +262,31 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Anchor Tauri desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_url;
+
+    #[test]
+    fn project_links_use_known_destinations() {
+        assert_eq!(
+            project_url("source", None).unwrap(),
+            "https://github.com/anchor-software-org/anchor"
+        );
+        assert_eq!(
+            project_url("commit", Some("015e5c8")).unwrap(),
+            "https://github.com/anchor-software-org/anchor/commit/015e5c8"
+        );
+        assert_eq!(project_url("website", None).unwrap(), "https://anchor-software.org");
+        assert_eq!(
+            project_url("issues", None).unwrap(),
+            "https://github.com/anchor-software-org/anchor/issues/new/choose"
+        );
+        assert!(project_url("commit", None).is_err());
+        assert!(project_url("https://example.com", None).is_err());
+        for invalid in ["", "unknown", "abc123", "abcdef0/../../issues", "https://example.com"] {
+            assert!(project_url("commit", Some(invalid)).is_err());
+        }
+    }
 }

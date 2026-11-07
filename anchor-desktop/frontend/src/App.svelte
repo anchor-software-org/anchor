@@ -45,6 +45,7 @@
     switchCamera,
     unpairDevice,
     updateCommand,
+    openProjectLink,
     type DesktopState,
     type Media,
     type PairedDevice,
@@ -68,6 +69,7 @@
   let desktop: DesktopState | undefined;
   let showWindowControls = false;
   let appVersion: string | undefined;
+  $: sourceCommit = desktop?.build && /^[0-9a-f]{7,40}$/i.test(desktop.build) ? desktop.build : undefined;
   let actionError = '';
   let busy = false;
   let smsDraft = '';
@@ -522,7 +524,6 @@
   const isStreaming = () => desktop?.capture.status === 'streaming';
   const isTransitioning = () => ['initializing', 'starting', 'switching', 'stopping'].includes(desktop?.capture.status ?? '');
   const statusLabel = (status?: string) => (status ?? 'connecting').replace(/_/g, ' ');
-  const pageTitle = () => navigation.find((item) => item.id === active)?.label ?? 'Anchor';
   const selectedThread = () => desktop?.smsThreads.find((thread) => thread.threadId === desktop?.selectedSmsThread);
   const filteredSmsThreads = () => {
     const query = smsSearch.trim().toLowerCase();
@@ -568,7 +569,7 @@
   </aside>
 
   <section class="workspace">
-    <WindowChrome title={pageTitle()} enabled={showWindowControls} onerror={(error) => { actionError = String(error); }} />
+    <WindowChrome title={navigation.find((item) => item.id === active)?.label ?? 'Anchor'} enabled={showWindowControls} onerror={(error) => { actionError = String(error); }} />
 
     <div class="page">
       {#if active === 'sideboat'}
@@ -886,14 +887,27 @@
           {/if}
 
           <section class="settings-section about-section">
-            <div class="settings-heading"><div><h2>About</h2></div></div>
+            <div class="settings-heading about-heading">
+              <div><h2>About {desktop?.appName || 'Anchor'}</h2><p>Linux desktop</p></div>
+              <div class="about-version"><span>App version</span><strong>{desktop?.version || 'Unavailable'}</strong></div>
+            </div>
             <dl class="about-grid">
-              <div><dt>Version</dt><dd>{desktop?.version}</dd></div>
-              <div><dt>Build</dt><dd class="mono">{desktop?.build}</dd></div>
+              <div>
+                <dt>Source commit</dt>
+                <dd class="mono">{#if sourceCommit}<a href={`https://github.com/anchor-software-org/anchor/commit/${sourceCommit}`} target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('commit', sourceCommit)); }}>{sourceCommit} ↗</a>{:else}Unavailable{/if}</dd>
+              </div>
+              <div>
+                <dt>Source code</dt>
+                <dd><a href="https://github.com/anchor-software-org/anchor" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('source')); }}>anchor-software-org/anchor ↗</a></dd>
+              </div>
+              <div>
+                <dt>Website</dt>
+                <dd><a href="https://anchor-software.org" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('website')); }}>anchor-software.org ↗</a></dd>
+              </div>
               <div class="environment-cell">
                 <dt>Compositor</dt>
                 <dd class="environment-value">
-                  <span>{desktop?.compositor}</span>
+                  <span>{desktop?.compositor || 'Unavailable'}</span>
                   {#if desktop}
                     <details class="capabilities-menu">
                       <summary>Capabilities</summary>
@@ -921,7 +935,7 @@
             <div class="settings-heading support-heading">
               <div>
                 <h3>Support &amp; feedback</h3>
-                <p>Email <a href="mailto:devs@anchor-software.org?subject=Anchor%20desktop%20feedback">devs@anchor-software.org</a> with your version, compositor, and a description of the problem. Do not include private messages, certificates, or credentials.</p>
+                <p><a href="https://github.com/anchor-software-org/anchor/issues/new/choose" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('issues')); }}>Open an issue on GitHub ↗</a></p>
               </div>
             </div>
           </section>

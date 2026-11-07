@@ -80,6 +80,9 @@ export type DesktopState = {
   camera: Camera;
 };
 
+export const openProjectLink = (page: 'source' | 'commit' | 'website' | 'issues', commit?: string) =>
+  invoke<void>('open_project_link', { page, commit });
+
 export const getDesktopState = (section?: string) => invoke<DesktopState>('desktop_state', { section });
 export const setStreaming = (enabled: boolean) => invoke<void>('set_streaming', { enabled });
 export const setWindowControls = (enabled: boolean) => invoke<void>('set_window_controls', { enabled });
