@@ -166,6 +166,28 @@ controller_action!(set_camera_exposure(value: i32) => set_camera_exposure(value)
 controller_action!(set_camera_torch(enabled: bool) => set_camera_torch(enabled));
 controller_action!(switch_camera() => switch_camera());
 
+fn source_url(commit: Option<&str>) -> Result<String, String> {
+    let repository = "https://github.com/anchor-software-org/anchor";
+    match commit {
+        None => Ok(repository.into()),
+        Some(hash)
+            if (7..=40).contains(&hash.len()) && hash.bytes().all(|c| c.is_ascii_hexdigit()) =>
+        {
+            Ok(format!("{repository}/commit/{hash}"))
+        }
+        Some(_) => Err("Source commit is unavailable.".into()),
+    }
+}
+
+#[tauri::command]
+fn open_source(commit: Option<String>) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(source_url(commit.as_deref())?)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open source code: {error}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -196,6 +218,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_state,
+            open_source,
             set_streaming,
             select_output,
             create_virtual_display,
@@ -237,4 +260,21 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Anchor Tauri desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_url;
+
+    #[test]
+    fn source_links_stay_in_the_anchor_repository() {
+        assert_eq!(source_url(None).unwrap(), "https://github.com/anchor-software-org/anchor");
+        assert_eq!(
+            source_url(Some("015e5c8")).unwrap(),
+            "https://github.com/anchor-software-org/anchor/commit/015e5c8"
+        );
+        for invalid in ["", "unknown", "abc123", "abcdef0/../../issues", "https://example.com"] {
+            assert!(source_url(Some(invalid)).is_err());
+        }
+    }
 }
