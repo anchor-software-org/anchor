@@ -13,6 +13,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -2006,22 +2009,22 @@ fun SettingsScreen(
     }
 
     Scaffold(
-        containerColor = CharcoalBlack,
+        containerColor = MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
-                title = { Text("Settings", color = OffWhite) },
+                title = { Text("Settings", color = MaterialTheme.colorScheme.onBackground) },
                 navigationIcon = {
                     IconButton(onClick = onMenuClick) {
-                        Icon(Icons.Default.Menu, contentDescription = "Menu", tint = OffWhite)
+                        Icon(Icons.Default.Menu, contentDescription = "Menu", tint = MaterialTheme.colorScheme.onBackground)
                     }
                 },
                 actions = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = OffWhite)
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = MaterialTheme.colorScheme.onBackground)
                     }
                 },
                 colors = androidx.compose.material3.TopAppBarDefaults.topAppBarColors(
-                    containerColor = CharcoalBlack
+                    containerColor = MaterialTheme.colorScheme.background
                 )
             )
         }
@@ -2029,7 +2032,7 @@ fun SettingsScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(CharcoalBlack)
+                .background(MaterialTheme.colorScheme.background)
                 .padding(padding)
                 .padding(horizontal = 16.dp)
                 .verticalScroll(rememberScrollState())
@@ -2037,7 +2040,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             // Connection Status
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2069,10 +2072,10 @@ fun SettingsScreen(
                                 if (usbTetherActive) "On — wired link available"
                                 else "Enable for a lower-latency wired link",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = AnchorGray
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
+                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
@@ -2080,7 +2083,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             // Paired Desktops
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Paired Desktops", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(12.dp))
@@ -2122,7 +2125,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             // Auto-reconnect
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -2137,7 +2140,7 @@ fun SettingsScreen(
 
             // Touch input on stream
             val touchInput by viewModel.touchInputOnStream.collectAsState()
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2150,7 +2153,7 @@ fun SettingsScreen(
                     Text(
                         "When enabled, tapping the fullscreen video controls the desktop pointer instead of exiting fullscreen.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = AnchorGray,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp)
                     )
                 }
@@ -2160,7 +2163,7 @@ fun SettingsScreen(
 
             // Touchpad sensitivity
             val sens by viewModel.touchpadSensitivity.collectAsState()
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2168,7 +2171,7 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Touchpad sensitivity")
-                        Text(String.format("%.1fx", sens), style = MaterialTheme.typography.bodyMedium, color = AnchorGray)
+                        Text(String.format("%.1fx", sens), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Slider(
                         value = sens,
@@ -2179,7 +2182,7 @@ fun SettingsScreen(
                     Text(
                         "Controls pointer speed on the Remote Input touchpad.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = AnchorGray
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -2188,7 +2191,7 @@ fun SettingsScreen(
 
             // Haptic feedback
             val haptics by viewModel.hapticsEnabled.collectAsState()
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2201,7 +2204,7 @@ fun SettingsScreen(
                     Text(
                         "Vibrate on clicks, and tick like a dial while scrolling on the touchpad.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = AnchorGray,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp)
                     )
                 }
@@ -2211,7 +2214,7 @@ fun SettingsScreen(
 
             // Sideboat input mode
             val sideboatTouchpad by viewModel.sideboatTouchpadMode.collectAsState()
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2226,7 +2229,7 @@ fun SettingsScreen(
                             "laptop touchpad — the cursor moves relative to your finger. Switch anytime " +
                             "from the toggle on the fullscreen stream.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = AnchorGray,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 4.dp)
                     )
                 }
@@ -2238,7 +2241,7 @@ fun SettingsScreen(
             val notifSend by viewModel.notifSendEnabled.collectAsState()
             val notifReceive by viewModel.notifReceiveEnabled.collectAsState()
             val ignoredApps by viewModel.ignoredNotifApps.collectAsState()
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Notifications", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(8.dp))
@@ -2269,20 +2272,20 @@ fun SettingsScreen(
                         Column(Modifier.weight(1f)) {
                             Text(
                                 "Ignored apps",
-                                color = if (notifSend) OffWhite else AnchorGray
+                                color = if (notifSend) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant
                             )
                             Text(
                                 if (ignoredApps.isEmpty()) "None — all apps forwarded"
                                 else "${ignoredApps.size} app${if (ignoredApps.size == 1) "" else "s"} ignored",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = AnchorGray
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(Modifier.width(8.dp))
                         Icon(
                             Icons.Default.ChevronRight,
                             contentDescription = null,
-                            tint = if (notifSend) AnchorGray else AnchorGray.copy(alpha = 0.4f)
+                            tint = if (notifSend) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
                         )
                     }
                 }
@@ -2291,7 +2294,7 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             // Privacy and data
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Privacy & data", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(8.dp))
@@ -2299,7 +2302,7 @@ fun SettingsScreen(
                         "Anchor has no accounts, ads, app analytics, or cloud storage for your personal content. " +
                             "Feature data is kept on your devices and sent directly to desktops you approve.",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = AnchorGray
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
                     SmsPermissionControls()
@@ -2316,7 +2319,7 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Privacy policy", modifier = Modifier.weight(1f))
-                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
+                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     HorizontalDivider()
                     Row(
@@ -2331,7 +2334,7 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Terms of service", modifier = Modifier.weight(1f))
-                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
+                        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
 
                 }
@@ -2340,11 +2343,25 @@ fun SettingsScreen(
             Spacer(Modifier.height(12.dp))
 
             // About
-            Card(modifier = Modifier.fillMaxWidth()) {
+            SettingsCard(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("About", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(12.dp))
-                    SettingsRow("Version", BuildConfig.VERSION_NAME)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(R.mipmap.ic_launcher),
+                            contentDescription = null,
+                            modifier = Modifier.size(48.dp).clip(RoundedCornerShape(12.dp))
+                        )
+                        Spacer(Modifier.width(14.dp))
+                        Column {
+                            Text("Anchor", style = MaterialTheme.typography.titleLarge)
+                            Text(
+                                "Version ${BuildConfig.VERSION_NAME} · Android",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(20.dp))
                     SettingsRow("Build number", BuildConfig.VERSION_CODE.toString())
                     if (BuildConfig.GIT_HASH.matches(Regex("[0-9a-fA-F]{7,40}"))) {
                         SettingsLinkRow("Source commit", BuildConfig.GIT_HASH, "https://github.com/anchor-software-org/anchor/commit/${BuildConfig.GIT_HASH}")
@@ -2354,7 +2371,7 @@ fun SettingsScreen(
                     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                     SettingsLinkRow("Website", "anchor-software.org", "https://anchor-software.org")
                     SettingsLinkRow("Source code", "anchor-software-org/anchor", "https://github.com/anchor-software-org/anchor")
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp))
                     Text("Support & feedback", style = MaterialTheme.typography.titleSmall)
                     SettingsLinkRow("Open an issue on GitHub", null, "https://github.com/anchor-software-org/anchor/issues/new/choose")
                 }
@@ -3056,10 +3073,24 @@ fun PairingDialog(pairingState: PairingState.Requested, onAccept: () -> Unit, on
 // ─── Utility (keep) ─────────────────────────────────────────────────────
 
 @Composable
+private fun SettingsCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        content = content
+    )
+}
+
+@Composable
 private fun SettingsLinkRow(label: String, value: String?, url: String) {
     val context = LocalContext.current
     Row(
-        modifier = Modifier.fillMaxWidth().clickable {
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable {
             try {
                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
             } catch (_: ActivityNotFoundException) {
@@ -3071,20 +3102,20 @@ private fun SettingsLinkRow(label: String, value: String?, url: String) {
         Column(Modifier.weight(1f)) {
             Text(label, style = MaterialTheme.typography.bodyMedium)
             if (value != null) {
-                Text(value, style = MaterialTheme.typography.bodySmall, color = AnchorGray)
+                Text(value, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = AnchorGray)
+        Icon(Icons.Default.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
 @Composable
 fun SettingsRow(label: String, value: String) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.outline)
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
     }
 }

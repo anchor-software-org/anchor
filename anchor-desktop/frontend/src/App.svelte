@@ -52,6 +52,8 @@
     type SavedCommand,
   } from './lib/anchor';
 
+  import anchorLogo from '../../../assets/anchor_logo_64.png';
+
   type Section = 'sideboat' | 'messages' | 'foghorn' | 'clipboard' | 'files' | 'commands' | 'media' | 'settings' | 'logs';
   const navigation: Array<{ id: Section; label: string }> = [
     { id: 'sideboat', label: 'Sideboat' },
@@ -888,7 +890,7 @@
 
           <section class="settings-section about-section">
             <div class="settings-heading about-heading">
-              <div><h2>About {desktop?.appName || 'Anchor'}</h2><p>Linux desktop</p></div>
+              <div class="about-brand"><img src={anchorLogo} alt="" width="44" height="44" /><div><h2>About {desktop?.appName || 'Anchor'}</h2><p>Linux desktop</p></div></div>
               <div class="about-version"><span>App version</span><strong>{desktop?.version || 'Unavailable'}</strong></div>
             </div>
             <dl class="about-grid">
