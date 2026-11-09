@@ -63,8 +63,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Fingerprint native build dependencies
+        id: native-deps
+        run: |
+          native_key=$(
+            {
+              cat /etc/os-release
+              pkg-config --modversion x264 libva libdrm gbm wayland-client gtk+-3.0 webkit2gtk-4.1
+            } | sha256sum | cut -d ' ' -f 1
+          )
+          echo "key=$native_key" >> "$GITHUB_OUTPUT"
+
       - uses: Swatinem/rust-cache@v2
         with:
+          # FFmpeg's cached objects link to the installed native-library ABIs.
+          key: native-${{ steps.native-deps.outputs.key }}
           workspaces: |
             anchor-desktop
 
