@@ -156,6 +156,25 @@ if [ -z "$X264_PATH" ]; then
 fi
 cp -L "$X264_PATH" "$APPDIR/usr/lib/$(basename "$X264_PATH")"
 
+# The tray library is opened with dlopen, so it does not appear in ldd's
+# output for anchor. Bundle its non-desktop dependencies as well, while
+# continuing to use the host GTK/GLib stack.
+INDICATOR_LIBS=(
+    libayatana-appindicator3.so.1
+    libayatana-indicator3.so.7
+    libayatana-ido3-0.4.so.0
+    libdbusmenu-gtk3.so.4
+    libdbusmenu-glib.so.4
+)
+for soname in "${INDICATOR_LIBS[@]}"; do
+    library_path="$(ldconfig -p | awk -v name="$soname" '$1 == name && !found { print $NF; found = 1 }')"
+    if [ -z "$library_path" ] || [ ! -f "$library_path" ]; then
+        echo "Unable to resolve $soname for AppImage packaging" >&2
+        exit 1
+    fi
+    cp -L "$library_path" "$APPDIR/usr/lib/$soname"
+done
+
 # Desktop entry
 cat > "$APPDIR/usr/share/applications/anchor.desktop" << 'EOF'
 [Desktop Entry]
@@ -243,6 +262,19 @@ for required in "$SQFS/AppRun" "$SQFS/usr/bin/anchor" \
         exit 1
     fi
 done
+
+for soname in libayatana-appindicator3.so.1 libayatana-indicator3.so.7 \
+    libayatana-ido3-0.4.so.0 libdbusmenu-gtk3.so.4 libdbusmenu-glib.so.4; do
+    if [ ! -f "$SQFS/usr/lib/$soname" ]; then
+        echo "AppImage verification failed: missing bundled $soname" >&2
+        exit 1
+    fi
+done
+
+if LD_LIBRARY_PATH="$SQFS/usr/lib" ldd -r "$SQFS/usr/lib/libayatana-appindicator3.so.1" | grep -E 'not found|undefined symbol'; then
+    echo "AppImage verification failed: AppIndicator has unresolved dependencies or symbols" >&2
+    exit 1
+fi
 
 if LD_LIBRARY_PATH="$SQFS/usr/lib" ldd "$SQFS/usr/bin/anchor" | grep "not found"; then
     echo "AppImage verification failed: anchor has unresolved libraries" >&2
