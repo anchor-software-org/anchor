@@ -1,6 +1,5 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
@@ -44,7 +43,7 @@ val releaseSigningConfigured = listOf(
 android {
     namespace = "com.anchor"
     compileSdk {
-        version = release(36)
+        version = release(37)
     }
     // Keep the native source build reproducible across local CI and source
     // distributors. The same revision is declared in the F-Droid handoff
@@ -101,9 +100,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
-    }
-    kotlinOptions {
-        jvmTarget = "11"
     }
     buildFeatures {
         compose = true

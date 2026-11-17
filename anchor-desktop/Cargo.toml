@@ -41,7 +41,7 @@ uuid = { version = "1.21.0", features = ["v4"] }
 dirs = "6.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25.9", default-features = false, features = ["png", "ico", "jpeg"] }
 url = "2"
 reqwest = { version = "0.13", features = ["blocking"] }

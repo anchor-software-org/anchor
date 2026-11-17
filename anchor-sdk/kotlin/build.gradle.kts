@@ -1,13 +1,19 @@
+// Also select the catalog's Kotlin version when the SDK is built standalone.
+buildscript {
+    dependencies {
+        classpath(libs.kotlin.gradle.plugin)
+    }
+}
+
 plugins {
     alias(libs.plugins.android.library)
-    alias(libs.plugins.kotlin.android)
 }
 
 version = "1.0.0"
 
 android {
     namespace = "org.anchor.sdk"
-    compileSdk { version = release(36) }
+    compileSdk { version = release(37) }
     defaultConfig {
         minSdk = 30
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -17,7 +23,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-    kotlinOptions { jvmTarget = "11" }
 }
 
 // This module is intentionally a standalone Gradle build as well as the
@@ -26,25 +31,30 @@ android {
 // application or unpublished package registries.
 
 val protocolRoot = layout.projectDirectory.dir("../protocol")
-val generatedProtocolDirectory = layout.buildDirectory.dir("generated/source/anchorProtocol/main/java")
 val protocolFiles = fileTree(protocolRoot) { include("anchor/v1/**/*.proto") }
 
-val generateAnchorProtocol by tasks.registering(Exec::class) {
+abstract class GenerateAnchorProtocol : Exec() {
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+}
+
+val generateAnchorProtocol = tasks.register<GenerateAnchorProtocol>("generateAnchorProtocol") {
     inputs.files(protocolFiles)
-    outputs.dir(generatedProtocolDirectory)
+    outputDirectory.set(layout.buildDirectory.dir("generated/source/anchorProtocol/main/java"))
     doFirst {
-        generatedProtocolDirectory.get().asFile.mkdirs()
+        outputDirectory.get().asFile.mkdirs()
         commandLine(
             "protoc", "-I", protocolRoot.asFile.absolutePath,
-            "--java_out=lite:" + generatedProtocolDirectory.get().asFile.absolutePath,
+            "--java_out=lite:" + outputDirectory.get().asFile.absolutePath,
             *protocolFiles.files.sorted().map { it.absolutePath }.toTypedArray(),
         )
     }
 }
 
-android.sourceSets.getByName("main").java.srcDir(generatedProtocolDirectory)
-tasks.configureEach {
-    if (name.startsWith("compile") || name.startsWith("test")) dependsOn(generateAnchorProtocol)
+androidComponents.onVariants { variant ->
+    variant.sources.java?.addGeneratedSourceDirectory(generateAnchorProtocol) {
+        it.outputDirectory
+    }
 }
 
 dependencies {

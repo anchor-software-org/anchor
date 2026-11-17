@@ -13,7 +13,8 @@ for feature data. Your Android application supplies those pieces.
 ## Status and compatibility
 
 The SDK targets Android API 30 or newer and Java/Kotlin JVM target 11. The
-project uses compile SDK 36, Android Gradle Plugin 8.13.2, and Kotlin 2.0.21.
+project uses compile SDK 37, Android Gradle Plugin 9.4.1 with built-in Kotlin
+2.4.20, and Gradle 9.6.0.
 Anchor Protocol v1 is the wire contract. The Kotlin SDK is consumed from this
 repository; it is not published to a package registry.
 
