@@ -72,7 +72,36 @@ elif [ ! -x "$APPIMAGETOOL" ]; then
     exit 1
 fi
 
+if [ -n "${APPIMAGE_EMULATOR:-}" ]; then
+    if [ ! -x "$APPIMAGE_EMULATOR" ]; then
+        echo "APPIMAGE_EMULATOR is not executable: $APPIMAGE_EMULATOR" >&2
+        exit 1
+    fi
+fi
+
+# qemu-user binaries built for binfmt run in preserve-argv0 mode (kernel flag
+# P): the argument after the program path becomes the guest argv[0], so it
+# must be repeated when invoking a program explicitly.
+run_appimage_tool() {
+    if [ -n "${APPIMAGE_EMULATOR:-}" ]; then
+        "$APPIMAGE_EMULATOR" "$1" "$@"
+    else
+        "$@"
+    fi
+}
+
 echo "==> Building $ARCH AppImage on $HOST_ARCH host"
+
+if [ "${APPIMAGE_PACKAGE_ONLY:-0}" = "1" ]; then
+    for required in "$APPDIR/AppRun" "$APPDIR/usr/bin/anchor"; do
+        if [ ! -e "$required" ]; then
+            echo "APPIMAGE_PACKAGE_ONLY=1 but $required is missing." >&2
+            echo "Run a full build first to produce the AppDir." >&2
+            exit 1
+        fi
+    done
+    echo "==> Reusing existing AppDir (APPIMAGE_PACKAGE_ONLY=1)"
+else
 
 # -- Build release application --------------------------------------------
 if ! command -v pnpm >/dev/null 2>&1; then
@@ -127,28 +156,24 @@ if [ -z "$X264_PATH" ]; then
 fi
 cp -L "$X264_PATH" "$APPDIR/usr/lib/$(basename "$X264_PATH")"
 
-# Bundle adb and its non-glibc dependency closure in an isolated library
-# directory. Its Ubuntu libraries must not enter Anchor's GTK/WebKit process.
-if ADB_PATH=$(command -v adb); then
-    mkdir -p "$APPDIR/usr/lib/adb"
-    cp "$ADB_PATH" "$APPDIR/usr/bin/adb.real"
-    while read -r lib; do
-        case "$(basename "$lib")" in
-            libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*) ;;
-            *) cp -Ln "$lib" "$APPDIR/usr/lib/adb/" ;;
-        esac
-    done < <(ldd "$APPDIR/usr/bin/adb.real" | awk '/=> \// { print $3 }')
-    cat > "$APPDIR/usr/bin/adb" << 'ADB_RUN'
-#!/usr/bin/env bash
-HERE="$(cd -- "$(dirname -- "$0")" && pwd -P)"
-export LD_LIBRARY_PATH="$HERE/../lib/adb${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$HERE/adb.real" "$@"
-ADB_RUN
-    chmod +x "$APPDIR/usr/bin/adb"
-    "$APPDIR/usr/bin/adb" version
-else
-    echo "WARN: adb not found on host; AppImage will not bundle adb"
-fi
+# The tray library is opened with dlopen, so it does not appear in ldd's
+# output for anchor. Bundle its non-desktop dependencies as well, while
+# continuing to use the host GTK/GLib stack.
+INDICATOR_LIBS=(
+    libayatana-appindicator3.so.1
+    libayatana-indicator3.so.7
+    libayatana-ido3-0.4.so.0
+    libdbusmenu-gtk3.so.4
+    libdbusmenu-glib.so.4
+)
+for soname in "${INDICATOR_LIBS[@]}"; do
+    library_path="$(ldconfig -p | awk -v name="$soname" '$1 == name && !found { print $NF; found = 1 }')"
+    if [ -z "$library_path" ] || [ ! -f "$library_path" ]; then
+        echo "Unable to resolve $soname for AppImage packaging" >&2
+        exit 1
+    fi
+    cp -L "$library_path" "$APPDIR/usr/lib/$soname"
+done
 
 # Desktop entry
 cat > "$APPDIR/usr/share/applications/anchor.desktop" << 'EOF'
@@ -213,8 +238,48 @@ chmod +x "$APPDIR/AppRun"
 LD_LIBRARY_PATH="$APPDIR/usr/lib" ldd "$APPDIR/usr/bin/anchor" \
     | grep "libx264.*$APPDIR/usr/lib"
 
+fi
+
 cd "$APPIMAGE_DIR"
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" "$APPIMAGETOOL" \
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="$ARCH" run_appimage_tool "$APPIMAGETOOL" \
     AppDir "Anchor-$ARCH.AppImage"
 
-echo "==> Done: $(ls -lh "Anchor-$ARCH.AppImage")"
+# Verify the image actually works: extract it (no FUSE needed), confirm the
+# packaged binary resolves every library with the bundled lib dir on the path.
+echo "==> Verifying AppImage contents..."
+VERIFY_DIR="$APPIMAGE_DIR/verify"
+rm -rf "$VERIFY_DIR"
+mkdir -p "$VERIFY_DIR"
+(cd "$VERIFY_DIR" && APPIMAGE_EXTRACT_AND_RUN=1 run_appimage_tool \
+    "$APPIMAGE_DIR/Anchor-$ARCH.AppImage" --appimage-extract >/dev/null)
+SQFS="$VERIFY_DIR/squashfs-root"
+
+for required in "$SQFS/AppRun" "$SQFS/usr/bin/anchor" \
+    "$SQFS/usr/share/applications/anchor.desktop" \
+    "$SQFS/usr/share/icons/hicolor/256x256/apps/anchor.png"; do
+    if [ ! -e "$required" ]; then
+        echo "AppImage verification failed: missing $required" >&2
+        exit 1
+    fi
+done
+
+for soname in libayatana-appindicator3.so.1 libayatana-indicator3.so.7 \
+    libayatana-ido3-0.4.so.0 libdbusmenu-gtk3.so.4 libdbusmenu-glib.so.4; do
+    if [ ! -f "$SQFS/usr/lib/$soname" ]; then
+        echo "AppImage verification failed: missing bundled $soname" >&2
+        exit 1
+    fi
+done
+
+if LD_LIBRARY_PATH="$SQFS/usr/lib" ldd -r "$SQFS/usr/lib/libayatana-appindicator3.so.1" | grep -E 'not found|undefined symbol'; then
+    echo "AppImage verification failed: AppIndicator has unresolved dependencies or symbols" >&2
+    exit 1
+fi
+
+if LD_LIBRARY_PATH="$SQFS/usr/lib" ldd "$SQFS/usr/bin/anchor" | grep "not found"; then
+    echo "AppImage verification failed: anchor has unresolved libraries" >&2
+    exit 1
+fi
+
+rm -rf "$VERIFY_DIR"
+echo "==> Done: $(ls -lh "Anchor-$ARCH.AppImage") (verified: extracts cleanly, all libraries resolve)"

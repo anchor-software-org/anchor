@@ -1,0 +1,20 @@
+## fdroid-1.0.1
+Command: python3 scripts/ci/verify-android-pairing.py Anchor-fdroid-101.apk
+Exit status: 1
+Pairing identity algorithms missing or renamed in Anchor-fdroid-101.apk:
+  org.bouncycastle.jcajce.provider.asymmetric.EC$Mappings
+  org.bouncycastle.jcajce.provider.asymmetric.X509$Mappings
+  org.bouncycastle.jcajce.provider.asymmetric.ec.KeyPairGeneratorSpi$EC
+  org.bouncycastle.jcajce.provider.asymmetric.ec.SignatureSpi$ecDSA256
+  org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory
+Check anchorSdk's consumer ProGuard rules.
+
+## github-1.0.0
+Command: python3 scripts/ci/verify-android-pairing.py Anchor-1.0.0.apk
+Exit status: 0
+Pairing identity provider classes verified in /tmp/anchor-cosmic-release/Anchor-1.0.0.apk
+
+## fixed-minified-test-apk
+Command: python3 scripts/ci/verify-android-pairing.py Anchor-r8-fixed-test.apk
+Exit status: 0
+Pairing identity provider classes verified in /tmp/anchor-cosmic-release/Anchor-r8-fixed-test.apk

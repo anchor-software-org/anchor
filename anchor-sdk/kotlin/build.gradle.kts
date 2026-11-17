@@ -11,6 +11,7 @@ android {
     defaultConfig {
         minSdk = 30
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles("consumer-rules.pro")
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
@@ -54,7 +55,7 @@ dependencies {
     // Generated capability messages are part of the public SDK surface, so
     // consumers compiling against ClipboardProtocol also need the lite
     // runtime on their classpath.
-    api("com.google.protobuf:protobuf-javalite:4.36.0")
+    api("com.google.protobuf:protobuf-javalite:4.36.2")
     implementation("org.bouncycastle:bcprov-jdk18on:1.79")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
     testImplementation(libs.junit)

@@ -1,0 +1,5 @@
+11-01 10:00:01.271 10904 10904 I anchor  : Loaded 0 trusted devices
+11-01 10:00:18.033 10904 10904 I anchor  : Connect button requested: host=192.168.122.22
+11-01 10:00:18.033 10904 10904 I anchor  : Starting direct pairing for new host=192.168.122.22
+11-01 10:00:18.953 10904 10930 I anchor  : Paired device: Anchor Desktop (90274470-54a8-44e5-945f-74d31081d21f)
+11-01 10:00:18.968 10904 10930 I anchor  : QUIC SDK session connected to 90274470-54a8-44e5-945f-74d31081d21f

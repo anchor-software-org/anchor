@@ -25,7 +25,13 @@ mod anchorwayland {
                 .min(u64::MAX as u128) as u64
         }
 
-        pub fn event(_name: &str, _payload: serde_json::Value) {}
+        // Production callers use `frame_trace::event!`, a macro that skips
+        // building the JSON payload when tracing is off. The stub matches the
+        // macro shape (no-op) rather than a function so `event!` resolves.
+        macro_rules! event {
+            ($kind:expr, $($fields:tt)*) => {{}};
+        }
+        pub(crate) use event;
     }
 }
 

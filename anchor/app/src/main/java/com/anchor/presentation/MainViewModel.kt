@@ -16,6 +16,7 @@ import com.anchor.data.PairedDeviceDisplay
 import com.anchor.data.PairingState
 import com.anchor.data.TrustedDeviceEntry
 import com.anchor.data.TrustedStore
+import com.anchor.data.WiredDiscovery
 import com.anchor.AnchorApplication
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -138,6 +139,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // mDNS discovery of nearby desktops
     private val mdnsDiscovery = MdnsDiscovery(application)
 
+    // Probes tethered subnets mDNS cannot see.
+    private val wiredDiscovery = WiredDiscovery(viewModelScope)
+
+    /** True while the phone has a USB-tethered interface up. */
+    val usbTetherActive = wiredDiscovery.usbTetherActive
+
     // Saved (trusted) devices including their last-known IP, kept in sync with
     // the on-disk store via refreshSavedDevices().
     private val _savedDevices = MutableStateFlow<List<TrustedDeviceEntry>>(emptyList())
@@ -149,12 +156,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * their stored last IP.
      */
     val deviceList: kotlinx.coroutines.flow.StateFlow<List<DeviceListEntry>> =
-        combine(_savedDevices, mdnsDiscovery.devices) { saved, discovered ->
-            com.anchor.data.DeviceListMerger.merge(saved, discovered)
+        combine(_savedDevices, mdnsDiscovery.devices, wiredDiscovery.devices) { saved, mdns, wired ->
+            com.anchor.data.DeviceListMerger.merge(saved, mdns + wired)
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    fun startDiscovery() = mdnsDiscovery.start()
-    fun stopDiscovery() = mdnsDiscovery.stop()
+    fun startDiscovery() {
+        mdnsDiscovery.start()
+        wiredDiscovery.start()
+    }
+    fun stopDiscovery() {
+        mdnsDiscovery.stop()
+        wiredDiscovery.stop()
+    }
+
+    /** Every discovered address path (Wi-Fi and USB) for a desktop. */
+    private fun allDiscovered(): List<com.anchor.data.DiscoveredDevice> =
+        mdnsDiscovery.devices.value + wiredDiscovery.devices.value
 
     init {
         app.ensurePluginsStarted()
@@ -314,7 +331,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun pickAutoConnectTarget(): String? =
         com.anchor.data.ReconnectPolicy.pickTarget(
-            discovered = mdnsDiscovery.devices.value,
+            discovered = allDiscovered(),
             savedDeviceIds = trustedStore.devices.keys,
             lastConnectedDeviceId = lastConnectedDeviceId?.takeIf { it in trustedStore.devices },
             lastConnectedIp = lastConnectedIp
@@ -404,7 +421,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // alternate LAN/Tailscale address reconnects instead of re-pairing.
             val desktopId = com.anchor.data.ReconnectPolicy.manualAddressDeviceId(
                 address = clean,
-                discovered = mdnsDiscovery.devices.value,
+                discovered = allDiscovered(),
                 savedDeviceLastIps = trustedStore.devices.mapValues { (_, device) -> device.lastIp },
                 lastConnectedDeviceId = lastConnectedDeviceId,
             )

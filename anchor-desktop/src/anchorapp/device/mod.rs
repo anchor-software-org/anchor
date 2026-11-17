@@ -1,9 +1,9 @@
-mod adb;
 mod broadcaster;
 pub(crate) mod camera_receiver;
 pub mod loopback_setup;
 mod manager;
 mod mdns;
+mod probe;
 mod registry;
 mod sdk_server;
 

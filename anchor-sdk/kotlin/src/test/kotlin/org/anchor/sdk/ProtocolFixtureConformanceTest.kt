@@ -13,6 +13,12 @@ class ProtocolFixtureConformanceTest {
             "capability-open" to ControlEnvelope.BodyCase.CAPABILITY_OPEN,
             "stream-open" to ControlEnvelope.BodyCase.STREAM_OPEN,
             "datagram-flow-open" to ControlEnvelope.BodyCase.DATAGRAM_FLOW_OPEN,
+            "ping" to ControlEnvelope.BodyCase.PING,
+            "pong" to ControlEnvelope.BodyCase.PONG,
+            "capability-opened" to ControlEnvelope.BodyCase.CAPABILITY_OPENED,
+            "stream-opened" to ControlEnvelope.BodyCase.STREAM_OPENED,
+            "datagram-flow-opened" to ControlEnvelope.BodyCase.DATAGRAM_FLOW_OPENED,
+            "session-close" to ControlEnvelope.BodyCase.SESSION_CLOSE,
         )
         expectedBodies.forEach { (name, expectedBody) ->
             val framer = ControlFramer()

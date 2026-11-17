@@ -721,7 +721,9 @@ impl VaapiEncoder {
             ffmpeg::software::scaling::Flags::FAST_BILINEAR,
         )
         .map_err(|e| format!("swscale context creation failed: {}", e))?;
-        let cpu_src_frame = ffmpeg::frame::Video::new(scaler_src_format, width, height);
+        // cpu_src_frame wraps the caller's mapped buffer by pointer (filled in
+        // encode_xbgr) — an owned 8MiB frame buffer is never needed.
+        let cpu_src_frame = ffmpeg::frame::Video::empty();
         let cpu_sw_frame = ffmpeg::frame::Video::new(sw_pixel_format, width, height);
 
         // Set up whenever a VAAPI device is available, regardless of which encoder was
@@ -1407,9 +1409,13 @@ impl VaapiEncoder {
                 }));
             }
 
-            // Take ownership of the buffer; it will be re-allocated on next frame's clear().
-            // This avoids a copy — the Vec moves to the caller, and packet_buf becomes empty.
-            Ok((std::mem::take(&mut self.packet_buf), timing))
+            // Clone into a right-sized output Vec instead of taking the
+            // staging buffer: taking it left packet_buf empty, so every
+            // frame reallocated ~256KiB from scratch. At that size glibc
+            // serves the alloc via mmap, so each frame paid mmap +
+            // page-fault-in on fresh pages followed by munmap on drop —
+            // far costlier than one memcpy into an arena-sized output.
+            Ok((self.packet_buf.clone(), timing))
         }
     }
 
@@ -1607,22 +1613,22 @@ impl VaapiEncoder {
             )
             .map_err(|e| format!("swscale context recreation failed: {e}"))?;
             self.scaler_src_format = source_format;
-            self.cpu_src_frame = ffmpeg::frame::Video::new(source_format, w, h);
+            self.cpu_src_frame = ffmpeg::frame::Video::empty();
             log::info!("CPU fallback input format changed to {source_format:?}");
         }
 
         // --- Step 1: Wrap raw packed RGB pixels into an AVFrame ---
+        // Zero-copy: point the frame at the caller's mapped buffer instead of
+        // memcpy'ing ~8MiB of XBGR into an owned frame. The borrow lasts only
+        // for the synchronous sws_scale call below.
         let stage = std::time::Instant::now();
-        let frame_stride = self.cpu_src_frame.stride(0);
-        {
-            let dst = self.cpu_src_frame.data_mut(0);
-            let row_bytes = (w as usize) * 4;
-            for y in 0..h as usize {
-                let src_start = y * stride;
-                let dst_start = y * frame_stride;
-                dst[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(&xbgr_data[src_start..src_start + row_bytes]);
-            }
+        unsafe {
+            let src = self.cpu_src_frame.as_mut_ptr();
+            (*src).data[0] = xbgr_data.as_ptr() as *mut u8;
+            (*src).linesize[0] = stride as i32;
+            (*src).format = ffi::AVPixelFormat::from(source_format) as i32;
+            (*src).width = w as i32;
+            (*src).height = h as i32;
         }
         timing.copy_us = stage.elapsed().as_micros();
 

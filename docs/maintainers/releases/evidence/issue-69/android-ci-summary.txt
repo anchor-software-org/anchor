@@ -1,0 +1,6 @@
+BUILD SUCCESSFUL in 6s
+161 actionable tasks: 1 executed, 160 up-to-date
+Pairing identity provider classes verified in app/build/outputs/apk/release/app-release-unsigned.apk
+==> ci: app/build/outputs/apk/debug/app-debug.apk verified (arm64-v8a native libs present)
+SDK unit tests: 42 passed
+App unit tests: 104 passed

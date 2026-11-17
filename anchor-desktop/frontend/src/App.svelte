@@ -4,6 +4,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import Select from './lib/Select.svelte';
   import TransportIcon from './lib/TransportIcon.svelte';
+  import WindowChrome from './lib/WindowChrome.svelte';
   import {
     clearClipboard,
     clearLogs,
@@ -39,14 +40,19 @@
     setCameraZoom,
     setSideboatVisible,
     setStreaming,
+    setWindowControls,
     setupCamera,
     switchCamera,
     unpairDevice,
     updateCommand,
+    openProjectLink,
     type DesktopState,
     type Media,
+    type PairedDevice,
     type SavedCommand,
   } from './lib/anchor';
+
+  import anchorLogo from '../../../assets/anchor_logo_64.png';
 
   type Section = 'sideboat' | 'messages' | 'foghorn' | 'clipboard' | 'files' | 'commands' | 'media' | 'settings' | 'logs';
   const navigation: Array<{ id: Section; label: string }> = [
@@ -63,7 +69,9 @@
 
   let active: Section = 'sideboat';
   let desktop: DesktopState | undefined;
+  let showWindowControls = false;
   let appVersion: string | undefined;
+  $: sourceCommit = desktop?.build && /^[0-9a-f]{7,40}$/i.test(desktop.build) ? desktop.build : undefined;
   let actionError = '';
   let busy = false;
   let smsDraft = '';
@@ -93,7 +101,8 @@
   let windowFocused = true;
   let previewTimer = 0;
   let virtualDisplayOpen = false;
-  let virtualSizeMode: 'phone' | 'custom' = 'phone';
+  let virtualSizeMode: 'device' | 'custom' = 'device';
+  let virtualDeviceId = '';
   let virtualOrientation: 'portrait' | 'landscape' = 'portrait';
   let virtualScale = 1;
   let virtualWidth = 1920;
@@ -196,6 +205,13 @@
       const shouldScrollLogs = logRenderKey !== '' && logRenderKey !== lastLogRenderKey;
       if (section === 'logs') lastLogRenderKey = logRenderKey;
       desktop = state;
+      showWindowControls = state.showWindowControls;
+      const displayDevices = state.devices
+        .filter((device) => device.online && device.displayWidth && device.displayHeight)
+        .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+      if (!displayDevices.some((device) => device.id === virtualDeviceId)) {
+        virtualDeviceId = displayDevices[0]?.id ?? '';
+      }
       appVersion = state.version;
       sectionLoading = false;
       if (section === 'sideboat') schedulePreview();
@@ -357,10 +373,22 @@
     void runAction(() => selectOutput(Number(value)));
   };
 
-  const phoneDisplay = () => desktop?.devices.find((device) => device.online && device.displayWidth && device.displayHeight);
+  const displayDevices = () => (desktop?.devices ?? [])
+    .filter((device) => device.online && device.displayWidth && device.displayHeight)
+    .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+  const selectedDisplayDevice = () => displayDevices().find((device) => device.id === virtualDeviceId);
+  const selectedDisplayDeviceOption = () => {
+    const device = selectedDisplayDevice();
+    return device ? { value: device.id, label: device.name, detail: `${device.displayWidth} × ${device.displayHeight}` } : undefined;
+  };
+  const displayDeviceOption = (device: PairedDevice) => ({
+    value: device.id,
+    label: device.name,
+    detail: `${device.displayWidth} × ${device.displayHeight}`,
+  });
   const virtualDimensions = () => {
     if (virtualSizeMode === 'custom') return { width: Number(virtualWidth), height: Number(virtualHeight) };
-    const display = phoneDisplay();
+    const display = selectedDisplayDevice();
     if (!display) return undefined;
     const shortEdge = Math.min(display.displayWidth!, display.displayHeight!);
     const longEdge = Math.max(display.displayWidth!, display.displayHeight!);
@@ -498,7 +526,6 @@
   const isStreaming = () => desktop?.capture.status === 'streaming';
   const isTransitioning = () => ['initializing', 'starting', 'switching', 'stopping'].includes(desktop?.capture.status ?? '');
   const statusLabel = (status?: string) => (status ?? 'connecting').replace(/_/g, ' ');
-  const pageTitle = () => navigation.find((item) => item.id === active)?.label ?? 'Anchor';
   const selectedThread = () => desktop?.smsThreads.find((thread) => thread.threadId === desktop?.selectedSmsThread);
   const filteredSmsThreads = () => {
     const query = smsSearch.trim().toLowerCase();
@@ -532,7 +559,7 @@
 
 <main class="shell">
   <aside class="sidebar" aria-label="Anchor navigation">
-    <div class="brand">Anchor</div>
+    <div class="brand" data-tauri-drag-region>Anchor</div>
     <nav>
       {#each navigation as item}
         <button class:active={active === item.id} onclick={() => void selectSection(item.id)} aria-current={active === item.id ? 'page' : undefined}>
@@ -544,9 +571,7 @@
   </aside>
 
   <section class="workspace">
-    <header class="topbar">
-      <h1>{pageTitle()}</h1>
-    </header>
+    <WindowChrome title={navigation.find((item) => item.id === active)?.label ?? 'Anchor'} enabled={showWindowControls} onerror={(error) => { actionError = String(error); }} />
 
     <div class="page">
       {#if active === 'sideboat'}
@@ -589,12 +614,24 @@
             {#if virtualDisplayOpen}
               <div class="virtual-display-form">
                 <div class="virtual-mode-buttons" role="group" aria-label="Virtual display size">
-                  <button class:active={virtualSizeMode === 'phone'} disabled={!phoneDisplay()} onclick={() => virtualSizeMode = 'phone'}>Match phone</button>
+                  <button class:active={virtualSizeMode === 'device'} disabled={!selectedDisplayDevice()} onclick={() => virtualSizeMode = 'device'}>Match {selectedDisplayDevice()?.name ?? 'device'}</button>
                   <button class:active={virtualSizeMode === 'custom'} onclick={() => virtualSizeMode = 'custom'}>Custom size</button>
                 </div>
-                {#if virtualSizeMode === 'phone'}
-                  {#if phoneDisplay()}
-                    <div class="virtual-phone-options">
+                {#if virtualSizeMode === 'device'}
+                  {#if selectedDisplayDevice()}
+                    <div class="virtual-device-options">
+                      <div class="virtual-option-row">
+                        <span>Device</span>
+                        <div class="virtual-device-select">
+                          <Select
+                            ariaLabel="Device display to match"
+                            value={virtualDeviceId}
+                            selected={selectedDisplayDeviceOption()}
+                            options={displayDevices().map(displayDeviceOption)}
+                            onselect={(value) => virtualDeviceId = value}
+                          />
+                        </div>
+                      </div>
                       <div class="virtual-option-row">
                         <span>Orientation</span>
                         <div class="virtual-orientation-options" role="group" aria-label="Virtual display orientation">
@@ -612,7 +649,7 @@
                       </div>
                     </div>
                   {:else}
-                    <p class="setting-note">Reconnect the phone after updating Anchor to use its display dimensions. Custom size is available now.</p>
+                    <p class="setting-note">Reconnect a device after updating Anchor to use its display dimensions. Custom size is available now.</p>
                   {/if}
                 {:else}
                   <div class="virtual-custom-size">
@@ -783,6 +820,20 @@
       {:else if active === 'settings'}
         <div class="settings-page">
           <section class="settings-section">
+            <div class="settings-heading"><div><h2>Appearance</h2></div></div>
+            <label class="appearance-setting">
+              <span class="appearance-setting-copy"><strong>Show window controls</strong><small>Minimize, maximize, close, and resize the window.</small></span>
+              <span class="appearance-switch">
+              <input type="checkbox" checked={showWindowControls} disabled={!desktop || busy} onchange={(event) => {
+                const enabled = event.currentTarget.checked;
+                event.currentTarget.checked = showWindowControls;
+                void runAction(() => setWindowControls(enabled));
+              }} />
+              <span class="appearance-switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+          </section>
+          <section class="settings-section">
             <div class="settings-heading"><div><h2>Paired devices</h2><p>Approve nearby pairing requests from this screen.</p></div><div class="actions"><span>{desktop?.devices.filter((device) => device.online).length ?? 0} connected</span></div></div>
             <div class="device-list">
               {#each desktop?.devices ?? [] as device}
@@ -838,14 +889,27 @@
           {/if}
 
           <section class="settings-section about-section">
-            <div class="settings-heading"><div><h2>About</h2></div></div>
+            <div class="settings-heading about-heading">
+              <div class="about-brand"><img src={anchorLogo} alt="" width="44" height="44" /><div><h2>About {desktop?.appName || 'Anchor'}</h2><p>Linux desktop</p></div></div>
+              <div class="about-version"><span>App version</span><strong>{desktop?.version || 'Unavailable'}</strong></div>
+            </div>
             <dl class="about-grid">
-              <div><dt>Version</dt><dd>{desktop?.version}</dd></div>
-              <div><dt>Build</dt><dd class="mono">{desktop?.build}</dd></div>
+              <div>
+                <dt>Source commit</dt>
+                <dd class="mono">{#if sourceCommit}<a href={`https://github.com/anchor-software-org/anchor/commit/${sourceCommit}`} target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('commit', sourceCommit)); }}>{sourceCommit} ↗</a>{:else}Unavailable{/if}</dd>
+              </div>
+              <div>
+                <dt>Source code</dt>
+                <dd><a href="https://github.com/anchor-software-org/anchor" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('source')); }}>anchor-software-org/anchor ↗</a></dd>
+              </div>
+              <div>
+                <dt>Website</dt>
+                <dd><a href="https://anchor-software.org" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('website')); }}>anchor-software.org ↗</a></dd>
+              </div>
               <div class="environment-cell">
                 <dt>Compositor</dt>
                 <dd class="environment-value">
-                  <span>{desktop?.compositor}</span>
+                  <span>{desktop?.compositor || 'Unavailable'}</span>
                   {#if desktop}
                     <details class="capabilities-menu">
                       <summary>Capabilities</summary>
@@ -873,7 +937,7 @@
             <div class="settings-heading support-heading">
               <div>
                 <h3>Support &amp; feedback</h3>
-                <p>Email <a href="mailto:devs@anchor-software.org?subject=Anchor%20desktop%20feedback">devs@anchor-software.org</a> with your version, compositor, and a description of the problem. Do not include private messages, certificates, or credentials.</p>
+                <p><a href="https://github.com/anchor-software-org/anchor/issues/new/choose" target="_blank" rel="noreferrer" onclick={(event) => { event.preventDefault(); void runAction(() => openProjectLink('issues')); }}>Open an issue on GitHub ↗</a></p>
               </div>
             </div>
           </section>

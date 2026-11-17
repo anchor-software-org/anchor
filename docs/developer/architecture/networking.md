@@ -13,6 +13,30 @@ material used during pairing.
 ADB is used for device detection and setup only. It is not a transport for
 Anchor sessions.
 
+## Wired (USB) discovery
+
+On Android a wired link uses USB tethering (RNDIS/NCM): the user enables
+tethering while the phone is plugged in, Android runs a DHCP server on the
+new `rndis*`/`usb*`/`ncm*` interface, the desktop receives a lease, and port
+`5027` is immediately reachable over the wire. iOS/iPadOS does not use its
+device USB cable as an Anchor transport.
+
+Android's NSD cannot see the tethered downstream link, so wired discovery
+uses a directed UDP probe instead of mDNS:
+
+- The phone sends `ANCHOR_PROBE_V1` to the subnet's broadcast address on UDP
+  port `5028` through tethered interfaces.
+- The desktop probe responder (`device/probe.rs`) answers with
+  `ANCHOR_HERE_V1\n` followed by a JSON object carrying the same public
+  identity the mDNS advertisement publishes: `device_id`, `device_name`,
+  `port`, and the base64url-encoded public certificate used to pin pairing.
+- Replies are trusted by packet source address. Certificate material is public
+  and still verified against the pairing pin before a session is trusted.
+
+When a desktop is reachable over both Wi-Fi and USB, Android prefers the
+wired address for new connections and reconnects. Wired discovery does not
+migrate an already-established session.
+
 ## Security and connection setup
 
 Each device has a self-signed certificate and a device ID. Pairing approves a
@@ -45,10 +69,13 @@ The protocol has two data lanes:
   refresh state when required. Datagram payloads are bounded application
   packets, not Protocol Buffer control records.
 
-Screen video uses a reliable stream. Each encoded `ANFR` frame packet is
-prefixed with a 32-bit little-endian length because QUIC streams do not retain
-application message boundaries. Camera video uses the datagram lane when the
-capability is negotiated.
+Screen and camera video both use the datagram lane when the peer advertises
+datagram support. `ANFR` frames are fragmented into bounded datagrams with
+sequence numbers and XOR parity groups, so a single lost datagram can be
+rebuilt instead of stalling the picture. When the peer does not support
+datagrams, screen video falls back to a reliable stream; on the stream each
+`ANFR` frame packet is prefixed with a 32-bit little-endian length because
+QUIC streams do not retain application message boundaries.
 
 ## Capabilities
 

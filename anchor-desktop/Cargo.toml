@@ -1,6 +1,6 @@
 [package]
 name = "anchor"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2024"
 
 [features]
@@ -26,8 +26,8 @@ ffmpeg-prebuilt = []
 drm = "0.14.1"
 gbm = "0.18.0"
 log = { version = "0.4.29", features = ["std"] }
-ffmpeg-next = { version = "8.1" }
-ffmpeg-sys-next = { version = "8.1" }
+ffmpeg-next = { git = "https://github.com/zmwangx/rust-ffmpeg", rev = "3751e2800d5d2f0215d69031285aadebac5db8fc", default-features = false, features = ["codec", "filter", "format", "software-scaling"] }
+ffmpeg-sys-next = { git = "https://github.com/anchor-software-org/rust-ffmpeg-sys", rev = "8bb5358f19acd12447ee1f8ea773046d95ed87aa", default-features = false, features = ["avcodec", "avfilter", "avformat", "swscale"] }
 serde_json = "1.0.149"
 wayland-client = "0.31.11"
 wayland-protocols = "0.32.9"
@@ -52,6 +52,7 @@ notify-rust = "4"
 rfd = "0.15"
 anchor-wl-clipboard = { git = "https://github.com/anchor-software-org/anchor-wl-clipboard", rev = "a76c760f6abc057d04662da8cc9a8bb28f3de13e" }
 anchor-sdk = { path = "../anchor-sdk/rust" }
+anchor-topology-core = { path = "topology-core" }
 prost = "0.14.4"
 bytes = "1"
 quinn = "0.11.9"
@@ -59,23 +60,34 @@ tokio = { version = "1.48.0", features = ["io-util", "rt", "time", "sync"] }
 zstd = "0.13"
 flate2 = "1"
 mdns-sd = "0.13"
+memchr = "2"
+mimalloc = "0.1"
 # Media playback control: read/control local MPRIS players, and expose the
 # phone as an MPRIS player so the system media widget / media keys drive it.
 mpris = "2.1"
 souvlaki = "0.7"
-mimalloc = "0.1"
 tauri = { version = "2", features = ["tray-icon", "image-png", "custom-protocol"] }
 tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+proptest = "1"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[patch.crates-io]
+ffmpeg-sys-next = { git = "https://github.com/anchor-software-org/rust-ffmpeg-sys", rev = "8bb5358f19acd12447ee1f8ea773046d95ed87aa" }
+
 [profile.release]
 debug = false
 overflow-checks = false
-lto = false
-codegen-units = 16
-opt-level = 2
+# The frame pipeline (fragmentation, codec plumbing, per-packet allocation)
+# is hot enough that release builds should optimize aggressively rather than
+# keep debug-build-like codegen settings. codegen-units stays at the default:
+# benching CGU=1 vs 16 showed noise-level deltas while serializing LLVM
+# codegen and roughly tripling release build time.
+lto = "thin"
+opt-level = 3
 
 [profile.profiling]
 inherits = "release"

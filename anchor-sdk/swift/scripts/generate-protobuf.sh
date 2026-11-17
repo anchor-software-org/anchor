@@ -9,7 +9,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 OUT="$ROOT/anchor-sdk/swift/Sources/AnchorSDK/Generated"
 mkdir -p "$OUT"
 
-mapfile -t PROTOS < <(find "$ROOT/anchor-sdk/protocol/anchor/v1" -type f -name '*.proto' | sort)
+PROTOS=()
+while IFS= read -r proto; do
+  PROTOS+=("$proto")
+done < <(find "$ROOT/anchor-sdk/protocol/anchor/v1" -type f -name '*.proto' | sort)
+
+if [[ ${#PROTOS[@]} -eq 0 ]]; then
+  echo "No Protocol v1 schemas found" >&2
+  exit 1
+fi
+
 protoc \
   --proto_path="$ROOT/anchor-sdk/protocol" \
   --swift_opt=Visibility=Public \

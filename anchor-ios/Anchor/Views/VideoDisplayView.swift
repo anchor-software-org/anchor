@@ -9,14 +9,14 @@ struct VideoDisplayView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> VideoLayerView {
         let view = VideoLayerView()
-        videoPlugin.displayLayer = view.displayLayer
+        videoPlugin.bindDisplayLayer(view.displayLayer)
         return view
     }
 
     func updateUIView(_ uiView: VideoLayerView, context: Context) {
         // Reconnect if the plugin's layer got swapped or cleared.
         if videoPlugin.displayLayer !== uiView.displayLayer {
-            videoPlugin.displayLayer = uiView.displayLayer
+            videoPlugin.bindDisplayLayer(uiView.displayLayer)
         }
     }
 }

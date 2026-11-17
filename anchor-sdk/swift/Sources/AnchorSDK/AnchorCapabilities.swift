@@ -54,7 +54,8 @@ public enum AnchorV1Capabilities {
         ], supportsDatagrams: true),
         AnchorCapabilityDescriptor(name: AnchorV1.Capability.files, recordTypeURLs: [
             AnchorV1.TypeURL.fileOffer, AnchorV1.TypeURL.fileDecision,
-            AnchorV1.TypeURL.fileContentStart, AnchorV1.TypeURL.fileComplete,
+            AnchorV1.TypeURL.fileContentStart, AnchorV1.TypeURL.fileContent,
+            AnchorV1.TypeURL.fileComplete,
         ]),
         AnchorCapabilityDescriptor(name: AnchorV1.Capability.sms, recordTypeURLs: [
             AnchorV1.TypeURL.smsMessage, AnchorV1.TypeURL.smsSend, AnchorV1.TypeURL.smsSendResult,

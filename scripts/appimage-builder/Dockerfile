@@ -7,7 +7,6 @@ ARG RUST_VERSION=1.98.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        adb \
         build-essential \
         ca-certificates \
         clang \
@@ -45,6 +44,7 @@ RUN apt-get update \
         nasm \
         perl \
         pkg-config \
+        protobuf-compiler \
         xz-utils \
         yasm \
     && rm -rf /var/lib/apt/lists/*

@@ -46,13 +46,24 @@ android {
     compileSdk {
         version = release(36)
     }
+    // Keep the native source build reproducible across local CI and source
+    // distributors. The same revision is declared in the F-Droid handoff
+    // instructions under docs/maintainers/releases.
+    ndkVersion = "30.0.16138531"
 
     defaultConfig {
         applicationId = "com.anchor.software"
         minSdk = 30
         targetSdk = 36
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 102
+        versionName = "1.0.2"
+
+        // Keep packaged ABIs aligned with the native MsQuic transport built by
+        // scripts/build-android-native.sh. Some AndroidX dependencies publish
+        // x86 JNI libraries, but Anchor does not support 32-bit x86.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -80,7 +91,7 @@ android {
             if (releaseSigningConfigured) {
                 signingConfig = signingConfigs.getByName("release")
             }
-            isMinifyEnabled = false
+            isMinifyEnabled = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

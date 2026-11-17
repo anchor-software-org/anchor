@@ -55,6 +55,19 @@ pub struct AppSettings {
     pub clipboard: ClipboardSettings,
     pub camera: CameraSettings,
     pub file_transfer: FileTransferSettings,
+    pub window: WindowSettings,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct WindowSettings {
+    pub show_controls: bool,
+}
+
+impl Default for WindowSettings {
+    fn default() -> Self {
+        Self { show_controls: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -157,9 +170,11 @@ pub struct EncodingSettings {
     pub hw_pool_size: u32,
 
     /// VAAPI encoder async depth — how many frames the encoder can buffer
-    /// internally before draining. Higher = better GPU pipeline utilization.
-    /// 0 = default (encoder decides), 1 = synchronous, 2-4 = pipelined.
-    /// Range: 0-8. Recommended: 2-4 for streaming.
+    /// internally before draining. Higher = better GPU pipeline utilization,
+    /// lower = less encoder queueing latency. 0 = encoder decides (ffmpeg's
+    /// VAAPI default is 4, worth up to ~4 frame periods of pipeline delay),
+    /// 1 = synchronous, 2-4 = pipelined.
+    /// Range: 0-8. Recommended: 1 for low-latency streaming.
     pub async_depth: u32,
 
     /// H.264 profile. Controls feature set and decoder compatibility.
@@ -247,7 +262,7 @@ impl Default for EncodingSettings {
             x264_preset: "ultrafast".into(),
             x264_tune: "zerolatency".into(),
             hw_pool_size: 20,
-            async_depth: 0,
+            async_depth: 1,
             profile: "auto".into(),
             level: "auto".into(),
             scale_mode: "hq".into(),
@@ -455,6 +470,12 @@ pub fn save_camera_auto_load(value: bool) -> Result<(), String> {
     save_settings(&current)
 }
 
+pub fn save_window_controls(enabled: bool) -> Result<(), String> {
+    let mut current = load_settings();
+    current.window.show_controls = enabled;
+    save_settings(&current)
+}
+
 /// Update camera streaming parameters on disk. Returns the new persisted values.
 pub fn save_camera_stream_params(fps: u32, bitrate_kbps: u32) -> Result<(u32, u32), String> {
     let fps = fps.clamp(1, 120);
@@ -495,6 +516,12 @@ const DEFAULTS_DOC: &str = r#"# Anchor Settings Reference
 
 Settings file: `~/.config/anchor/settings.json`
 Delete the file to regenerate defaults. Restart the app after editing.
+
+## window
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `show_controls` | `true` | Show window buttons and resize handles. Can also be changed immediately in Settings → Appearance → Show window controls. |
 
 ## capture
 
@@ -585,5 +612,22 @@ mod tests {
     fn empty_json_gives_defaults() {
         let s: AppSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.encoding.bitrate_bps, 15_000_000);
+    }
+
+    #[test]
+    fn window_controls_default_on_for_existing_settings() {
+        for json in ["{}", r#"{"window": {}}"#, r#"{"camera": {"auto_load": true}}"#] {
+            let s: AppSettings = serde_json::from_str(json).unwrap();
+            assert!(s.window.show_controls);
+        }
+    }
+
+    #[test]
+    fn disabled_window_controls_survive_settings_roundtrip() {
+        let s: AppSettings =
+            serde_json::from_str(r#"{"window": {"show_controls": false}}"#).unwrap();
+        let saved = serde_json::to_string(&s).unwrap();
+        let restored: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.window.show_controls);
     }
 }

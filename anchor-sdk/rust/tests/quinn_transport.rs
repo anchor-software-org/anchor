@@ -161,6 +161,26 @@ async fn wrong_alpn_cannot_establish_an_anchor_connection() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrong_server_name_cannot_establish_an_anchor_connection() {
+    let (server_config, client_config, _) = test_configs();
+    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.accept().await.unwrap().await });
+
+    let mut client = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+    client.set_default_client_config(client_config);
+    assert!(
+        client
+            .connect(address, "different-anchor.test")
+            .unwrap()
+            .await
+            .is_err(),
+        "the certificate name must be checked before Anchor receives control records",
+    );
+    assert!(server_task.await.unwrap().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutually_authenticated_peers_negotiate_anchor_alpn() {
     let (server_config, client_config) = mutually_authenticated_configs();
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();

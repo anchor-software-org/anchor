@@ -4,6 +4,7 @@ import org.anchor.sdk.v1.ControlEnvelope
 import org.anchor.sdk.v1.PairingReject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AnchorProtocolTest {
@@ -73,5 +74,36 @@ class AnchorProtocolTest {
         val action = controller.approve()
         assertEquals(7, (action as PairingAction.Approve).transcriptHash[0].toInt())
         assertEquals(4, stored!!.certificateFingerprint[0].toInt())
+    }
+
+    @Test
+    fun failedApprovalLeavesPairingAwaitingUserDecision() {
+        val controller = PairingController(PairedPeerStore { throw IllegalStateException("store unavailable") })
+        val hello = PairingHello(
+            nodeId = ByteArray(32) { 9 },
+            displayName = "Phone",
+            deviceKindValue = 2,
+            transcriptHash = ByteArray(32) { 7 },
+        )
+        assertEquals(ProtocolValidation.Valid, controller.receiveHello(hello, ByteArray(32) { 4 }))
+
+        assertEquals(PairingAction.StoreFailed, controller.approve())
+        assertTrue(controller.state is PairingState.AwaitingUser)
+    }
+
+    @Test
+    fun pairingResolutionIsAllowedOnlyOncePerRequest() {
+        val controller = PairingController(PairedPeerStore { })
+        val hello = PairingHello(
+            nodeId = ByteArray(32) { 9 },
+            displayName = "Phone",
+            deviceKindValue = 2,
+            transcriptHash = ByteArray(32) { 7 },
+        )
+        assertEquals(ProtocolValidation.Valid, controller.receiveHello(hello, ByteArray(32) { 4 }))
+
+        assertTrue(controller.approve() is PairingAction.Approve)
+        assertEquals(PairingAction.InvalidState, controller.approve())
+        assertEquals(PairingAction.InvalidState, controller.reject())
     }
 }

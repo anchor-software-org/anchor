@@ -38,6 +38,7 @@ private const val FRAME_QUEUE_CAPACITY = 3
 private const val MAX_INIT_FAILURES = 3
 private const val CODEC_METADATA_LIMIT = 64
 private const val START_CONFIRMATION_TIMEOUT_MS = 15_000L
+private const val KEYFRAME_REQUEST_MIN_INTERVAL_NS = 300_000_000L
 
 class VideoPlugin(
     private val broker: MessageBroker
@@ -251,6 +252,12 @@ class VideoPlugin(
                 try {
                     val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
                     format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 0)
+                    // Realtime priority + an operating-rate hint: some vendor
+                    // decoders engage faster scheduling/output paths with
+                    // these set. Both are documented MediaFormat keys; codecs
+                    // that ignore them are unaffected.
+                    format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+                    format.setInteger(MediaFormat.KEY_OPERATING_RATE, 120)
                     if (withLowLatency) {
                         format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                     }
@@ -383,9 +390,6 @@ class VideoPlugin(
             sideboatTrace = trace
             trace.event("run_start", "capability_session_id" to capability.sessionId)
             try {
-                val stream = capability.openStream(ScreenProtocol.FRAME_TYPE_URL)
-                Log.i(TAG, "SDK screen reliable stream opened (stream=${stream.streamId})")
-                trace.event("stream_open", "stream_id" to stream.streamId)
                 val assembler = ScreenFrameAssembler(onEvent = { outcome ->
                     trace.event(
                         "assembler_${outcome.outcome.name.lowercase(Locale.US)}",
@@ -400,8 +404,61 @@ class VideoPlugin(
                         "reason" to outcome.reason,
                     )
                 })
+                // Prefer the lossy datagram flow: it skips head-of-line
+                // blocking and carries XOR parity so a singly-lost fragment is
+                // rebuilt instead of stalling the whole stream ~1 RTT. Peers
+                // that did not advertise datagram support fail here and take
+                // the reliable-stream path below.
+                val datagramFlow = try {
+                    capability.openDatagramFlow(ScreenProtocol.FRAME_TYPE_URL)
+                } catch (error: Exception) {
+                    Log.i(TAG, "SDK screen datagram flow unavailable: ${error.message}")
+                    null
+                }
+                if (datagramFlow != null) {
+                    Log.i(TAG, "SDK screen datagram flow opened (flow=${datagramFlow.flowId})")
+                    trace.event("datagram_flow_open", "flow_id" to datagramFlow.flowId)
+                    var lastKeyframeRequestNs = 0L
+                    var lastIngressMetricsNs = 0L
+                    while (true) {
+                        val datagram = datagramFlow.receive()
+                        val completed =
+                            assembler.add(datagram, datagramFlow.flowId, capability.sessionId)
+                        if (assembler.takeKeyframeRequest()) {
+                            // While awaiting an IDR every incoming datagram
+                            // re-arms the assembler's request flag — debounce
+                            // so a gap costs one IDR, not an IDR per fragment.
+                            val nowNs = System.nanoTime()
+                            if (nowNs - lastKeyframeRequestNs >= KEYFRAME_REQUEST_MIN_INTERVAL_NS) {
+                                lastKeyframeRequestNs = nowNs
+                                requestKeyframe()
+                                trace.event("keyframe_request_needed", "flow_id" to datagramFlow.flowId)
+                            }
+                        }
+                        val nowNs = System.nanoTime()
+                        if (nowNs - lastIngressMetricsNs >= 1_000_000_000L) {
+                            lastIngressMetricsNs = nowNs
+                            val session = sdkSession ?: break
+                            val native = sessionIngressMetrics(session)
+                            trace.event(
+                                "ingress_metrics",
+                                "sdk_datagram_queue_items" to native.sdkDatagramQueueItems,
+                                "sdk_datagram_queue_bytes" to native.sdkDatagramQueueBytes,
+                                "sdk_datagram_queue_high_water_items" to native.sdkDatagramQueueHighWaterItems,
+                                "sdk_dropped_datagrams" to native.sdkDroppedDatagrams,
+                            )
+                        }
+                        for (assembled in completed) {
+                            feedFrame(assembled)
+                        }
+                    }
+                }
+                val stream = capability.openStream(ScreenProtocol.FRAME_TYPE_URL)
+                Log.i(TAG, "SDK screen reliable stream opened (stream=${stream.streamId})")
+                trace.event("stream_open", "stream_id" to stream.streamId)
                 val packetReader = ScreenStreamPacketReader()
                 var lastIngressMetricsNs = 0L
+                var lastKeyframeRequestNs = 0L
                 while (true) {
                     val chunk = stream.receive()
                     val packets = packetReader.add(chunk.bytes)
@@ -440,12 +497,18 @@ class VideoPlugin(
                             "sdk_datagram_queue_bytes" to native.sdkDatagramQueueBytes,
                             "sdk_datagram_queue_high_water_items" to native.sdkDatagramQueueHighWaterItems,
                             "sdk_datagram_queue_high_water_bytes" to native.sdkDatagramQueueHighWaterBytes,
+                            "sdk_dropped_datagrams" to native.sdkDroppedDatagrams,
                         )
                     }
                     for (packet in packets) {
                         val completed = assembler.add(packet, stream.streamId, capability.sessionId)
                         if (assembler.takeKeyframeRequest()) {
-                            trace.event("keyframe_request_needed", "stream_id" to stream.streamId)
+                            val nowNs2 = System.nanoTime()
+                            if (nowNs2 - lastKeyframeRequestNs >= KEYFRAME_REQUEST_MIN_INTERVAL_NS) {
+                                lastKeyframeRequestNs = nowNs2
+                                requestKeyframe()
+                                trace.event("keyframe_request_needed", "stream_id" to stream.streamId)
+                            }
                         }
                         for (assembled in completed) {
                             feedFrame(assembled)
@@ -489,6 +552,7 @@ class VideoPlugin(
             sdkDatagramQueueBytes = sdk.datagramQueueBytes,
             sdkDatagramQueueHighWaterItems = sdk.datagramQueueHighWaterItems,
             sdkDatagramQueueHighWaterBytes = sdk.datagramQueueHighWaterBytes,
+            sdkDroppedDatagrams = sdk.droppedDatagrams,
         )
     }
 
@@ -514,6 +578,7 @@ class VideoPlugin(
         val sdkDatagramQueueBytes: Long,
         val sdkDatagramQueueHighWaterItems: Long,
         val sdkDatagramQueueHighWaterBytes: Long,
+        val sdkDroppedDatagrams: Long,
     )
 
     private fun sendSdk(typeUrl: String, payload: ByteArray): Boolean {

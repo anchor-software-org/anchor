@@ -23,6 +23,25 @@ For an existing checkout:
 git submodule update --init --recursive
 ```
 
+### Submodules and native libraries
+
+Anchor vendors its QUIC implementation differently per platform:
+
+- **Android** uses [MsQuic](https://github.com/microsoft/msquic) at
+  `anchor-sdk/kotlin/src/main/cpp/third_party/msquic`. MsQuic itself carries a
+  nested submodule, `submodules/quictls` (the OpenSSL fork it uses for TLS)
+- **Desktop** uses [Quinn](https://github.com/quinn-rs/quinn), a pure-Rust QUIC
+  implementation fetched by Cargo. There is nothing to build or initialize.
+
+The MsQuic build outputs are **not checked in**. The Gradle build packages whatever is present in `anchor-sdk/kotlin/src/main/jniLibs/<abi>/` — a fresh clone ships no `.so` files there, yet the APK still builds and installs successfully. 
+
+Build the native libraries once after cloning, and again whenever the MsQuic submodule pin moves or `jniLibs/` is cleaned:
+
+```sh
+android-msquic-build-all
+```
+This produces `libmsquic.so` and `libanchor_msquic_jni.so` for `arm64-v8a`, `armeabi-v7a`, and `x86_64`. To build a single ABI, use `android-msquic-build <abi>`.
+
 ## Android
 
 From the repository root, enter the Android shell:
@@ -83,8 +102,77 @@ cargo test
 engine if needed. It writes the AppImage under
 `anchor-desktop/target/appimage/`.
 
+### How the desktop build is wired
+
+The desktop is a Tauri app: a Rust binary hosting a WebKitGTK webview whose UI
+lives in `frontend/` (Svelte + Vite, built with **pnpm** — not npm). The
+coupling is in `anchor-desktop/tauri.conf.json`:
+
+- `cargo tauri dev` runs `beforeDevCommand` (`pnpm run dev`) to start the Vite
+  dev server on port 1420 and points the webview at it.
+- `cargo tauri build` runs `beforeBuildCommand` (`pnpm run build`) and embeds
+  the resulting `frontend/dist` into the binary.
+
+Entering the devenv shell runs `pnpm install` automatically
+(`languages.javascript.pnpm.install.enable` in `devenv.nix`). Outside devenv,
+run `pnpm --dir frontend install` yourself first.
+
+`frontend/dist` is not checked in, and `cargo run`/`cargo build` do **not**
+invoke the Tauri hooks — Tauri embeds `frontend/dist` at compile time, so a
+bare `cargo run --release` on a fresh checkout fails or produces a blank
+window. Either use `dev`/`cargo tauri build`, or build the frontend first:
+
+```sh
+pnpm --dir frontend install
+pnpm --dir frontend build
+```
+
 The Sideboat baselines also need a host `ffmpeg`; `--headed` needs `ffplay`.
 VA-API benchmarks additionally need a usable DRM render device and driver.
+
+## Run CI locally
+
+Every GitHub Actions job calls a script under `scripts/ci/`, so the same steps
+run on a workstation. The workflows only provision tools, run the script, and
+upload artifacts.
+
+Inside either devenv shell:
+
+```sh
+ci <job> [job...]
+ci all
+```
+
+`ci` dispatches each job into the devenv that provides its tools, so it works
+from either shell (or a plain shell, as `scripts/ci.sh <job>`, if `devenv` is
+on `PATH`).
+
+| Job | Mirrors | Environment used |
+| --- | --- | --- |
+| `check` | fmt + clippy + test (`ci-rust.yml`) | `anchor-desktop` devenv |
+| `sdk` | SDK source conformance (`ci-rust.yml`) | root devenv |
+| `android` | Android APK (`verification-artifacts.yml`) | root devenv + Android SDK |
+| `desktop` | Desktop binary (`verification-artifacts.yml`) | `anchor-desktop` devenv |
+| `appimage` | Build AppImage (`appimage.yml`) | Ubuntu 22.04 builder container |
+
+Notes:
+
+- `all` runs `check sdk android desktop`; `appimage` is opt-in because it does
+  a full release build in the container.
+- `check` links the pinned prebuilt FFmpeg like PR CI. `VENDOR_FFMPEG=1 ci
+  check` builds FFmpeg from source instead (release parity).
+- `android` builds MsQuic for the packaged ABIs when missing
+  (`CI_MSQUIC_ABIS` to widen beyond `arm64-v8a`) and verifies the `.so` files
+  land in the APK — without them the app crashes on first connect.
+- `desktop` verifies the release binary is an ELF with a fully resolvable
+  `ldd` closure; `appimage` extracts the image and verifies the binary's
+  library closure and that bundled `adb` runs.
+- The `appimage` job only covers the host architecture — there is no local
+  aarch64 equivalent of the ARM runner.
+- Artifact uploads stay in the workflows. Locally, `ci` links every produced
+  artifact (APK, release binary, AppImage) into `target/ci-artifacts/` —
+  gitignored — and prints the listing at the end of the run. The real files
+  stay in their usual build directories.
 
 ## Update pinned inputs
 

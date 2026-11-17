@@ -27,8 +27,17 @@
 		F9629138F5B48FC386E0E6AE /* TouchpadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F21DA927A2A8CE1F1E53F55 /* TouchpadView.swift */; };
 		AA0001010000000100000001 /* ClipboardPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001020000000200000002 /* ClipboardPlugin.swift */; };
 		AA0001030000000300000003 /* ClipboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001040000000400000004 /* ClipboardView.swift */; };
+		AA0001050000000500000005 /* MediaPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001060000000600000006 /* MediaPlugin.swift */; };
+		AA0001070000000700000007 /* MediaView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001080000000800000008 /* MediaView.swift */; };
+		AA0001090000000900000009 /* NotificationPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001100000001000000010 /* NotificationPlugin.swift */; };
+		AA0001110000001100000011 /* NotificationsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001120000001200000012 /* NotificationsView.swift */; };
+		AA0001130000001300000013 /* CommandsPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001140000001400000014 /* CommandsPlugin.swift */; };
+		AA0001150000001500000015 /* CommandsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001160000001600000016 /* CommandsView.swift */; };
+		AA0001170000001700000017 /* FilesPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001180000001800000018 /* FilesPlugin.swift */; };
+		AA0001190000001900000019 /* FilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0001200000002000000020 /* FilesView.swift */; };
 		FE1C89EBE8BBFF8D916399AC /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C32A8D51FBF9C10FB8E041C8 /* Assets.xcassets */; };
 		FF3DA49C17174A36EDC4842C /* InputPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = C11C6E55F38CA127A8E61055 /* InputPlugin.swift */; };
+		A10000000000000000000001 /* AnchorSDK in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000002 /* AnchorSDK */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -62,6 +71,14 @@
 		AF3186D712F8B024AF3E4926 /* VideoPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPlugin.swift; sourceTree = "<group>"; };
 		AA0001020000000200000002 /* ClipboardPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardPlugin.swift; sourceTree = "<group>"; };
 		AA0001040000000400000004 /* ClipboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClipboardView.swift; sourceTree = "<group>"; };
+		AA0001060000000600000006 /* MediaPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPlugin.swift; sourceTree = "<group>"; };
+		AA0001080000000800000008 /* MediaView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaView.swift; sourceTree = "<group>"; };
+		AA0001100000001000000010 /* NotificationPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationPlugin.swift; sourceTree = "<group>"; };
+		AA0001120000001200000012 /* NotificationsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationsView.swift; sourceTree = "<group>"; };
+		AA0001140000001400000014 /* CommandsPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandsPlugin.swift; sourceTree = "<group>"; };
+		AA0001160000001600000016 /* CommandsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandsView.swift; sourceTree = "<group>"; };
+		AA0001180000001800000018 /* FilesPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesPlugin.swift; sourceTree = "<group>"; };
+		AA0001200000002000000020 /* FilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilesView.swift; sourceTree = "<group>"; };
 		C11C6E55F38CA127A8E61055 /* InputPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InputPlugin.swift; sourceTree = "<group>"; };
 		C2CE93B7CF9DD458264293D7 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		C32A8D51FBF9C10FB8E041C8 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -69,6 +86,17 @@
 		CD5B93FC85E023B3EFC90546 /* NetworkPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkPlugin.swift; sourceTree = "<group>"; };
 		E9EFE4D94569E104A5007E9E /* ConnectionModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionModels.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* AnchorSDK in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
 		1D3AC49A64DBCD360DC5C93E /* Core */ = {
@@ -158,6 +186,10 @@
 				339A43E658783786F1A69AA4 /* UdpFrameReassembler.swift */,
 				AF3186D712F8B024AF3E4926 /* VideoPlugin.swift */,
 				AA0001020000000200000002 /* ClipboardPlugin.swift */,
+				AA0001060000000600000006 /* MediaPlugin.swift */,
+				AA0001100000001000000010 /* NotificationPlugin.swift */,
+				AA0001140000001400000014 /* CommandsPlugin.swift */,
+				AA0001180000001800000018 /* FilesPlugin.swift */,
 			);
 			path = Plugins;
 			sourceTree = "<group>";
@@ -171,6 +203,10 @@
 				8F21DA927A2A8CE1F1E53F55 /* TouchpadView.swift */,
 				45F58526F31D038E4ABAD5A3 /* VideoDisplayView.swift */,
 				AA0001040000000400000004 /* ClipboardView.swift */,
+				AA0001080000000800000008 /* MediaView.swift */,
+				AA0001120000001200000012 /* NotificationsView.swift */,
+				AA0001160000001600000016 /* CommandsView.swift */,
+				AA0001200000002000000020 /* FilesView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -183,6 +219,7 @@
 			buildConfigurationList = 9A3340A0BCD8AA8B00BE46C6 /* Build configuration list for PBXNativeTarget "Anchor" */;
 			buildPhases = (
 				63D364B80E211DB48EB26372 /* Sources */,
+				A10000000000000000000003 /* Frameworks */,
 				7346EBA95A3342D71D986520 /* Resources */,
 			);
 			buildRules = (
@@ -191,6 +228,7 @@
 			);
 			name = Anchor;
 			packageProductDependencies = (
+				A10000000000000000000002 /* AnchorSDK */,
 			);
 			productName = Anchor;
 			productReference = 067C4B964D6B6AD5DC23BD6C /* Anchor.app */;
@@ -243,12 +281,30 @@
 			minimizedProjectReferenceProxies = 1;
 			projectDirPath = "";
 			projectRoot = "";
+			packageReferences = (
+				A10000000000000000000004 /* XCLocalSwiftPackageReference "../anchor-sdk/swift" */,
+			);
 			targets = (
 				6F5D2FC464FFAA1DA15E11C1 /* Anchor */,
 				F550439999E9EDA3665F573C /* AnchorTests */,
 			);
 		};
 /* End PBXProject section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A10000000000000000000004 /* XCLocalSwiftPackageReference "../anchor-sdk/swift" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../anchor-sdk/swift;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000002 /* AnchorSDK */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000004 /* XCLocalSwiftPackageReference "../anchor-sdk/swift" */;
+			productName = AnchorSDK;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXResourcesBuildPhase section */
 		7346EBA95A3342D71D986520 /* Resources */ = {
@@ -294,6 +350,14 @@
 				B9F114FA3AFE9B79018EE4C7 /* VideoPlugin.swift in Sources */,
 				AA0001010000000100000001 /* ClipboardPlugin.swift in Sources */,
 				AA0001030000000300000003 /* ClipboardView.swift in Sources */,
+				AA0001050000000500000005 /* MediaPlugin.swift in Sources */,
+				AA0001070000000700000007 /* MediaView.swift in Sources */,
+				AA0001090000000900000009 /* NotificationPlugin.swift in Sources */,
+				AA0001110000001100000011 /* NotificationsView.swift in Sources */,
+				AA0001130000001300000013 /* CommandsPlugin.swift in Sources */,
+				AA0001150000001500000015 /* CommandsView.swift in Sources */,
+				AA0001170000001700000017 /* FilesPlugin.swift in Sources */,
+				AA0001190000001900000019 /* FilesView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -313,6 +377,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				DEVELOPMENT_TEAM = BU9F43B7BB;
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -330,6 +395,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				DEVELOPMENT_TEAM = BU9F43B7BB;
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

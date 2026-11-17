@@ -35,7 +35,6 @@
     curl
     file
     imagemagick
-    android-tools
 
     # Tauri and GTK runtime/build dependencies.
     webkitgtk_4_1
@@ -54,6 +53,7 @@
     mesa
     libgbm
     libva
+    intel-media-driver
     x264
 
     # Other native dependencies.
@@ -85,10 +85,12 @@
   ];
 
   # NixOS normally exposes these through /run/opengl-driver. On this non-NixOS
-  # host, point GLVND, GBM and VA-API at the matching Nix Mesa driver set.
+  # host, point GLVND, GBM and VA-API at matching Nix driver sets. Mesa supplies
+  # the AMD/other Gallium VA-API drivers; Intel's H.264 encoder lives in the
+  # separate iHD driver package.
   env.GBM_BACKENDS_PATH = "${pkgs.mesa}/lib/gbm";
   env.LIBGL_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
-  env.LIBVA_DRIVERS_PATH = "${pkgs.mesa}/lib/dri";
+  env.LIBVA_DRIVERS_PATH = "${pkgs.intel-media-driver}/lib/dri:${pkgs.mesa}/lib/dri";
   env.__EGL_VENDOR_LIBRARY_DIRS = "${pkgs.mesa}/share/glvnd/egl_vendor.d";
 
   scripts.dev.exec = ''
@@ -102,6 +104,11 @@
   scripts.check-all.exec = ''
     cargo check
     pnpm --dir frontend run check
+  '';
+
+  # Run a CI job exactly as GitHub runs it (../scripts/ci.sh job list).
+  scripts.ci.exec = ''
+    exec "$DEVENV_ROOT/../scripts/ci.sh" "$@"
   '';
 
   enterShell = ''

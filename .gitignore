@@ -19,6 +19,7 @@ node_modules/
 
 # ===== Rust =====
 Cargo.lock
+!anchor-sdk/rust/Cargo.lock
 
 # ===== Python =====
 __pycache__/
@@ -41,6 +42,7 @@ captures/
 # ===== iOS =====
 *.xcworkspace/xcuserdata/
 *.xcuserdata/
+xcuserdata/
 *.xcuserstate
 DerivedData/
 Pods/
@@ -48,6 +50,10 @@ Pods/
 
 # ===== macOS =====
 .DS_Store
+
+# ===== Swift SDK build artifacts =====
+anchor-sdk/swift/.build/
+anchor-sdk/swift/.swiftpm/
 **/.DS_Store
 
 # ===== Windows =====

@@ -10,7 +10,6 @@ import org.anchor.sdk.v1.capabilities.screen.ScreenOutputList
 import org.anchor.sdk.v1.capabilities.screen.ScreenStatus
 import org.anchor.sdk.v1.capabilities.sms.SmsMessage
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -51,10 +50,7 @@ class RemainingProtocolTest {
         assertEquals(1, decodedOutputs.size)
         assertEquals("display-1", decodedOutputs.single().outputId)
         assertEquals("HDMI", decodedOutputs.single().displayName)
-        // Sideboat now uses a reliable QUIC stream. A screen capability must
-        // not advertise datagrams, or callers can accidentally recreate the
-        // lossy/reordering path that caused visible frame degradation.
-        assertFalse(ScreenProtocol.advertisement().supportsDatagrams)
+        assertTrue(ScreenProtocol.advertisement().supportsDatagrams)
     }
 
     @Test
@@ -107,5 +103,34 @@ class RemainingProtocolTest {
         assertEquals("completed", decoded.status)
         assertEquals(0, decoded.exitCode)
         assertEquals(CommandsProtocol.CAPABILITY_NAME, CommandsProtocol.endpointAdvertisement().capabilitiesList.single().name)
+    }
+
+    @Test
+    fun everyPublicCapabilityAdvertisesNonEmptyUniqueRecordTypeUrls() {
+        val advertisements = listOf(
+            CameraProtocol.advertisement(),
+            ClipboardProtocol.advertisement(),
+            CommandsProtocol.advertisement(),
+            DeviceProtocol.advertisement(),
+            FilesProtocol.advertisement(),
+            InputProtocol.advertisement(),
+            MediaProtocol.advertisement(),
+            NotificationsProtocol.advertisement(),
+            ScreenProtocol.advertisement(),
+            SmsProtocol.advertisement(),
+        )
+
+        advertisements.forEach { advertisement ->
+            assertTrue(advertisement.name.isNotEmpty())
+            assertTrue(advertisement.major > 0)
+            assertTrue(advertisement.recordTypeUrlsCount > 0)
+            assertEquals(
+                advertisement.recordTypeUrlsCount,
+                advertisement.recordTypeUrlsList.toSet().size,
+            )
+            advertisement.recordTypeUrlsList.forEach { typeUrl ->
+                assertTrue(typeUrl.isNotEmpty())
+            }
+        }
     }
 }

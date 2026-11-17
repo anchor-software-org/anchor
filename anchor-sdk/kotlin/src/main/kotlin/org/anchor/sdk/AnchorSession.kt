@@ -7,6 +7,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.yield
 import org.anchor.sdk.v1.CapabilityOpened
 import org.anchor.sdk.v1.ControlEnvelope
 import org.anchor.sdk.v1.EndpointAdvertisement
@@ -20,6 +21,9 @@ private const val PROTOCOL_MAJOR = 1
 private const val PROTOCOL_MINOR = 0
 private const val NODE_ID_BYTES = 32
 private const val MAX_CONTROL_RECORD_BYTES = 1024 * 1024
+// One max-size frame is ~8007 fragments; 8192 absorbs a full burst while
+// bounding how much stale media can accumulate behind a stalled consumer.
+private const val MAX_QUEUED_DATAGRAMS = 8192
 private val CONTROL_MAGIC = byteArrayOf('A'.code.toByte(), 'N'.code.toByte(), 'C'.code.toByte(), 'R'.code.toByte())
 
 data class SessionIdentity(
@@ -87,13 +91,19 @@ class AnchorSession private constructor(
 ) : AutoCloseable {
     private val queuedEvents = ArrayDeque<AnchorSessionEvent>()
     private val queuedStreamData = mutableMapOf<Long, ArrayDeque<AnchorStreamData>>()
-    private val queuedDatagrams = ArrayDeque<ByteArray>()
+    /* Inbound datagrams route to per-flow queues by the ANFR flow ID, like
+     * the Rust dispatcher — a single shared queue would let one flow's
+     * reader consume another flow's datagrams and drop them as header
+     * mismatches, which is silent cross-flow media loss. */
+    private val queuedDatagrams = mutableMapOf<Long, ArrayDeque<ByteArray>>()
+    private val datagramRoutes = mutableSetOf<Long>()
     /* Queue containers and their counters share one lock. This makes a
      * snapshot describe a real state rather than a mixture of two moments. */
     private val queueLock = Any()
     private val eventQueueAccounting = QueueAccounting()
     private val streamQueueAccounting = QueueAccounting()
     private val datagramQueueAccounting = QueueAccounting()
+    private var droppedDatagrams = 0L
     private val pollMutex = Mutex()
     // A session has one control stream, but capability operations and the
     // SDK event router may wait on it concurrently. Serialize reads and queue
@@ -105,6 +115,15 @@ class AnchorSession private constructor(
     private var nextCapabilityId = 1L
     private var nextFlowId = 1L
     private var closedReason: Int? = null
+    private val capabilities = mutableMapOf<Long, CapabilityState>()
+    private val finishedStreams = mutableSetOf<Long>()
+    private val invalidStreams = mutableSetOf<Long>()
+
+    private data class CapabilityState(
+        val allowedTypeUrls: List<String>,
+        val supportsDatagrams: Boolean,
+        var open: Boolean,
+    )
 
     suspend fun nextEvent(): AnchorSessionEvent {
         return readEvent()
@@ -126,6 +145,11 @@ class AnchorSession private constructor(
             when (val event = readEvent()) {
                 is AnchorSessionEvent.CapabilityOpened -> if (event.responseTo == requestId && event.capabilitySessionId == sessionId) {
                     restoreEvents(deferred)
+                    capabilities[sessionId] = CapabilityState(
+                        advertisement.recordTypeUrlsList,
+                        advertisement.supportsDatagrams,
+                        true,
+                    )
                     return AnchorCapability(this, sessionId, advertisement.recordTypeUrlsList, advertisement.supportsDatagrams)
                 } else deferred.addLast(event)
                 else -> deferred.addLast(event)
@@ -185,6 +209,7 @@ class AnchorSession private constructor(
     }
 
     internal suspend fun sendRecord(sessionId: Long, typeUrl: String, payload: ByteArray) {
+        requireCapability(sessionId, typeUrl, requiresDatagrams = false)
         send(0, ControlEnvelope.newBuilder().setCapabilityRecord(
             org.anchor.sdk.v1.CapabilityRecord.newBuilder().setCapabilitySessionId(sessionId)
                 .setTypeUrl(typeUrl).setPayload(ByteString.copyFrom(payload)),
@@ -192,6 +217,7 @@ class AnchorSession private constructor(
     }
 
     internal suspend fun openStream(capabilitySessionId: Long, payloadTypeUrl: String): AnchorStream {
+        requireCapability(capabilitySessionId, payloadTypeUrl, requiresDatagrams = false)
         val streamId = transport.openBidirectionalStream()
         val requestId = allocateRequestId()
         send(requestId, ControlEnvelope.newBuilder().setStreamOpen(
@@ -220,11 +246,11 @@ class AnchorSession private constructor(
 
     internal suspend fun readEvent(): AnchorSessionEvent = eventMutex.withLock {
         while (true) {
-            framer.next()?.let { return@withLock decodeEvent(it) }
+            framer.next()?.let { return@withLock validateEvent(decodeEvent(it)) }
             takeQueuedEvent()?.let { return@withLock it }
             closedReason?.let { return@withLock AnchorSessionEvent.SessionClosed(it) }
             pollMutex.withLock { dispatch(transport.poll()) }
-            framer.next()?.let { return@withLock decodeEvent(it) }
+            framer.next()?.let { return@withLock validateEvent(decodeEvent(it)) }
             takeQueuedEvent()?.let { return@withLock it }
             closedReason?.let { return@withLock AnchorSessionEvent.SessionClosed(it) }
             delay(2)
@@ -234,9 +260,17 @@ class AnchorSession private constructor(
 
     internal suspend fun readStream(streamId: Long): AnchorStreamData {
         var closeObserved = false
+        var idlePolls = 0
         while (true) {
+            if (invalidStreams.contains(streamId)) {
+                throw AnchorSessionException("stream received data after FIN")
+            }
             takeQueuedStream(streamId)?.let { return it }
-            pollMutex.withLock { dispatch(transport.poll()) }
+            val polled = pollMutex.withLock {
+                val events = transport.poll()
+                dispatch(events)
+                events.size
+            }
             takeQueuedStream(streamId)?.let { return it }
             if (closedReason != null) {
                 // MsQuic can report connection shutdown before its final
@@ -245,18 +279,38 @@ class AnchorSession private constructor(
                 if (closeObserved) throw AnchorSessionException("QUIC transport closed")
                 closeObserved = true
             }
-            delay(2)
+            if (polled > 0) {
+                idlePolls = 0
+            } else if (++idlePolls < 32) {
+                yield()
+            } else {
+                delay(1)
+            }
         }
     }
 
-    internal suspend fun readDatagram(): ByteArray {
+    internal suspend fun readDatagram(flowId: Long): ByteArray {
+        var idlePolls = 0
         while (true) {
-            takeQueuedDatagram()?.let { return it }
+            takeQueuedDatagram(flowId)?.let { return it }
             if (closedReason != null) throw AnchorSessionException("QUIC transport closed")
-            pollMutex.withLock { dispatch(transport.poll()) }
-            takeQueuedDatagram()?.let { return it }
+            val polled = pollMutex.withLock {
+                val events = transport.poll()
+                dispatch(events)
+                events.size
+            }
+            takeQueuedDatagram(flowId)?.let { return it }
             if (closedReason != null) throw AnchorSessionException("QUIC transport closed")
-            delay(2)
+            // Media datagrams arrive in bursts microseconds apart — spin
+            // briefly so an in-flight burst is not delayed by a sleep, then
+            // nap while the transport is truly idle.
+            if (polled > 0) {
+                idlePolls = 0
+            } else if (++idlePolls < 32) {
+                yield()
+            } else {
+                delay(1)
+            }
         }
     }
 
@@ -267,14 +321,38 @@ class AnchorSession private constructor(
                     framer.feed(event.bytes)
                 } else {
                     synchronized(queueLock) {
-                        queuedStreamData.getOrPut(event.streamId) { ArrayDeque() }
-                            .addLast(AnchorStreamData(event.bytes, event.finished))
-                        streamQueueAccounting.enqueue(event.bytes.size)
+                        if (finishedStreams.contains(event.streamId)) {
+                            invalidStreams.add(event.streamId)
+                        } else {
+                            queuedStreamData.getOrPut(event.streamId) { ArrayDeque() }
+                                .addLast(AnchorStreamData(event.bytes, event.finished))
+                            streamQueueAccounting.enqueue(event.bytes.size)
+                            if (event.finished) finishedStreams.add(event.streamId)
+                        }
                     }
                 }
                 is QuicEvent.Datagram -> synchronized(queueLock) {
-                    queuedDatagrams.addLast(event.bytes)
-                    datagramQueueAccounting.enqueue(event.bytes.size)
+                    // Route by ANFR flow ID; datagrams for unregistered or
+                    // malformed packets are dropped as ordinary media loss.
+                    // Media datagrams are replaceable: an over-full queue
+                    // means the consumer is behind, so drop the oldest
+                    // rather than deliver stale video or grow memory without
+                    // bound. Mirrors the Rust dispatcher's per-flow channel.
+                    val queue = VideoFrameProtocol.datagramFlowId(event.bytes)
+                        ?.takeIf { it in datagramRoutes }
+                        ?.let { queuedDatagrams.getOrPut(it) { ArrayDeque() } }
+                    if (queue == null) {
+                        droppedDatagrams++
+                    } else {
+                        while (queue.size >= MAX_QUEUED_DATAGRAMS) {
+                            queue.pollFirst()?.let { dropped ->
+                                datagramQueueAccounting.dequeue(dropped.size)
+                                droppedDatagrams++
+                            }
+                        }
+                        queue.addLast(event.bytes)
+                        datagramQueueAccounting.enqueue(event.bytes.size)
+                    }
                 }
                 is QuicEvent.Failed -> throw AnchorSessionException(event.reason)
                 is QuicEvent.Closed -> if (closedReason == null) closedReason = event.code.toInt()
@@ -304,6 +382,40 @@ class AnchorSession private constructor(
     internal fun allocateRequestId(): Long = nextRequestId++.also { if (it == 0L) nextRequestId = 1L }
     private fun allocateCapabilityId(): Long = nextCapabilityId++.also { if (it == 0L) nextCapabilityId = 1L }
     internal fun allocateFlowId(): Long = nextFlowId++.also { if (it == 0L) nextFlowId = 1L }
+
+    internal fun requireCapability(sessionId: Long, typeUrl: String, requiresDatagrams: Boolean) {
+        val capability = capabilities[sessionId]
+            ?: throw AnchorSessionException("capability session is not open")
+        if (!capability.open) throw AnchorSessionException("capability session is not open")
+        if (!capability.allowedTypeUrls.contains(typeUrl)) {
+            throw AnchorSessionException("record type URL was not advertised")
+        }
+        if (requiresDatagrams && !capability.supportsDatagrams) {
+            throw AnchorSessionException("capability does not advertise datagrams")
+        }
+    }
+
+    private fun validateEvent(event: AnchorSessionEvent): AnchorSessionEvent {
+        when (event) {
+            is AnchorSessionEvent.CapabilityClosed -> {
+                val capability = capabilities[event.capabilitySessionId]
+                    ?: throw AnchorSessionException("unknown capability session")
+                capability.open = false
+            }
+            is AnchorSessionEvent.CapabilityRecord -> requireCapability(
+                event.capabilitySessionId,
+                event.typeUrl,
+                requiresDatagrams = false,
+            )
+            is AnchorSessionEvent.DatagramFlowOpenRequested -> requireCapability(
+                event.capabilitySessionId,
+                event.payloadTypeUrl,
+                requiresDatagrams = true,
+            )
+            else -> Unit
+        }
+        return event
+    }
     /**
      * Return an event to the session queue when an application-level reader
      * observes an acknowledgement owned by another pending operation.
@@ -348,6 +460,7 @@ class AnchorSession private constructor(
             datagramQueueBytes = datagramQueueAccounting.currentBytes,
             datagramQueueHighWaterItems = datagramQueueAccounting.highWaterItems,
             datagramQueueHighWaterBytes = datagramQueueAccounting.highWaterBytes,
+            droppedDatagrams = droppedDatagrams,
             enqueuedItems = streamQueueAccounting.enqueuedItems + datagramQueueAccounting.enqueuedItems + eventQueueAccounting.enqueuedItems,
             enqueuedBytes = streamQueueAccounting.enqueuedBytes + datagramQueueAccounting.enqueuedBytes,
             dequeuedItems = streamQueueAccounting.dequeuedItems + datagramQueueAccounting.dequeuedItems + eventQueueAccounting.dequeuedItems,
@@ -368,8 +481,22 @@ class AnchorSession private constructor(
         }
     }
 
-    private fun takeQueuedDatagram(): ByteArray? = synchronized(queueLock) {
-        queuedDatagrams.takeFirstOrNull()?.also { datagramQueueAccounting.dequeue(it.size) }
+    private fun takeQueuedDatagram(flowId: Long): ByteArray? = synchronized(queueLock) {
+        val queue = queuedDatagrams[flowId] ?: return@synchronized null
+        queue.pollFirst()?.also {
+            datagramQueueAccounting.dequeue(it.size)
+            if (queue.isEmpty()) queuedDatagrams.remove(flowId)
+        }
+    }
+
+    /** Register a datagram route before the open request so early datagrams queue. */
+    internal fun registerDatagramFlow(flowId: Long) = synchronized(queueLock) {
+        datagramRoutes.add(flowId)
+    }
+
+    internal fun unregisterDatagramFlow(flowId: Long) = synchronized(queueLock) {
+        datagramRoutes.remove(flowId)
+        queuedDatagrams.remove(flowId)?.forEach { datagramQueueAccounting.dequeue(it.size) }
     }
 
     companion object {
@@ -389,14 +516,24 @@ class AnchorSession private constructor(
             val peer = peerFromHello(peerHello)
             val ready = awaitEnvelope(transport, controlStream, framer, timeoutMs)
             if (ready.bodyCase != ControlEnvelope.BodyCase.SESSION_READY) throw AnchorSessionException("expected SessionReady")
+            if (!ready.sessionReady.hasProtocolVersion()
+                || ready.sessionReady.protocolVersion.major != PROTOCOL_MAJOR
+                || ready.sessionReady.protocolVersion.minor > PROTOCOL_MINOR
+            ) throw AnchorSessionException("unsupported protocol version")
             AnchorSession(transport, controlStream, peer, framer)
         }
 
         private suspend fun awaitConnected(transport: QuicTransport, timeoutMs: Long) {
             val deadline = System.nanoTime() + timeoutMs * 1_000_000
             while (System.nanoTime() < deadline) {
-                if (transport.poll().any { it == QuicEvent.Connected }) return
-                transport.poll().filterIsInstance<QuicEvent.Failed>().firstOrNull()?.let { throw AnchorSessionException(it.reason) }
+                for (event in transport.poll()) {
+                    when (event) {
+                        QuicEvent.Connected -> return
+                        is QuicEvent.Failed -> throw AnchorSessionException(event.reason)
+                        is QuicEvent.Closed -> throw AnchorSessionException("QUIC transport closed: ${event.reason}")
+                        else -> Unit
+                    }
+                }
                 delay(2)
             }
             throw AnchorSessionException("QUIC connection timed out")
@@ -407,7 +544,12 @@ class AnchorSession private constructor(
             while (System.nanoTime() < deadline) {
                 framer.next()?.let { return it }
                 transport.poll().forEach {
-                    if (it is QuicEvent.StreamData && it.streamId == streamId) framer.feed(it.bytes)
+                    when (it) {
+                        is QuicEvent.StreamData -> if (it.streamId == streamId) framer.feed(it.bytes)
+                        is QuicEvent.Failed -> throw AnchorSessionException(it.reason)
+                        is QuicEvent.Closed -> throw AnchorSessionException("QUIC transport closed: ${it.reason}")
+                        else -> Unit
+                    }
                 }
                 framer.next()?.let { return it }
                 delay(2)
@@ -445,7 +587,9 @@ class AnchorCapability internal constructor(
     suspend fun openDatagramFlow(payloadTypeUrl: String): AnchorDatagramFlow {
         require(supportsDatagrams) { "capability does not advertise datagrams" }
         require(allowedTypeUrls.contains(payloadTypeUrl)) { "datagram type URL was not advertised" }
+        session.requireCapability(sessionId, payloadTypeUrl, requiresDatagrams = true)
         val flowId = session.allocateFlowId()
+        session.registerDatagramFlow(flowId)
         val requestId = session.allocateRequestId()
         session.send(requestId, ControlEnvelope.newBuilder().setDatagramFlowOpen(
             org.anchor.sdk.v1.DatagramFlowOpen.newBuilder()
@@ -468,11 +612,21 @@ class AnchorDatagramFlow internal constructor(
     private val session: AnchorSession,
     val flowId: Long,
 ) {
-    fun send(bytes: ByteArray) = session.sendDatagram(bytes)
+    private var closed = false
 
-    suspend fun receive(): ByteArray = session.readDatagram()
+    fun send(bytes: ByteArray) {
+        check(!closed) { "datagram flow is closed" }
+        session.sendDatagram(bytes)
+    }
 
-    suspend fun close() = session.sendDatagramFlowClosed(flowId)
+    suspend fun receive(): ByteArray = session.readDatagram(flowId)
+
+    suspend fun close() {
+        check(!closed) { "datagram flow is closed" }
+        session.unregisterDatagramFlow(flowId)
+        session.sendDatagramFlowClosed(flowId)
+        closed = true
+    }
 }
 
 class AnchorStream internal constructor(private val session: AnchorSession, val streamId: Long) {
@@ -532,6 +686,9 @@ internal class ControlFramer {
             if (index == 9 && byte > 1) throw AnchorSessionException("invalid control length")
             value = value or ((byte and 0x7f).toLong() shl (index * 7))
             if (byte and 0x80 == 0) {
+                if (value > MAX_CONTROL_RECORD_BYTES.toLong() || value > Int.MAX_VALUE) {
+                    throw AnchorSessionException("control record exceeds 1 MiB")
+                }
                 return value.toInt() to consumed
             }
         }

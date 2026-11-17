@@ -1,0 +1,84 @@
+{
+  "captured_at": "2026-11-01",
+  "fdroid_build_commit": "11c53e011cca8392f4993820c57d819cc05cfad1",
+  "fix_base_commit": "79e1ba6f91dafdc2ea5212c31310c3e3513f2c5f",
+  "source_comparison": {
+    "command": "git diff --exit-code 11c53e011cca8392f4993820c57d819cc05cfad1 79e1ba6 -- anchor anchor-sdk/kotlin anchor-sdk/protocol",
+    "result": "No differences"
+  },
+  "artifacts": [
+    {
+      "id": "fdroid-1.0.1",
+      "filename": "Anchor-fdroid-101.apk",
+      "source_url": "https://f-droid.org/repo/com.anchor.software_101.apk",
+      "bytes": 17207512,
+      "sha256": "22a9db8b92f77dfcdc9078943a8dc93dc62dce9fe95ca317d60a55b491aba5a2"
+    },
+    {
+      "id": "github-1.0.0",
+      "filename": "Anchor-1.0.0.apk",
+      "source_url": "https://github.com/anchor-software-org/anchor/releases/download/v1.0.0/Anchor-1.0.0.apk",
+      "bytes": 66257859,
+      "sha256": "ccb71a85edf68ecf888e23b903284f24d93ce652ef5ea69f97c32e93595985ee"
+    },
+    {
+      "id": "desktop-1.0.0",
+      "filename": "Anchor-x86_64.AppImage",
+      "source_url": "https://github.com/anchor-software-org/anchor/releases/download/v1.0.0/Anchor-x86_64.AppImage",
+      "bytes": 14490104,
+      "sha256": "c6d767f52fb593e657edf5ccf85633895d328d0a0272878baf8575a8a008b624"
+    },
+    {
+      "id": "fixed-minified-test-apk",
+      "filename": "Anchor-r8-fixed-test.apk",
+      "source_url": null,
+      "bytes": 17735896,
+      "sha256": "648d6df5729fb8fe25222d52cbb60fa1c1818c2be82aade93867974d15fe1fc1"
+    }
+  ],
+  "native_libraries": [
+    {
+      "path": "lib/arm64-v8a/libanchor_msquic_jni.so",
+      "original_sha256": "48d7edb397d5b5159e143b94a0d09fb3b472c8686f5ad9cf75ffcdf4a8b7b826",
+      "fixed_sha256": "48d7edb397d5b5159e143b94a0d09fb3b472c8686f5ad9cf75ffcdf4a8b7b826",
+      "identical": true
+    },
+    {
+      "path": "lib/arm64-v8a/libmsquic.so",
+      "original_sha256": "85f5313a30ba1178d46ef5eda18c5fe7012128b5b0d1216e82697129c57f4b3a",
+      "fixed_sha256": "85f5313a30ba1178d46ef5eda18c5fe7012128b5b0d1216e82697129c57f4b3a",
+      "identical": true
+    },
+    {
+      "path": "lib/armeabi-v7a/libanchor_msquic_jni.so",
+      "original_sha256": "a6fd1dbdfedc055e17e2f7a143b9826ed177044dffef48560d1426ca75b4b38a",
+      "fixed_sha256": "a6fd1dbdfedc055e17e2f7a143b9826ed177044dffef48560d1426ca75b4b38a",
+      "identical": true
+    },
+    {
+      "path": "lib/armeabi-v7a/libmsquic.so",
+      "original_sha256": "644ca8a19926162e6c326d18833944a58ffae709204df91fa7a5c8103d415676",
+      "fixed_sha256": "644ca8a19926162e6c326d18833944a58ffae709204df91fa7a5c8103d415676",
+      "identical": true
+    },
+    {
+      "path": "lib/x86_64/libanchor_msquic_jni.so",
+      "original_sha256": "c41d60460566eb599537708e3ac9e1a843b4f5894b0b6f02db15f4d5122714bd",
+      "fixed_sha256": "c41d60460566eb599537708e3ac9e1a843b4f5894b0b6f02db15f4d5122714bd",
+      "identical": true
+    },
+    {
+      "path": "lib/x86_64/libmsquic.so",
+      "original_sha256": "27eb406dcd945221cfd3175c12cf16d3db709951a6689948eee740832773342c",
+      "fixed_sha256": "27eb406dcd945221cfd3175c12cf16d3db709951a6689948eee740832773342c",
+      "identical": true
+    }
+  ],
+  "environment": {
+    "desktop": "Pop!_OS 24.04 official live ISO in libvirt",
+    "cosmic_comp": "0.1~1786994555~24.04~8806436",
+    "android": "Dedicated Android x86_64 emulator, API 37.1 system image",
+    "transport": "Pairing by IPv4 address across emulator/VM NAT"
+  },
+  "test_apk_signing": "Temporary local test key; not signed by F-Droid or the production release key"
+}

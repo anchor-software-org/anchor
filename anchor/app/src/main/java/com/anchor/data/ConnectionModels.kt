@@ -23,6 +23,8 @@ data class DeviceListEntry(
     val isOnline: Boolean,
     val port: Int = 5027,
     val certificateDer: ByteArray? = null,
+    /** True when [ip] reaches this desktop over USB tethering. */
+    val wired: Boolean = false,
 )
 
 enum class ConnectionStatus {

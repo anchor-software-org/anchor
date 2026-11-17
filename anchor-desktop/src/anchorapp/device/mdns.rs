@@ -21,7 +21,7 @@ pub(crate) fn desktop_name() -> String {
 /// DNS-SD service type for Anchor desktops.
 const SERVICE_TYPE: &str = "_anchor._udp.local.";
 /// QUIC SDK endpoint port.
-const SDK_PORT: u16 = 5027;
+pub(super) const SDK_PORT: u16 = 5027;
 const CERTIFICATE_CHUNK_BYTES: usize = 220;
 
 /// Encodes public certificate bytes as bounded DNS-SD TXT properties. Every

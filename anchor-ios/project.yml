@@ -13,12 +13,18 @@ settings:
     CODE_SIGN_IDENTITY: "Apple Development"
     CODE_SIGN_STYLE: Automatic
 
+packages:
+  AnchorSDK:
+    path: ../anchor-sdk/swift
+
 targets:
   Anchor:
     type: application
     platform: iOS
     sources:
       - path: Anchor
+    dependencies:
+      - package: AnchorSDK
     settings:
       base:
         INFOPLIST_FILE: Anchor/Info.plist

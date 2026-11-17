@@ -8,8 +8,8 @@ import org.junit.Test
 
 class ReconnectPolicyTest {
 
-    private fun dev(id: String?, ip: String, name: String = id ?: "?") =
-        DiscoveredDevice(deviceId = id, name = name, ip = ip, port = 5027)
+    private fun dev(id: String?, ip: String, name: String = id ?: "?", wired: Boolean = false) =
+        DiscoveredDevice(deviceId = id, name = name, ip = ip, port = 5027, wired = wired)
 
     // --- Priority 1: last device visible on mDNS ---
 
@@ -93,6 +93,47 @@ class ReconnectPolicyTest {
             lastConnectedIp = "10.0.0.42"
         )
         assertNull(target)
+    }
+
+    // --- Wired path preference ---
+
+    @Test
+    fun lastDeviceOnWiredAndWifiPrefersWiredIp() {
+        val target = ReconnectPolicy.pickTarget(
+            discovered = listOf(
+                dev("A", "10.0.0.5"),
+                dev("A", "192.168.42.10", wired = true),
+            ),
+            savedDeviceIds = setOf("A"),
+            lastConnectedDeviceId = "A",
+            lastConnectedIp = "10.0.0.99"
+        )
+        assertEquals("192.168.42.10", target)
+    }
+
+    @Test
+    fun otherSavedDeviceOnWiredAndWifiPrefersWiredIp() {
+        val target = ReconnectPolicy.pickTarget(
+            discovered = listOf(
+                dev("B", "10.0.0.6"),
+                dev("B", "192.168.42.11", wired = true),
+            ),
+            savedDeviceIds = setOf("A", "B"),
+            lastConnectedDeviceId = "A", // A absent entirely
+            lastConnectedIp = "10.0.0.99"
+        )
+        assertEquals("192.168.42.11", target)
+    }
+
+    @Test
+    fun wiredFallbackBeatsStoredIp() {
+        val target = ReconnectPolicy.pickTarget(
+            discovered = listOf(dev("A", "192.168.42.10", wired = true)),
+            savedDeviceIds = setOf("A"),
+            lastConnectedDeviceId = "A",
+            lastConnectedIp = "10.0.0.99"
+        )
+        assertEquals("192.168.42.10", target)
     }
 
     // --- Nothing to do ---

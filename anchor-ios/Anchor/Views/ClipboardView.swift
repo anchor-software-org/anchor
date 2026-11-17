@@ -5,32 +5,24 @@ struct ClipboardView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Send button
-            Button(action: { clipboardPlugin.sendCurrentClipboard() }) {
-                HStack(spacing: 8) {
-                    Image(systemName: "paperplane.fill")
-                        .font(.system(size: 14))
-                    Text("Send Clipboard to Desktop")
-                        .font(.system(size: 14, weight: .medium))
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
-                .background(Color.anchorBlue40)
-                .foregroundColor(.white)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+            if let notice = clipboardPlugin.notice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 12)
-            .padding(.bottom, 8)
-
-            Divider().padding(.vertical, 4)
 
             // History
             if clipboardPlugin.history.isEmpty {
                 Spacer()
                 VStack(spacing: 12) {
-                    Image(systemName: "doc.on.clipboard")
-                        .font(.system(size: 44))
+                    Image("AndroidClipboard")
+                        .renderingMode(.template)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 44, height: 44)
                         .foregroundColor(.anchorGray.opacity(0.4))
                     Text("No clipboard history yet")
                         .font(.system(size: 14))
@@ -63,14 +55,31 @@ struct ClipboardView: View {
             }
         }
         .background(Color.charcoalBlack)
-        .navigationTitle("Clipboard")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            if !clipboardPlugin.history.isEmpty {
-                ToolbarItem(placement: .navigationBarTrailing) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack(spacing: 12) {
+                if !clipboardPlugin.history.isEmpty {
                     Button("Clear") { clipboardPlugin.clearHistory() }
                         .foregroundColor(.anchorGray)
                 }
+                Spacer()
+                Button(action: { clipboardPlugin.sendCurrentClipboard() }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "paperplane.fill")
+                        Text("Send to Desktop")
+                    }
+                    .font(.system(size: 14, weight: .medium))
+                    .padding(.horizontal, 20)
+                    .frame(height: 44)
+                    .background(Color.darkGray)
+                    .foregroundColor(.offWhite)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color.charcoalBlack)
+            .overlay(alignment: .top) {
+                Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
             }
         }
     }
@@ -82,17 +91,11 @@ struct ClipboardHistoryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // Header row: dot + Sent/Received ... size · compressed · time
+            // Header row: direction and quiet metadata.
             HStack {
-                // Source: colored dot + label
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(entry.source == "local" ? Color.anchorBlue40 : Color.seaGreen40)
-                        .frame(width: 6, height: 6)
-                    Text(entry.source == "local" ? "Sent" : "Received")
-                        .font(.system(size: 11))
-                        .foregroundColor(entry.source == "local" ? .anchorBlue40 : .seaGreen40)
-                }
+                Text(entry.source == "local" ? "Sent" : "Received")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.anchorGray)
 
                 Spacer()
 
@@ -139,8 +142,7 @@ struct ClipboardHistoryCard: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.darkGray.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .background(Color.darkGray.opacity(0.55))
         .onTapGesture {
             onCopy(entry)
         }

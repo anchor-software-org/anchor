@@ -55,6 +55,7 @@ export type Camera = {
 };
 
 export type DesktopState = {
+  showWindowControls: boolean;
   appName: string;
   version: string;
   build: string;
@@ -79,8 +80,12 @@ export type DesktopState = {
   camera: Camera;
 };
 
+export const openProjectLink = (page: 'source' | 'commit' | 'website' | 'issues', commit?: string) =>
+  invoke<void>('open_project_link', { page, commit });
+
 export const getDesktopState = (section?: string) => invoke<DesktopState>('desktop_state', { section });
 export const setStreaming = (enabled: boolean) => invoke<void>('set_streaming', { enabled });
+export const setWindowControls = (enabled: boolean) => invoke<void>('set_window_controls', { enabled });
 export const selectOutput = (index: number) => invoke<void>('select_output', { index });
 export const createVirtualDisplay = (width: number, height: number) => invoke<void>('create_virtual_display', { width, height });
 export const destroyVirtualDisplay = (name: string) => invoke<void>('destroy_virtual_display', { name });

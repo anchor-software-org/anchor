@@ -55,16 +55,22 @@ class AnchorPairingSession private constructor(
             require(hello.nodeId.size == 32) { "PairingHello node_id must be 32 bytes" }
             require(hello.displayName.isNotBlank()) { "PairingHello needs display metadata" }
             require(hello.transcriptHash.size == 32) { "PairingHello transcript hash must be 32 bytes" }
+            require(request.pairingBootstrap) { "pairing requires an unpinned bootstrap request" }
             transport.connect(request)
             val deadline = System.nanoTime() + timeoutMs * 1_000_000
-            while (System.nanoTime() < deadline) {
-                when (val event = transport.poll().firstOrNull { it is QuicEvent.Connected || it is QuicEvent.Failed }) {
-                    QuicEvent.Connected -> break
-                    is QuicEvent.Failed -> throw AnchorSessionException(event.reason)
-                    else -> delay(2)
+            var connected = false
+            while (System.nanoTime() < deadline && !connected) {
+                for (event in transport.poll()) {
+                    when (event) {
+                        QuicEvent.Connected -> connected = true
+                        is QuicEvent.Failed -> throw AnchorSessionException(event.reason)
+                        is QuicEvent.Closed -> throw AnchorSessionException("pairing connection closed: ${event.reason}")
+                        else -> Unit
+                    }
                 }
+                if (!connected) delay(2)
             }
-            if (System.nanoTime() >= deadline) throw AnchorSessionException("QUIC connection timed out")
+            if (!connected) throw AnchorSessionException("QUIC connection timed out")
             val streamId = transport.openBidirectionalStream()
             val envelope = ControlEnvelope.newBuilder().setPairingHello(AnchorProtocol.run { hello.toWire() }).build()
             transport.sendStream(streamId, ControlFraming.encode(envelope, first = true))
@@ -72,11 +78,18 @@ class AnchorPairingSession private constructor(
         }
 
         private fun decodeResolution(envelope: ControlEnvelope): PairingResolution = when (envelope.bodyCase) {
-            ControlEnvelope.BodyCase.PAIRING_APPROVE -> PairingResolution.Approved(
-                transcriptHash = envelope.pairingApprove.transcriptHash.toByteArray(),
-                approverCertificateDer = envelope.pairingApprove.approverCertificateDer.toByteArray(),
-                approverDeviceId = envelope.pairingApprove.approverDeviceId,
-            )
+            ControlEnvelope.BodyCase.PAIRING_APPROVE -> {
+                val approval = envelope.pairingApprove
+                if (approval.transcriptHash.size() != 32
+                    || approval.approverCertificateDer.isEmpty
+                    || approval.approverDeviceId.isBlank()
+                ) throw AnchorSessionException("pairing approval is missing trusted identity data")
+                PairingResolution.Approved(
+                    transcriptHash = approval.transcriptHash.toByteArray(),
+                    approverCertificateDer = approval.approverCertificateDer.toByteArray(),
+                    approverDeviceId = approval.approverDeviceId,
+                )
+            }
             ControlEnvelope.BodyCase.PAIRING_REJECT -> PairingResolution.Rejected
             else -> throw AnchorSessionException("pairing connection received a non-pairing record")
         }

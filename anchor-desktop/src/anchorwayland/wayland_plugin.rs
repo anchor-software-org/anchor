@@ -9,6 +9,7 @@ use crate::anchorwayland::vaapi_encoder::{VaapiDeviceCtx, VaapiEncoder};
 use crate::anchorwayland::wayland_objects::DrmBufParams;
 use serde_json::json;
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -113,6 +114,10 @@ struct CaptureState {
     next_encode_deadline: Option<Instant>,
     backend: Box<dyn CaptureBackend>,
     last_encoded_frame_time: Option<Instant>,
+    /// When the last recovery IDR was forced. Rate-limits keyframe honoring
+    /// so sustained backpressure can't turn into an IDR-per-frame storm —
+    /// each 300KB+ keyframe competes with the media that is already behind.
+    last_forced_idr: Option<Instant>,
     frame_drops: u64,
     total_frame_drops: u64,
     trace_ring: Arc<TraceRing>,
@@ -163,6 +168,10 @@ impl Plugin for AnchorPluginWayland {
             send_output_list(&tx, &last_output_list);
 
             let mut selected_output_index: usize = 0;
+            // A list index is only a capture-backend cursor and can change on
+            // hotplug. The compositor output name is the stable selection ID.
+            let mut selected_output_name =
+                last_output_list.first().map(|output| output.name.clone()).unwrap_or_default();
             let mut wayland_tab_visible = true;
             let mut preview_sequence = 0_u64;
             let mut last_idle_output_check = Instant::now();
@@ -182,27 +191,38 @@ impl Plugin for AnchorPluginWayland {
                                 break WaitResult::Start;
                             }
                             AnchorMessage::Wayland(WaylandPluginMsg::SelectOutput(idx)) => {
-                                selected_output_index = idx;
+                                if let Some(output) = last_output_list.get(idx) {
+                                    selected_output_index = idx;
+                                    selected_output_name = output.name.clone();
+                                }
                             }
                             AnchorMessage::Wayland(WaylandPluginMsg::TabVisible(visible)) => {
                                 wayland_tab_visible = visible;
                             }
                             AnchorMessage::Wayland(WaylandPluginMsg::RequestOutputs) => {
+                                let old_index = selected_output_index;
                                 backend.refresh_outputs();
                                 last_output_list = backend.get_outputs();
+                                reconcile_output_selection(
+                                    &last_output_list,
+                                    &mut selected_output_index,
+                                    &mut selected_output_name,
+                                );
                                 send_output_list(&tx, &last_output_list);
+                                if selected_output_index != old_index {
+                                    send_stream_status(&tx, "idle", selected_output_index, None);
+                                }
                             }
                             AnchorMessage::Wayland(WaylandPluginMsg::PrepareOutputRemoval {
                                 name,
                                 response_tx,
                             }) => {
-                                let selected_name = last_output_list
-                                    .get(selected_output_index)
-                                    .map(|output| output.name.as_str());
-                                let result = if selected_name == Some(name.as_str()) {
+                                let result = if selected_output_name == name {
                                     match fallback_output_index(&last_output_list, &name) {
                                         Some(index) => {
                                             selected_output_index = index;
+                                            selected_output_name =
+                                                last_output_list[index].name.clone();
                                             send_stream_status(&tx, "idle", index, None);
                                             Ok(())
                                         }
@@ -268,8 +288,11 @@ impl Plugin for AnchorPluginWayland {
                                         Some("select_output") => {
                                             if let Some(idx) =
                                                 json.get("index").and_then(|v| v.as_u64())
+                                                && let Some(output) =
+                                                    last_output_list.get(idx as usize)
                                             {
                                                 selected_output_index = idx as usize;
+                                                selected_output_name = output.name.clone();
                                                 log::info!(
                                                     "select_output({}) from phone (idle)",
                                                     idx
@@ -293,25 +316,18 @@ impl Plugin for AnchorPluginWayland {
                                 );
                             }
                             if last_idle_output_check.elapsed() >= Duration::from_secs(2) {
-                                let selected_name = last_output_list
-                                    .get(selected_output_index)
-                                    .map(|output| output.name.clone())
-                                    .unwrap_or_default();
                                 let old_index = selected_output_index;
                                 let removed = check_output_changes(
                                     &mut backend,
                                     &mut last_output_list,
                                     &tx,
-                                    Some(&selected_name),
+                                    Some(&selected_output_name),
                                 );
-                                selected_output_index = if removed {
-                                    0
-                                } else {
-                                    last_output_list
-                                        .iter()
-                                        .position(|output| output.name == selected_name)
-                                        .unwrap_or(0)
-                                };
+                                reconcile_output_selection(
+                                    &last_output_list,
+                                    &mut selected_output_index,
+                                    &mut selected_output_name,
+                                );
                                 if removed || selected_output_index != old_index {
                                     send_stream_status(&tx, "idle", selected_output_index, None);
                                 }
@@ -326,7 +342,7 @@ impl Plugin for AnchorPluginWayland {
                     WaitResult::Shutdown => break 'outer,
                 }
 
-                let (selected_output_name, output_x, output_y) = last_output_list
+                let (resolved_output_name, output_x, output_y) = last_output_list
                     .get(selected_output_index)
                     .map(|o| (o.name.clone(), o.x, o.y))
                     .unwrap_or_default();
@@ -338,7 +354,7 @@ impl Plugin for AnchorPluginWayland {
                         &crate::anchorapp::settings::settings().encoding.vaapi_device,
                     ),
                     selected_output_index,
-                    selected_output_name,
+                    selected_output_name: resolved_output_name,
                     output_x,
                     output_y,
                     iters: 1,
@@ -348,6 +364,7 @@ impl Plugin for AnchorPluginWayland {
                     next_encode_deadline: None,
                     backend,
                     last_encoded_frame_time: None,
+                    last_forced_idr: None,
                     frame_drops: 0,
                     total_frame_drops: 0,
                     trace_ring: Arc::new(TraceRing::new()),
@@ -435,20 +452,52 @@ impl Plugin for AnchorPluginWayland {
                             break 'screenloop;
                         }
                         CaptureAction::SelectOutput(idx) => {
-                            log::info!("SelectOutput({}) mid-stream — switching", idx);
-                            state.streaming = false;
-                            state.h264_encoder = None;
-                            state.selected_output_index = idx;
-                            let out = last_output_list.get(idx);
-                            state.selected_output_name =
-                                out.map(|o| o.name.clone()).unwrap_or_default();
-                            state.output_x = out.map(|o| o.x).unwrap_or(0);
-                            state.output_y = out.map(|o| o.y).unwrap_or(0);
-                            send_stream_status(&tx, "switching", idx, None);
-                            // Encoder re-created on next frame via process_frame.
+                            if try_apply_output_selection(&mut state, &last_output_list, idx) {
+                                log::info!("SelectOutput({}) mid-stream — switching", idx);
+                                // Update absolute input before the next encoded frame. A pen
+                                // event can arrive as soon as the viewer selects the output.
+                                if let Some(output) =
+                                    last_output_list.get(state.selected_output_index)
+                                {
+                                    send_stream_info(
+                                        &tx,
+                                        output.width,
+                                        output.height,
+                                        &state.selected_output_name,
+                                        state.output_x,
+                                        state.output_y,
+                                    );
+                                }
+                                state.streaming = false;
+                                state.h264_encoder = None;
+                                send_stream_status(&tx, "switching", idx, None);
+                                // Encoder re-created on next frame via process_frame.
+                            } else {
+                                // A device can race an output deletion and send an index from
+                                // its previous output list. Keep the valid stream alive and
+                                // immediately repair the device's view of topology/state.
+                                log::warn!(
+                                    "Ignoring stale SelectOutput({}); only {} outputs remain",
+                                    idx,
+                                    last_output_list.len()
+                                );
+                                send_output_list(&tx, &last_output_list);
+                                send_stream_status(
+                                    &tx,
+                                    if state.streaming { "streaming" } else { "idle" },
+                                    state.selected_output_index,
+                                    None,
+                                );
+                            }
                         }
                         CaptureAction::RequestKeyframe => {
-                            request_idr(&mut state, w, h, fourcc, &tx);
+                            // The receiver re-requests while awaiting IDR, so
+                            // honor at most one per interval; the next request
+                            // arrives before the limit could stall recovery.
+                            if idr_request_due(&state, Instant::now()) {
+                                state.last_forced_idr = Some(Instant::now());
+                                request_idr(&mut state, w, h, fourcc, &tx);
+                            }
                         }
                         CaptureAction::ResyncToPhone => {
                             let s = if state.streaming { "streaming" } else { "starting" };
@@ -466,9 +515,34 @@ impl Plugin for AnchorPluginWayland {
                             }
                         }
                         CaptureAction::RequestOutputs => {
+                            let old_index = state.selected_output_index;
                             state.backend.refresh_outputs();
                             last_output_list = state.backend.get_outputs();
                             send_output_list(&tx, &last_output_list);
+                            let selected_still_present = last_output_list
+                                .iter()
+                                .any(|output| output.name == state.selected_output_name);
+                            if selected_still_present {
+                                if let Some(index) = last_output_list
+                                    .iter()
+                                    .position(|output| output.name == state.selected_output_name)
+                                {
+                                    apply_output_selection(&mut state, &last_output_list, index);
+                                    if index != old_index {
+                                        send_stream_status(&tx, "streaming", index, None);
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "Streaming output '{}' disappeared during topology refresh",
+                                    state.selected_output_name
+                                );
+                                state.streaming = false;
+                                state.h264_encoder = None;
+                                apply_output_selection(&mut state, &last_output_list, 0);
+                                send_stream_status(&tx, "idle", state.selected_output_index, None);
+                                break 'screenloop;
+                            }
                         }
                         CaptureAction::PrepareOutputRemoval { name, response_tx } => {
                             let selected = state.selected_output_name == name;
@@ -538,16 +612,21 @@ impl Plugin for AnchorPluginWayland {
                         } else if let Some(index) = last_output_list
                             .iter()
                             .position(|output| output.name == state.selected_output_name)
-                            && index != state.selected_output_index
                         {
+                            let old_index = state.selected_output_index;
+                            // Refresh geometry even when the stable output kept
+                            // the same cursor position in the new list.
                             apply_output_selection(&mut state, &last_output_list, index);
-                            send_stream_status(&tx, "streaming", index, None);
+                            if index != old_index {
+                                send_stream_status(&tx, "streaming", index, None);
+                            }
                         }
                     }
                 }
 
                 backend = state.backend;
                 selected_output_index = state.selected_output_index;
+                selected_output_name = state.selected_output_name;
             }
 
             log::debug!("ENDING WAYLAND THREAD");
@@ -619,10 +698,30 @@ fn process_frame(
         // Fall through — encoder now exists (if init succeeded), encode this frame.
     }
 
+    // ── Congestion backpressure ──────────────────────────────────────────────
+    // A subscriber queue was full on the last publish. Skip ENCODING entirely
+    // rather than producing an access unit that gets dropped post-encode: a
+    // frame the encoder never saw cannot break the decoder's reference chain,
+    // so congestion costs framerate instead of a ~350KB recovery IDR (which
+    // then stalls the pacer and causes the next drop — the IDR treadmill).
+    // Pending keyframe requests stay queued and are honored once a drain
+    // thread clears the flag.
+    if broadcaster.as_ref().is_some_and(|bc| bc.has_backpressure()) {
+        state.frame_drops += 1;
+        state.total_frame_drops += 1;
+        return false;
+    }
+
     // ── Handle IDR requests from broadcaster ─────────────────────────────────
-    if state.h264_encoder.is_some()
-        && broadcaster.as_ref().is_some_and(|bc| bc.take_keyframe_request())
-    {
+    // Peek rather than take: if honoring is still rate-limited, the flag stays
+    // set so a later frame forces the IDR once the interval elapses.
+    let keyframe_pending =
+        broadcaster.as_ref().is_some_and(|bc| bc.needs_keyframe.load(Ordering::Relaxed));
+    if state.h264_encoder.is_some() && keyframe_pending && idr_request_due(state, Instant::now()) {
+        if let Some(bc) = broadcaster {
+            bc.take_keyframe_request();
+        }
+        state.last_forced_idr = Some(Instant::now());
         state.frame_drops += 1;
         state.total_frame_drops += 1;
         log::debug!("Frame drop #{} — forcing IDR on next frame", state.total_frame_drops);
@@ -738,8 +837,27 @@ fn send_output_list(
     // Phones get JSON with stable IDs.
     let outputs_json: Vec<serde_json::Value> = outputs
         .iter()
-        .map(|o| json!({"id": o.id, "name": o.name, "width": o.width, "height": o.height}))
+        .map(|o| {
+            json!({
+                "id": o.id,
+                "name": o.name,
+                "width": o.width,
+                "height": o.height,
+                "x": o.x,
+                "y": o.y,
+            })
+        })
         .collect();
+    // Input owns a separate Wayland connection, so it cannot rely on the
+    // capture worker's registry state. Push every refreshed topology to it so
+    // absolute coordinates shrink as well as expand when outputs change.
+    tx.send(AnchorEvent {
+        target: AnchorTarget::Broadcast,
+        message: AnchorMessage::Json(
+            json!({"type": "output_layout", "outputs": outputs_json.clone()}).to_string(),
+        ),
+    })
+    .ok();
     tx.send(AnchorEvent {
         target: AnchorTarget::Device,
         message: AnchorMessage::Json(
@@ -825,7 +943,26 @@ fn poll_messages(plugin_rx: &Receiver<AnchorEvent>, state: &CaptureState) -> Cap
 }
 
 fn fallback_output_index(outputs: &[OutputInfo], removed_name: &str) -> Option<usize> {
-    outputs.iter().position(|output| output.name != removed_name)
+    anchor_topology_core::fallback_index(
+        outputs.iter().map(|output| output.name.as_str()),
+        removed_name,
+    )
+}
+
+fn reconcile_output_selection(
+    outputs: &[OutputInfo],
+    selected_index: &mut usize,
+    selected_name: &mut String,
+) -> bool {
+    let mut selection =
+        anchor_topology_core::OutputSelection::new(*selected_index, selected_name.clone());
+    let outcome = anchor_topology_core::reconcile_selection(
+        outputs.iter().map(|output| output.name.as_str()),
+        &mut selection,
+    );
+    *selected_index = selection.index;
+    *selected_name = selection.name;
+    matches!(outcome, anchor_topology_core::ReconcileOutcome::Preserved)
 }
 
 fn apply_output_selection(state: &mut CaptureState, outputs: &[OutputInfo], index: usize) {
@@ -834,6 +971,18 @@ fn apply_output_selection(state: &mut CaptureState, outputs: &[OutputInfo], inde
     state.selected_output_name = output.map(|output| output.name.clone()).unwrap_or_default();
     state.output_x = output.map(|output| output.x).unwrap_or(0);
     state.output_y = output.map(|output| output.y).unwrap_or(0);
+}
+
+fn try_apply_output_selection(
+    state: &mut CaptureState,
+    outputs: &[OutputInfo],
+    index: usize,
+) -> bool {
+    if index >= outputs.len() {
+        return false;
+    }
+    apply_output_selection(state, outputs, index);
+    true
 }
 
 // ── Encoder management ────────────────────────────────────────────────────────
@@ -877,6 +1026,14 @@ fn start_streaming(
             );
         }
     }
+}
+
+/// Minimum spacing between honored IDR requests. Matches the receiver's
+/// re-request cadence so a fresh request always lands before recovery stalls.
+const MIN_IDR_INTERVAL: Duration = Duration::from_millis(250);
+
+fn idr_request_due(state: &CaptureState, now: Instant) -> bool {
+    state.last_forced_idr.is_none_or(|at| now.duration_since(at) >= MIN_IDR_INTERVAL)
 }
 
 /// Force the next encoded frame to be an IDR keyframe so a decoder that lost
@@ -1153,7 +1310,7 @@ fn encode_streaming_frame(
                     cpu_convert_us,
                     cpu_codec_us,
                 );
-                concat_packets(&packets, concat_us)
+                concat_packets(packets, concat_us)
             }
         }
     } else if encoder.selected_encoder == "h264_vaapi" {
@@ -1169,7 +1326,7 @@ fn encode_streaming_frame(
             cpu_convert_us,
             cpu_codec_us,
         );
-        concat_packets(&packets, concat_us)
+        concat_packets(packets, concat_us)
     } else if encoder.vpp_available {
         match encoder.encode_dmabuf_vpp(
             buf_params.fd.as_raw_fd(),
@@ -1178,7 +1335,7 @@ fn encode_streaming_frame(
             u64::from(buf_params.modifier),
             compositor_fourcc,
         ) {
-            Ok(pkts) => concat_packets(&pkts, concat_us),
+            Ok(pkts) => concat_packets(pkts, concat_us),
             Err(e) => {
                 // A failed DMA-BUF import is normally a capability mismatch (for
                 // example AVERROR(ENOSYS)), not a transient per-frame error.  Keep
@@ -1198,7 +1355,7 @@ fn encode_streaming_frame(
                     cpu_convert_us,
                     cpu_codec_us,
                 );
-                concat_packets(&packets, concat_us)
+                concat_packets(packets, concat_us)
             }
         }
     } else {
@@ -1214,7 +1371,7 @@ fn encode_streaming_frame(
             cpu_convert_us,
             cpu_codec_us,
         );
-        concat_packets(&packets, concat_us)
+        concat_packets(packets, concat_us)
     };
 
     *encode_us = t.elapsed().as_micros();
@@ -1244,7 +1401,7 @@ fn encode_cpu_streaming_frame(
             timing.cpu_copy_us = cpu.copy_us;
             timing.cpu_convert_us = cpu.convert_us;
             timing.cpu_codec_us = cpu.codec_us;
-            if let Some(data) = concat_packets(&packets, &mut timing.concat_us) {
+            if let Some(data) = concat_packets(packets, &mut timing.concat_us) {
                 timing.encoded_size = data.len();
                 if let Some(bc) = broadcaster {
                     let publish = Instant::now();
@@ -1258,14 +1415,19 @@ fn encode_cpu_streaming_frame(
     timing.encode_us = start.elapsed().as_micros();
 }
 
-fn concat_packets(packets: &[Vec<u8>], concat_us: &mut u128) -> Option<Vec<u8>> {
+fn concat_packets(mut packets: Vec<Vec<u8>>, concat_us: &mut u128) -> Option<Vec<u8>> {
     if packets.is_empty() {
         return None;
+    }
+    // Encoders usually emit one AVPacket per access unit — move it instead
+    // of copying the whole frame into a fresh buffer.
+    if packets.len() == 1 {
+        return Some(packets.pop().unwrap());
     }
     let t = Instant::now();
     let total: usize = packets.iter().map(|p| p.len()).sum();
     let mut buf = Vec::with_capacity(total);
-    for pkt in packets {
+    for pkt in &packets {
         buf.extend_from_slice(pkt);
     }
     *concat_us += t.elapsed().as_micros();
@@ -1513,6 +1675,27 @@ mod tests {
         }
     }
 
+    fn ordered_topologies(outputs: &[OutputInfo]) -> Vec<Vec<OutputInfo>> {
+        fn append_permutations(
+            prefix: &mut Vec<OutputInfo>,
+            remaining: &mut Vec<OutputInfo>,
+            result: &mut Vec<Vec<OutputInfo>>,
+        ) {
+            result.push(prefix.clone());
+            for index in 0..remaining.len() {
+                let output = remaining.remove(index);
+                prefix.push(output.clone());
+                append_permutations(prefix, remaining, result);
+                prefix.pop();
+                remaining.insert(index, output);
+            }
+        }
+
+        let mut result = Vec::new();
+        append_permutations(&mut Vec::new(), &mut outputs.to_vec(), &mut result);
+        result
+    }
+
     /// Build a CaptureState with no real GPU encoder.
     /// `streaming` controls whether the state machine considers itself live.
     fn make_state(streaming: bool, selected_output_index: usize) -> CaptureState {
@@ -1531,6 +1714,7 @@ mod tests {
             next_encode_deadline: None,
             backend: Box::new(MockBackend::new(vec![])),
             last_encoded_frame_time: None,
+            last_forced_idr: None,
             frame_drops: 0,
             total_frame_drops: 0,
             trace_ring: Arc::new(TraceRing::new()),
@@ -1893,11 +2077,11 @@ mod tests {
     }
 
     #[test]
-    fn output_list_empty_sends_both_targets() {
+    fn output_list_empty_sends_gui_input_and_device_updates() {
         let (tx, rx) = mpsc::channel::<AnchorEvent>();
         send_output_list(&tx, &[]);
         let events = drain(&rx);
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         let gui = events.iter().find(|e| matches!(e.target, AnchorTarget::Gui)).unwrap();
         match &gui.message {
             AnchorMessage::Wayland(WaylandPluginMsg::OutputList(list)) => {
@@ -1905,6 +2089,14 @@ mod tests {
             }
             other => panic!("unexpected: {:?}", other),
         }
+
+        let topology = events
+            .iter()
+            .find(|event| matches!(event.target, AnchorTarget::Broadcast))
+            .expect("input topology update missing");
+        let topology_json = parse_json(&topology.message);
+        assert_eq!(topology_json["type"], "output_layout");
+        assert_eq!(topology_json["outputs"], serde_json::json!([]));
     }
 
     #[test]
@@ -1918,6 +2110,27 @@ mod tests {
         assert_eq!(j["outputs"][0]["id"], 0);
         assert_eq!(j["outputs"][1]["id"], 1);
         assert_eq!(j["outputs"][1]["name"], "HDMI-A-1");
+    }
+
+    #[test]
+    fn output_layout_broadcast_includes_geometry_used_by_absolute_input() {
+        let (tx, rx) = mpsc::channel::<AnchorEvent>();
+        let mut output = make_output(4, "HEADLESS-1", 1080, 2340);
+        output.x = -1080;
+        output.y = 72;
+
+        send_output_list(&tx, &[output]);
+
+        let event = rx
+            .try_iter()
+            .find(|event| matches!(event.target, AnchorTarget::Broadcast))
+            .expect("input topology update missing");
+        let json = parse_json(&event.message);
+        assert_eq!(json["outputs"][0]["name"], "HEADLESS-1");
+        assert_eq!(json["outputs"][0]["x"], -1080);
+        assert_eq!(json["outputs"][0]["y"], 72);
+        assert_eq!(json["outputs"][0]["width"], 1080);
+        assert_eq!(json["outputs"][0]["height"], 2340);
     }
 
     // ── Scenario: phone reconnects while streaming ────────────────────────────
@@ -2013,6 +2226,119 @@ mod tests {
         let outputs = vec![make_output(0, "HEADLESS-1", 1080, 2340)];
 
         assert_eq!(fallback_output_index(&outputs, "HEADLESS-1"), None);
+    }
+
+    #[test]
+    fn topology_reorder_preserves_selection_by_output_name() {
+        let outputs =
+            vec![make_output(0, "HEADLESS-1", 1080, 2340), make_output(1, "eDP-1", 1920, 1200)];
+        let mut index = 0;
+        let mut name = "eDP-1".to_string();
+
+        assert!(reconcile_output_selection(&outputs, &mut index, &mut name));
+        assert_eq!(index, 1);
+        assert_eq!(name, "eDP-1");
+    }
+
+    #[test]
+    fn topology_removal_falls_back_to_a_valid_output() {
+        let outputs = vec![make_output(0, "eDP-1", 1920, 1200)];
+        let mut index = 1;
+        let mut name = "HEADLESS-1".to_string();
+
+        assert!(!reconcile_output_selection(&outputs, &mut index, &mut name));
+        assert_eq!(index, 0);
+        assert_eq!(name, "eDP-1");
+    }
+
+    #[test]
+    fn every_add_remove_reorder_sequence_preserves_selection_or_uses_first_fallback() {
+        let universe = vec![
+            make_output(0, "eDP-1", 1920, 1200),
+            make_output(1, "HEADLESS-1", 1080, 2340),
+            make_output(2, "HDMI-A-1", 2560, 1440),
+            make_output(3, "DP-2", 3840, 2160),
+        ];
+        let topologies = ordered_topologies(&universe);
+
+        for selected in universe.iter().map(|output| output.name.as_str()).chain(["REMOVED-1"]) {
+            for outputs in &topologies {
+                let mut index = usize::MAX;
+                let mut name = selected.to_string();
+                let preserved = reconcile_output_selection(outputs, &mut index, &mut name);
+                let expected = outputs.iter().position(|output| output.name == selected);
+
+                match expected {
+                    Some(expected_index) => {
+                        assert!(preserved);
+                        assert_eq!(index, expected_index);
+                        assert_eq!(name, selected);
+                    }
+                    None if outputs.is_empty() => {
+                        assert!(!preserved);
+                        assert_eq!(index, 0);
+                        assert!(name.is_empty());
+                    }
+                    None => {
+                        assert!(!preserved);
+                        assert_eq!(index, 0);
+                        assert_eq!(name, outputs[0].name);
+                    }
+                }
+
+                let reconciled_name = name.clone();
+                let reconciled_index = index;
+                let second_result = reconcile_output_selection(outputs, &mut index, &mut name);
+                assert_eq!((index, name.as_str()), (reconciled_index, reconciled_name.as_str()));
+                assert_eq!(second_result, !outputs.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_never_selects_the_output_being_deleted() {
+        let outputs = vec![
+            make_output(0, "eDP-1", 1920, 1200),
+            make_output(1, "HEADLESS-1", 1080, 2340),
+            make_output(2, "HDMI-A-1", 2560, 1440),
+        ];
+
+        for removed in &outputs {
+            let index = fallback_output_index(&outputs, &removed.name).expect("fallback required");
+            assert!(index < outputs.len());
+            assert_ne!(outputs[index].name, removed.name);
+        }
+    }
+
+    #[test]
+    fn stale_device_selection_after_deletion_leaves_valid_stream_unchanged() {
+        let outputs = vec![make_output(0, "eDP-1", 1920, 1200)];
+        let mut state = make_state(true, 0);
+        state.selected_output_name = "eDP-1".into();
+        state.output_x = -20;
+        state.output_y = 30;
+
+        assert!(!try_apply_output_selection(&mut state, &outputs, 1));
+        assert!(state.streaming);
+        assert_eq!(state.selected_output_index, 0);
+        assert_eq!(state.selected_output_name, "eDP-1");
+        assert_eq!((state.output_x, state.output_y), (-20, 30));
+    }
+
+    #[test]
+    fn valid_selection_updates_stable_name_and_current_geometry_together() {
+        let mut first = make_output(0, "eDP-1", 1920, 1200);
+        first.x = -1920;
+        let mut second = make_output(1, "HEADLESS-1", 1080, 2340);
+        second.x = 0;
+        second.y = 100;
+        let outputs = vec![first, second];
+        let mut state = make_state(true, 0);
+
+        assert!(try_apply_output_selection(&mut state, &outputs, 1));
+        assert_eq!(state.selected_output_index, 1);
+        assert_eq!(state.selected_output_name, "HEADLESS-1");
+        assert_eq!((state.output_x, state.output_y), (0, 100));
     }
 
     #[test]

@@ -6,8 +6,9 @@
 //! providers still own their application policy; an incoming capability-open
 //! request is surfaced as an event and is never approved implicitly.
 
+use rustc_hash::FxHashMap;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
@@ -55,6 +56,8 @@ pub enum SessionError {
     CapabilityNotOpened(u64),
     #[error("control stream ended")]
     ControlStreamEnded,
+    #[error("datagram flow ended")]
+    DatagramFlowEnded,
 }
 
 /// Local identity and endpoint advertisements sent in `SessionHello`.
@@ -180,6 +183,13 @@ pub struct Capability {
     supports_datagrams: bool,
 }
 
+#[derive(Clone)]
+struct CapabilityState {
+    allowed_type_urls: Arc<Vec<String>>,
+    supports_datagrams: bool,
+    open: bool,
+}
+
 /// A capability-bound reliable QUIC stream.
 ///
 /// The SDK owns the raw Quinn handles and the required `StreamOpen` protocol
@@ -223,6 +233,17 @@ impl ReliableSendStream {
             .map_err(SessionError::Write)
     }
 
+    /// Writes every chunk without concatenating them first. Producers that
+    /// already hold `Bytes` fragments (for example ANFR packets with their
+    /// stream length prefixes) avoid a per-frame copy through an intermediate
+    /// buffer.
+    pub async fn write_all_chunks(&mut self, bufs: &mut [Bytes]) -> Result<(), SessionError> {
+        self.inner
+            .write_all_chunks(bufs)
+            .await
+            .map_err(SessionError::Write)
+    }
+
     pub fn finish(&mut self) -> Result<(), SessionError> {
         self.inner.finish().map_err(SessionError::ClosedStream)
     }
@@ -256,6 +277,9 @@ impl Capability {
         type_url: &str,
         payload: impl Into<Vec<u8>>,
     ) -> Result<(), SessionError> {
+        self.session
+            .ensure_capability_open(self.session_id, type_url, false)
+            .await?;
         if !self
             .allowed_type_urls
             .iter()
@@ -281,6 +305,9 @@ impl Capability {
         &self,
         payload_type_url: &str,
     ) -> Result<DatagramFlow, SessionError> {
+        self.session
+            .ensure_capability_open(self.session_id, payload_type_url, true)
+            .await?;
         if !self.supports_datagrams {
             return Err(SessionError::UnexpectedRecord(
                 "capability does not advertise datagrams",
@@ -307,20 +334,18 @@ impl Capability {
                 }),
             )
             .await?;
-        loop {
-            match self.session.read_event().await? {
-                SessionEvent::DatagramFlowOpened {
-                    response_to,
-                    flow_id: opened,
-                } if response_to == request_id && opened == flow_id => {
-                    return Ok(DatagramFlow {
-                        session: self.session.clone(),
-                        flow_id,
-                    });
-                }
-                event => self.session.0.queued_events.lock().await.push_back(event),
-            }
-        }
+        self.session
+            .wait_for_event(|event| {
+                matches!(event, SessionEvent::DatagramFlowOpened {
+                response_to, flow_id: opened
+            } if *response_to == request_id && *opened == flow_id)
+            })
+            .await?;
+        Ok(DatagramFlow {
+            session: self.session.clone(),
+            flow_id,
+            recv: Arc::new(Mutex::new(self.session.route_datagram_flow(flow_id))),
+        })
     }
 
     /// Opens a reliable bidirectional stream bound to this capability. The
@@ -330,6 +355,9 @@ impl Capability {
         &self,
         payload_type_url: &str,
     ) -> Result<ReliableStream, SessionError> {
+        self.session
+            .ensure_capability_open(self.session_id, payload_type_url, false)
+            .await?;
         if !self
             .allowed_type_urls
             .iter()
@@ -352,35 +380,38 @@ impl Capability {
                 }),
             )
             .await?;
-        loop {
-            match self.session.read_event().await? {
-                SessionEvent::StreamOpened {
-                    response_to,
-                    quic_stream_id,
-                } if response_to == request_id && quic_stream_id == stream_id => {
-                    return Ok(ReliableStream {
-                        stream_id,
-                        send: ReliableSendStream {
-                            stream_id,
-                            inner: send,
-                        },
-                        recv: ReliableRecvStream {
-                            stream_id,
-                            inner: recv,
-                        },
-                    });
-                }
-                event => self.session.0.queued_events.lock().await.push_back(event),
-            }
-        }
+        self.session
+            .wait_for_event(|event| {
+                matches!(event, SessionEvent::StreamOpened {
+                response_to, quic_stream_id
+            } if *response_to == request_id && *quic_stream_id == stream_id)
+            })
+            .await?;
+        Ok(ReliableStream {
+            stream_id,
+            send: ReliableSendStream {
+                stream_id,
+                inner: send,
+            },
+            recv: ReliableRecvStream {
+                stream_id,
+                inner: recv,
+            },
+        })
     }
 }
 
 /// A negotiated unreliable datagram path associated with one capability.
+///
+/// Received datagrams arrive through the connection-level dispatcher, which
+/// routes by the ANFR flow ID — so concurrent flows can never steal each
+/// other's packets the way multiple `connection.read_datagram()` callers
+/// would.
 #[derive(Clone)]
 pub struct DatagramFlow {
     session: Session,
     flow_id: u64,
+    recv: Arc<Mutex<tokio::sync::mpsc::Receiver<Bytes>>>,
 }
 
 /// Failure returned when an application datagram cannot be queued without
@@ -409,12 +440,23 @@ pub struct DatagramTransportStats {
 
 // Quinn 0.11's lossy send path has a queue-accounting bug when it evicts old
 // datagrams after the configured buffer fills. Keep a small reserve so Anchor
-// never asks Quinn to perform that eviction, while still allowing a large
-// scene-change IDR to fit in the 256 KiB queue. The per-fragment allowance
+// never asks Quinn to perform that eviction. The per-fragment allowance
 // below accounts for Quinn's private `Datagram` bookkeeping; the public
 // `datagram_send_buffer_space()` API only subtracts one such item.
 const DATAGRAM_QUEUE_HEADROOM_BYTES: usize = 16 * 1024;
 const DATAGRAM_QUEUE_ITEM_BYTES: usize = 32;
+/// Staleness bound for the unreliable media queue, expressed as a drain time:
+/// a burst may never leave more than ~40 ms of backlog waiting behind
+/// congestion, so scene changes cannot stack stale frames ahead of the live
+/// one. A fixed byte bound would admit ~4 ms of backlog on a fast LAN but
+/// ~105 ms on a 20 Mbps uplink; scaling by the congestion controller's own
+/// pacing estimate (cwnd/RTT) keeps the *time* bound constant across paths.
+/// The byte bound is clamped between a small floor — so an idle queue always
+/// admits the next frame — and the previous fixed cap. Quinn's buffer itself
+/// is sized for the largest legal access unit (`DATAGRAM_SEND_BUFFER_BYTES`).
+const DATAGRAM_STALE_QUEUE_MAX: std::time::Duration = std::time::Duration::from_millis(40);
+const DATAGRAM_STALE_QUEUE_MIN_BYTES: usize = 32 * 1024;
+const DATAGRAM_STALE_QUEUE_BYTES: usize = 256 * 1024;
 
 impl DatagramFlow {
     pub fn flow_id(&self) -> u64 {
@@ -439,6 +481,12 @@ impl DatagramFlow {
         self.session.0.connection.datagram_send_buffer_space()
     }
 
+    /// Maximum application payload accepted by the peer on the current path.
+    /// This value can change after path-MTU discovery or network migration.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.session.0.connection.max_datagram_size()
+    }
+
     pub fn send(&self, payload: Bytes) -> Result<(), DatagramSendError> {
         self.session.send_datagram(payload)
     }
@@ -447,27 +495,33 @@ impl DatagramFlow {
     /// connection-wide datagram lock. This prevents screen/camera producers
     /// from interleaving fragments and, importantly, avoids queueing a partial
     /// frame when there is not enough space for all of its fragments.
-    pub fn send_many<I>(&self, payloads: I) -> Result<(), DatagramSendError>
-    where
-        I: IntoIterator<Item = Bytes>,
-    {
-        self.session.send_datagrams(payloads)
+    ///
+    /// Takes the packet vector by value so each fragment's `Bytes` moves into
+    /// the send queue — no per-fragment refcount churn on large keyframes.
+    pub fn send_many(&self, payloads: Vec<Bytes>) -> Result<(), DatagramSendError> {
+        self.session.send_datagrams_owned(payloads)
     }
 
-    /// Receive the next application datagram on the authenticated session.
-    ///
-    /// QUIC exposes datagrams at connection scope, so callers must validate
-    /// the fixed Anchor frame header and discard packets for other flow IDs.
+    /// Receive the next application datagram routed to this flow. The
+    /// dispatcher only forwards packets whose ANFR flow ID matches; the
+    /// per-flow queue is bounded, so a stalled consumer drops rather than
+    /// accumulating stale media.
     pub async fn recv(&self) -> Result<Bytes, SessionError> {
-        self.session
-            .0
-            .connection
-            .read_datagram()
+        self.recv
+            .lock()
             .await
-            .map_err(SessionError::Connection)
+            .recv()
+            .await
+            .ok_or(SessionError::DatagramFlowEnded)
     }
 
     pub async fn close(&self) -> Result<(), SessionError> {
+        self.session
+            .0
+            .datagram_routes
+            .lock()
+            .unwrap()
+            .remove(&self.flow_id);
         self.session.send_datagram_flow_closed(self.flow_id).await
     }
 }
@@ -478,9 +532,17 @@ struct SessionInner {
     // from independent screen/camera producers so queue accounting remains
     // consistent when both flows are active at once.
     datagram_send: std::sync::Mutex<()>,
+    // Receiving is connection-scoped too: one dispatcher task reads
+    // `read_datagram` and routes each packet to its flow's channel by the
+    // ANFR flow ID. Without it, two concurrent `DatagramFlow::recv` callers
+    // would steal each other's datagrams and drop them as wrong-flow.
+    datagram_routes: std::sync::Mutex<FxHashMap<u64, tokio::sync::mpsc::Sender<Bytes>>>,
+    datagram_dispatch_started: std::sync::atomic::AtomicBool,
     control_send: Mutex<quinn::SendStream>,
     control_recv: Mutex<ControlReader>,
+    event_wait: Mutex<()>,
     queued_events: Mutex<VecDeque<SessionEvent>>,
+    capabilities: Mutex<HashMap<u64, CapabilityState>>,
     next_request_id: AtomicU64,
     next_capability_id: AtomicU64,
     next_flow_id: AtomicU64,
@@ -706,7 +768,96 @@ impl Session {
     async fn read_event(&self) -> Result<SessionEvent, SessionError> {
         let mut reader = self.0.control_recv.lock().await;
         let envelope = reader.read_record().await?;
-        decode_event(envelope)
+        let event = decode_event(envelope)?;
+        self.validate_incoming_event(&event).await?;
+        Ok(event)
+    }
+
+    async fn wait_for_event<F>(&self, matches: F) -> Result<SessionEvent, SessionError>
+    where
+        F: Fn(&SessionEvent) -> bool,
+    {
+        let _wait = self.0.event_wait.lock().await;
+        loop {
+            let queued = {
+                let mut events = self.0.queued_events.lock().await;
+                events
+                    .iter()
+                    .position(&matches)
+                    .and_then(|index| events.remove(index))
+            };
+            if let Some(event) = queued {
+                return Ok(event);
+            }
+            let event = self.read_event().await?;
+            if matches(&event) {
+                return Ok(event);
+            }
+            self.0.queued_events.lock().await.push_back(event);
+        }
+    }
+
+    async fn ensure_capability_open(
+        &self,
+        capability_session_id: u64,
+        type_url: &str,
+        requires_datagrams: bool,
+    ) -> Result<(), SessionError> {
+        let capabilities = self.0.capabilities.lock().await;
+        let state = capabilities
+            .get(&capability_session_id)
+            .filter(|state| state.open)
+            .ok_or(SessionError::UnexpectedRecord(
+                "capability session is not open",
+            ))?;
+        if !state
+            .allowed_type_urls
+            .iter()
+            .any(|allowed| allowed == type_url)
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "record type URL was not advertised",
+            ));
+        }
+        if requires_datagrams && !state.supports_datagrams {
+            return Err(SessionError::UnexpectedRecord(
+                "capability does not advertise datagrams",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_incoming_event(&self, event: &SessionEvent) -> Result<(), SessionError> {
+        match event {
+            SessionEvent::CapabilityRecord {
+                capability_session_id,
+                type_url,
+                ..
+            } => {
+                self.ensure_capability_open(*capability_session_id, type_url, false)
+                    .await
+            }
+            SessionEvent::CapabilityClosed {
+                capability_session_id,
+                ..
+            } => {
+                let mut capabilities = self.0.capabilities.lock().await;
+                let state = capabilities
+                    .get_mut(capability_session_id)
+                    .ok_or(SessionError::UnexpectedRecord("unknown capability session"))?;
+                state.open = false;
+                Ok(())
+            }
+            SessionEvent::DatagramFlowOpenRequested {
+                capability_session_id,
+                payload_type_url,
+                ..
+            } => {
+                self.ensure_capability_open(*capability_session_id, payload_type_url, true)
+                    .await
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Opens a peer-advertised capability and waits for its positive reply.
@@ -744,22 +895,28 @@ impl Session {
         )
         .await?;
 
-        loop {
-            match self.read_event().await? {
-                SessionEvent::CapabilityOpened {
-                    response_to,
-                    capability_session_id: opened,
-                } if response_to == request_id && opened == capability_session_id => {
-                    return Ok(Capability {
-                        session: self.clone(),
-                        session_id: capability_session_id,
-                        allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
-                        supports_datagrams: advertisement.supports_datagrams,
-                    });
-                }
-                event => self.0.queued_events.lock().await.push_back(event),
-            }
-        }
+        self.wait_for_event(|event| {
+            matches!(event, SessionEvent::CapabilityOpened {
+            response_to, capability_session_id: opened
+        } if *response_to == request_id && *opened == capability_session_id)
+        })
+        .await?;
+        let state = CapabilityState {
+            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
+            supports_datagrams: advertisement.supports_datagrams,
+            open: true,
+        };
+        self.0
+            .capabilities
+            .lock()
+            .await
+            .insert(capability_session_id, state.clone());
+        Ok(Capability {
+            session: self.clone(),
+            session_id: capability_session_id,
+            allowed_type_urls: state.allowed_type_urls,
+            supports_datagrams: state.supports_datagrams,
+        })
     }
 
     /// Sends a typed control record for a capability after the host has
@@ -803,13 +960,23 @@ impl Session {
                 name: capability_name.to_owned(),
                 major: capability_major,
             })?;
+        let state = CapabilityState {
+            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
+            supports_datagrams: advertisement.supports_datagrams,
+            open: true,
+        };
+        self.0
+            .capabilities
+            .lock()
+            .await
+            .insert(capability_session_id, state.clone());
         self.send_capability_opened(request_id, capability_session_id)
             .await?;
         Ok(Capability {
             session: self.clone(),
             session_id: capability_session_id,
-            allowed_type_urls: Arc::new(advertisement.record_type_urls.clone()),
-            supports_datagrams: advertisement.supports_datagrams,
+            allowed_type_urls: state.allowed_type_urls,
+            supports_datagrams: state.supports_datagrams,
         })
     }
 
@@ -825,14 +992,23 @@ impl Session {
         .await
     }
 
-    /// Accept a peer-requested capability stream. The SDK confirms the stream
-    /// binding and verifies that the accepted QUIC stream ID matches the
-    /// negotiated ID before returning application byte handles.
+    /// Accept a peer-requested capability stream. The SDK rejects IDs that
+    /// cannot name a peer-initiated bidirectional stream, then verifies that
+    /// the accepted QUIC stream ID matches the negotiated ID before returning
+    /// application byte handles.
     pub async fn accept_stream(
         &self,
         request_id: u64,
         expected_stream_id: u64,
     ) -> Result<ReliableStream, SessionError> {
+        if expected_stream_id == 0
+            || expected_stream_id > (1_u64 << 62) - 1
+            || expected_stream_id & 0b11 != 0
+        {
+            return Err(SessionError::UnexpectedRecord(
+                "StreamOpen did not name a client-initiated bidirectional stream",
+            ));
+        }
         self.send_stream_opened(request_id, expected_stream_id)
             .await?;
         let (send, recv) = self.0.connection.accept_bi().await?;
@@ -899,6 +1075,7 @@ impl Session {
         Ok(DatagramFlow {
             session: self.clone(),
             flow_id,
+            recv: Arc::new(Mutex::new(self.route_datagram_flow(flow_id))),
         })
     }
 
@@ -922,14 +1099,37 @@ impl Session {
     /// Sends an application datagram. Flow negotiation and the capability's
     /// fixed binary header remain explicit at the capability layer.
     pub fn send_datagram(&self, payload: Bytes) -> Result<(), DatagramSendError> {
-        self.send_datagrams(std::iter::once(payload))
+        self.send_datagrams(std::slice::from_ref(&payload))
     }
 
-    fn send_datagrams<I>(&self, payloads: I) -> Result<(), DatagramSendError>
-    where
-        I: IntoIterator<Item = Bytes>,
-    {
-        let payloads: Vec<Bytes> = payloads.into_iter().collect();
+    /// Register a receive route for one datagram flow and lazily start the
+    /// connection-level dispatcher. Each route is a bounded channel: a full
+    /// queue drops the datagram, preserving QUIC's lossy semantics for media
+    /// without letting a stalled consumer grow unbounded.
+    fn route_datagram_flow(&self, flow_id: u64) -> tokio::sync::mpsc::Receiver<Bytes> {
+        // Room for one whole maximum-size access unit (~8007 fragments at
+        // MAX_FRAME_BYTES) plus slack: anything smaller can be dropped
+        // mid-frame only by a genuinely stalled consumer. The channel grows
+        // by allocation chunks, so the bound costs nothing while queues stay
+        // short.
+        const DATAGRAM_ROUTE_CAPACITY: usize = 8192;
+        let (tx, rx) = tokio::sync::mpsc::channel(DATAGRAM_ROUTE_CAPACITY);
+        self.0
+            .datagram_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(flow_id, tx);
+        if !self
+            .0
+            .datagram_dispatch_started
+            .swap(true, Ordering::AcqRel)
+        {
+            tokio::spawn(dispatch_datagrams(self.clone()));
+        }
+        rx
+    }
+
+    fn send_datagrams(&self, payloads: &[Bytes]) -> Result<(), DatagramSendError> {
         if payloads.is_empty() {
             return Ok(());
         }
@@ -944,7 +1144,63 @@ impl Session {
             .map(|payload| payload.len().saturating_add(DATAGRAM_QUEUE_ITEM_BYTES))
             .sum::<usize>()
             .saturating_add(DATAGRAM_QUEUE_HEADROOM_BYTES);
-        if available < required {
+        if self.datagram_admission_denied(available, required) {
+            return Err(DatagramSendError::BufferFull {
+                available,
+                required,
+            });
+        }
+        for payload in payloads {
+            self.0
+                .connection
+                .send_datagram(payload.clone())
+                .map_err(|error| DatagramSendError::Transport(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// All-or-nothing admission: the burst must physically fit in Quinn's
+    /// queue, and the backlog already waiting there must not exceed the
+    /// staleness bound. Oversized access units are not special-cased — they
+    /// pass as soon as congestion drains the backlog under the bound, which
+    /// is also what keeps a huge keyframe from starving forever.
+    fn datagram_admission_denied(&self, available: usize, required: usize) -> bool {
+        if required > available {
+            return true;
+        }
+        let queued = crate::quinn_transport::DATAGRAM_SEND_BUFFER_BYTES.saturating_sub(available);
+        // The staleness bound is clamped below by STALE_QUEUE_MIN_BYTES, so a
+        // backlog at or under that floor can never deny — skip the stats
+        // snapshot entirely on an empty or near-empty queue.
+        if queued <= DATAGRAM_STALE_QUEUE_MIN_BYTES {
+            return false;
+        }
+        let stats = self.0.connection.stats();
+        // cwnd/RTT approximates the pacing rate congestion control is
+        // enforcing right now; backlog beyond ~40 ms of drain time is stale.
+        let rate_bps = stats.path.cwnd as f64 / stats.path.rtt.as_secs_f64().max(1e-6);
+        let bound = (rate_bps * DATAGRAM_STALE_QUEUE_MAX.as_secs_f64()) as usize;
+        queued > bound.clamp(DATAGRAM_STALE_QUEUE_MIN_BYTES, DATAGRAM_STALE_QUEUE_BYTES)
+    }
+
+    /// Owned-packet variant of `send_datagrams`: identical admission logic,
+    /// but each `Bytes` moves into Quinn's queue instead of taking a refcount.
+    fn send_datagrams_owned(&self, payloads: Vec<Bytes>) -> Result<(), DatagramSendError> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        let _guard = self
+            .0
+            .datagram_send
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let available = self.0.connection.datagram_send_buffer_space();
+        let required = payloads
+            .iter()
+            .map(|payload| payload.len().saturating_add(DATAGRAM_QUEUE_ITEM_BYTES))
+            .sum::<usize>()
+            .saturating_add(DATAGRAM_QUEUE_HEADROOM_BYTES);
+        if self.datagram_admission_denied(available, required) {
             return Err(DatagramSendError::BufferFull {
                 available,
                 required,
@@ -984,21 +1240,20 @@ impl Session {
         let peer_hello = reader.read_record().await?;
         let peer = peer_from_hello(peer_hello)?;
         let ready = reader.read_record().await?;
-        if !matches!(
-            ready.body,
-            Some(v1::control_envelope::Body::SessionReady(_))
-        ) {
-            return Err(SessionError::UnexpectedRecord("expected SessionReady"));
-        }
+        validate_session_ready(ready)?;
         let next_capability_id = match role {
             SessionRole::Initiator => 1,
         };
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
+            datagram_routes: std::sync::Mutex::new(FxHashMap::default()),
+            datagram_dispatch_started: std::sync::atomic::AtomicBool::new(false),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
+            event_wait: Mutex::new(()),
             queued_events: Mutex::new(VecDeque::new()),
+            capabilities: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             next_capability_id: AtomicU64::new(next_capability_id),
             next_flow_id: AtomicU64::new(next_capability_id),
@@ -1027,18 +1282,17 @@ impl Session {
         };
         write_records(&mut send, &[(&local.hello(), true), (&ready, false)]).await?;
         let ready = reader.read_record().await?;
-        if !matches!(
-            ready.body,
-            Some(v1::control_envelope::Body::SessionReady(_))
-        ) {
-            return Err(SessionError::UnexpectedRecord("expected SessionReady"));
-        }
+        validate_session_ready(ready)?;
         Ok(Self(Arc::new(SessionInner {
             connection,
             datagram_send: std::sync::Mutex::new(()),
+            datagram_routes: std::sync::Mutex::new(FxHashMap::default()),
+            datagram_dispatch_started: std::sync::atomic::AtomicBool::new(false),
             control_send: Mutex::new(send),
             control_recv: Mutex::new(reader),
+            event_wait: Mutex::new(()),
             queued_events: Mutex::new(VecDeque::new()),
+            capabilities: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
             next_capability_id: AtomicU64::new(2),
             next_flow_id: AtomicU64::new(2),
@@ -1083,7 +1337,8 @@ impl Session {
     }
 
     async fn send_envelope(&self, envelope: v1::ControlEnvelope) -> Result<(), SessionError> {
-        validate_control_envelope(&envelope)?;
+        // encode_record applies the envelope invariants; validating here too
+        // would double the check on every control send.
         let mut send = self.0.control_send.lock().await;
         write_record(&mut send, &envelope, false).await
     }
@@ -1138,8 +1393,8 @@ async fn write_record(
     envelope: &v1::ControlEnvelope,
     first: bool,
 ) -> Result<(), SessionError> {
-    validate_control_envelope(envelope)?;
-    let frame = encode_record(envelope, first)?;
+    let mut frame = Vec::new();
+    encode_record_into(envelope, first, &mut frame)?;
     send.write_all(&frame).await?;
     send.flush().await?;
     Ok(())
@@ -1151,28 +1406,78 @@ async fn write_records(
 ) -> Result<(), SessionError> {
     let mut frame = Vec::new();
     for (envelope, first) in records {
-        frame.extend_from_slice(&encode_record(envelope, *first)?);
+        encode_record_into(envelope, *first, &mut frame)?;
     }
     send.write_all(&frame).await?;
     send.flush().await?;
     Ok(())
 }
 
-fn encode_record(envelope: &v1::ControlEnvelope, first: bool) -> Result<Vec<u8>, SessionError> {
+/// Encode one control record directly into `frame`. Prost's
+/// `encode_length_delimited` emits the same LEB128 length prefix as
+/// `encode_varint`, so this avoids the intermediate `encode_to_vec`
+/// allocation and payload memcpy the old two-step path needed.
+fn encode_record_into(
+    envelope: &v1::ControlEnvelope,
+    first: bool,
+    frame: &mut Vec<u8>,
+) -> Result<(), SessionError> {
     validate_control_envelope(envelope)?;
-    let payload = envelope.encode_to_vec();
-    if payload.len() > MAX_CONTROL_RECORD_BYTES {
+    if envelope.encoded_len() > MAX_CONTROL_RECORD_BYTES {
         return Err(ProtocolViolation::ControlRecordTooLarge.into());
     }
-    let mut frame = Vec::with_capacity(payload.len() + 16);
+    frame.reserve(envelope.encoded_len() + 16);
     if first {
         frame.extend_from_slice(&CONTROL_MAGIC);
         frame.push(PROTOCOL_MAJOR);
         frame.push(PROTOCOL_MINOR);
     }
-    encode_varint(payload.len() as u64, &mut frame);
-    frame.extend_from_slice(&payload);
-    Ok(frame)
+    envelope
+        .encode_length_delimited(frame)
+        .map_err(|_| ProtocolViolation::MalformedControlRecord)?;
+    Ok(())
+}
+
+/// Read connection-scoped QUIC datagrams and fan them out to per-flow
+/// channels by the ANFR flow ID. Datagrams for unregistered or closed flows
+/// are dropped; a full flow queue drops too — the receiver treats that as
+/// ordinary media loss and recovers from the next keyframe.
+async fn dispatch_datagrams(session: Session) {
+    // Media flows deliver thousands of consecutive datagrams to one flow ID;
+    // remember the last route so the common case skips the map lock, the hash
+    // probe, and the per-datagram `Sender` refcount churn.
+    let mut cached_route: Option<(u64, tokio::sync::mpsc::Sender<Bytes>)> = None;
+    loop {
+        let Ok(datagram) = session.0.connection.read_datagram().await else {
+            // Connection ended; dropping the session closes every channel.
+            return;
+        };
+        let Some(flow_id) = crate::video_frame::datagram_flow_id(&datagram) else {
+            continue;
+        };
+        if !matches!(&cached_route, Some((id, _)) if *id == flow_id) {
+            cached_route = session
+                .0
+                .datagram_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&flow_id)
+                .cloned()
+                .map(|sender| (flow_id, sender));
+        }
+        let Some((_, sender)) = &cached_route else {
+            continue;
+        };
+        if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = sender.try_send(datagram) {
+            session
+                .0
+                .datagram_routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&flow_id);
+            cached_route = None;
+        }
+    }
 }
 
 struct ControlReader {
@@ -1188,7 +1493,7 @@ impl ControlReader {
     async fn read_record(&mut self) -> Result<v1::ControlEnvelope, SessionError> {
         if self.first {
             let mut prefix = [0_u8; FIRST_RECORD_HEADER_BYTES];
-            self.recv.read_exact(&mut prefix).await?;
+            read_control_exact(&mut self.recv, &mut prefix).await?;
             if prefix[..CONTROL_MAGIC.len()] != CONTROL_MAGIC {
                 return Err(ProtocolViolation::InvalidControlMagic.into());
             }
@@ -1213,7 +1518,7 @@ impl ControlReader {
             return Err(ProtocolViolation::ControlRecordTooLarge.into());
         }
         let mut payload = vec![0_u8; length];
-        self.recv.read_exact(&mut payload).await?;
+        read_control_exact(&mut self.recv, &mut payload).await?;
         let envelope = v1::ControlEnvelope::decode(payload.as_slice())
             .map_err(|_| ProtocolViolation::MalformedControlRecord)?;
         validate_control_envelope(&envelope)?;
@@ -1221,10 +1526,27 @@ impl ControlReader {
     }
 }
 
+async fn read_control_exact(
+    recv: &mut quinn::RecvStream,
+    bytes: &mut [u8],
+) -> Result<(), SessionError> {
+    match recv.read_exact(bytes).await {
+        Err(quinn::ReadExactError::FinishedEarly(_)) => Err(SessionError::ControlStreamEnded),
+        Err(error) => Err(SessionError::ReadExact(error)),
+        Ok(()) => Ok(()),
+    }
+}
+
 async fn read_varint(recv: &mut quinn::RecvStream) -> Result<u64, SessionError> {
     let mut value = 0_u64;
     for index in 0..10 {
-        let byte = recv.read_u8().await?;
+        let byte = match recv.read_u8().await {
+            Ok(byte) => byte,
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(SessionError::ControlStreamEnded);
+            }
+            Err(error) => return Err(SessionError::Io(error)),
+        };
         if index == 9 && byte > 1 {
             return Err(ProtocolViolation::ControlRecordTooLarge.into());
         }
@@ -1234,14 +1556,6 @@ async fn read_varint(recv: &mut quinn::RecvStream) -> Result<u64, SessionError> 
         }
     }
     Err(ProtocolViolation::ControlRecordTooLarge.into())
-}
-
-fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
-    while value >= 0x80 {
-        output.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
 }
 
 fn peer_from_hello(envelope: v1::ControlEnvelope) -> Result<SessionPeer, SessionError> {
@@ -1281,6 +1595,25 @@ fn peer_from_hello(envelope: v1::ControlEnvelope) -> Result<SessionPeer, Session
         device_kind: display.device_kind,
         endpoints: hello.endpoints,
     })
+}
+
+fn validate_session_ready(envelope: v1::ControlEnvelope) -> Result<(), SessionError> {
+    let Some(v1::control_envelope::Body::SessionReady(ready)) = envelope.body else {
+        return Err(SessionError::UnexpectedRecord("expected SessionReady"));
+    };
+    let version = ready
+        .protocol_version
+        .ok_or(SessionError::UnexpectedRecord(
+            "SessionReady missing version",
+        ))?;
+    if version.major != u32::from(PROTOCOL_MAJOR) || version.minor > u32::from(PROTOCOL_MINOR) {
+        return Err(ProtocolViolation::UnsupportedControlVersion {
+            major: version.major as u8,
+            minor: version.minor as u8,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn decode_event(envelope: v1::ControlEnvelope) -> Result<SessionEvent, SessionError> {

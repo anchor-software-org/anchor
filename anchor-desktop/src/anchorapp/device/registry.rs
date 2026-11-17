@@ -268,4 +268,43 @@ mod tests {
         drop(registry);
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    #[test]
+    fn display_size_clears_on_last_disconnect_and_restores_after_reconnect_state() {
+        let (registry, directory) = registry();
+        let first = registry.connect_sdk("phone");
+        let second = registry.connect_sdk("phone");
+        registry.set_display_size("phone", 1366, 1024);
+        assert_eq!(registry.connected_devices()[0].display_size, Some((1366, 1024)));
+
+        drop(first);
+        assert_eq!(registry.connected_devices()[0].display_size, Some((1366, 1024)));
+
+        drop(second);
+        assert_eq!(registry.inner.lock().unwrap().devices["phone"].display_size, None);
+
+        let reconnected = registry.connect_sdk("phone");
+        assert_eq!(registry.connected_devices()[0].display_size, None);
+        registry.set_display_size("phone", 2048, 2732);
+        assert_eq!(registry.connected_devices()[0].display_size, Some((2048, 2732)));
+
+        drop(reconnected);
+        drop(registry);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incomplete_display_dimensions_do_not_replace_a_valid_size() {
+        let (registry, directory) = registry();
+        let connection = registry.connect_sdk("phone");
+        registry.set_display_size("phone", 1366, 1024);
+
+        registry.set_display_size("phone", 0, 2048);
+        registry.set_display_size("phone", 2732, 0);
+
+        assert_eq!(registry.connected_devices()[0].display_size, Some((1366, 1024)));
+        drop(connection);
+        drop(registry);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

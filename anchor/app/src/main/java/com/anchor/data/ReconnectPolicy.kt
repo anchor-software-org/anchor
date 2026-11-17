@@ -53,17 +53,25 @@ object ReconnectPolicy {
         // pairing flow.
         val trustedLastDeviceId = lastConnectedDeviceId?.takeIf { it in savedDeviceIds }
 
-        // 1. Last trusted device, seen on mDNS now → use its fresh (possibly changed) IP.
+        // 1. Last trusted device, seen on mDNS/wired now → use its fresh
+        //    (possibly changed) IP. When it is reachable on both paths, prefer
+        //    the wired address.
         if (trustedLastDeviceId != null) {
-            discovered.firstOrNull { it.deviceId == trustedLastDeviceId && it.ip.isNotEmpty() }
+            val matches = discovered.filter {
+                it.deviceId == trustedLastDeviceId && it.ip.isNotEmpty()
+            }
+            (matches.firstOrNull { it.wired } ?: matches.firstOrNull())
                 ?.let { return it.ip }
         }
 
-        // 2. Any other saved device currently on mDNS. mDNS presence means we
-        //    know it's reachable, so this beats a blind stored-IP attempt.
-        discovered.firstOrNull {
+        // 2. Any other saved device currently on discovery. Discovery presence
+        //    means we know it's reachable, so this beats a blind stored-IP
+        //    attempt. Wired addresses win here too.
+        val reachable = discovered.filter {
             it.deviceId != null && it.deviceId in savedDeviceIds && it.ip.isNotEmpty()
-        }?.let { return it.ip }
+        }
+        (reachable.firstOrNull { it.wired } ?: reachable.firstOrNull())
+            ?.let { return it.ip }
 
         // 3. Blind attempt at the last device's stored IP.
         return lastConnectedIp?.takeIf { trustedLastDeviceId != null && it.isNotEmpty() }

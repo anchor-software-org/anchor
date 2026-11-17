@@ -5,20 +5,20 @@ struct SettingsView: View {
     @State private var showShareSheet = false
     @State private var exportURL: URL?
 
-    private var statusColor: Color {
-        switch viewModel.connectionState.status {
-        case .connected: return .seaGreen40
-        case .connecting: return .anchorBlue40
-        case .disconnected: return .coralRed40
-        }
-    }
-
     private var statusText: String {
         switch viewModel.connectionState.status {
         case .connected: return "Connected"
         case .connecting: return "Connecting..."
         case .disconnected: return "Disconnected"
         }
+    }
+
+    private var endpointText: String {
+        let host = viewModel.connectionState.host
+        let port = viewModel.connectionState.port
+        guard !host.isEmpty else { return "--" }
+        guard port > 0 else { return host }
+        return host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
     }
 
     var body: some View {
@@ -42,12 +42,8 @@ struct SettingsView: View {
 
     private var connectionStatusSection: some View {
         Section("Connection Status") {
-            HStack {
-                Circle().fill(statusColor).frame(width: 10, height: 10)
-                Text(statusText)
-            }
-            SettingsRow(label: "Host", value: viewModel.connectionState.host.isEmpty ? "--" : viewModel.connectionState.host)
-            SettingsRow(label: "Port", value: viewModel.connectionState.port > 0 ? "\(viewModel.connectionState.port)" : "--")
+            Text(statusText)
+            SettingsRow(label: "Endpoint", value: endpointText)
             if let error = viewModel.connectionState.error {
                 Text(error).font(.caption).foregroundColor(.red)
             }
