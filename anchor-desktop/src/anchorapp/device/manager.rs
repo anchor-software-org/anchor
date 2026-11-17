@@ -24,6 +24,7 @@ use super::{
 };
 
 pub struct DeviceManager {
+    pub input_available: bool,
     pub registry: DeviceRegistry,
     pub broker_tx: Sender<AnchorEvent>,
     pub plugin_rx: Option<Receiver<AnchorEvent>>,
@@ -153,6 +154,7 @@ impl DeviceManager {
         let registry = DeviceRegistry::new(trusted_store);
 
         DeviceManager {
+            input_available: false,
             registry,
             broker_tx,
             plugin_rx: Some(plugin_rx),
@@ -201,6 +203,7 @@ impl DeviceManager {
         let sdk_commands = self.sdk_commands.clone();
         let sdk_camera = self.sdk_camera.clone();
         let sdk_device = self.sdk_device.clone();
+        let input_available = self.input_available;
         let pairing_request = self.pairing_request.clone();
         let sdk_identity = crate::anchorapp::tls::AnchorIdentity {
             certificate_pem: self.identity.certificate_pem.clone(),
@@ -232,6 +235,7 @@ impl DeviceManager {
 
             SdkServer::new(
                 sdk_identity,
+                input_available,
                 registry.clone(),
                 sdk_clipboard,
                 sdk_media,

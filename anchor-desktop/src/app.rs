@@ -182,6 +182,7 @@ impl AnchorAppInstance {
         let _sms_handle = self.sms_plugin.run();
         let _foghorn_handle = self.foghorn_plugin.run();
         let _input_handle = self.input_plugin.run();
+        self.device_manager.input_available = self.input_plugin.available;
         let _clipboard_handle = self.clipboard_plugin.run();
         let _media_handle = self.media_plugin.run();
         let _commands_handle = self.commands_plugin.run();

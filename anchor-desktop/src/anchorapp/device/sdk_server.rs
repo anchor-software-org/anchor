@@ -34,6 +34,7 @@ use crate::anchorapp::{
 };
 
 pub(crate) struct SdkServer {
+    input_available: bool,
     identity: AnchorIdentity,
     registry: DeviceRegistry,
     clipboard: SdkClipboardBinding,
@@ -53,6 +54,7 @@ impl SdkServer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         identity: AnchorIdentity,
+        input_available: bool,
         registry: DeviceRegistry,
         clipboard: SdkClipboardBinding,
         media: SdkMediaBinding,
@@ -67,6 +69,7 @@ impl SdkServer {
         pairing_request: SharedPairingRequest,
     ) -> Self {
         Self {
+            input_available,
             identity,
             registry,
             clipboard,
@@ -104,7 +107,7 @@ impl SdkServer {
     }
 
     async fn run(self) {
-        let identity = session_identity(&self.identity);
+        let identity = session_identity(&self.identity, self.input_available);
         let listener_identity = ListenerIdentity::from_pem(
             self.identity.certificate_pem.clone(),
             self.identity.private_key_pem.clone(),
@@ -1340,11 +1343,13 @@ fn forward_typed_sms_messages(
     });
 }
 
-fn session_identity(identity: &AnchorIdentity) -> SessionIdentity {
+fn session_identity(identity: &AnchorIdentity, input_available: bool) -> SessionIdentity {
     let mut endpoint = clipboard::endpoint_advertisement();
     endpoint.capabilities.push(device::advertisement());
     endpoint.capabilities.push(notifications::advertisement());
-    endpoint.capabilities.push(input::advertisement());
+    if input_available {
+        endpoint.capabilities.push(input::advertisement());
+    }
     endpoint.capabilities.push(media::advertisement());
     endpoint.capabilities.push(screen::advertisement());
     endpoint.capabilities.push(camera::advertisement());
@@ -1398,7 +1403,7 @@ fn accepts_device_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        accepts_device_state, device, forward_typed_sms_messages, handle_pairing,
+        accepts_device_state, device, forward_typed_sms_messages, handle_pairing, input,
         pairing_safety_number, screen, session_identity, v1, valid_file_offer,
     };
     use crate::anchorapp::event::{AnchorMessage, AnchorTarget};
@@ -1486,7 +1491,7 @@ mod tests {
     #[test]
     fn session_identity_advertises_device_and_clipboard() {
         let identity = crate::anchorapp::tls::generate_test_identity();
-        let session_identity = super::session_identity(&identity);
+        let session_identity = super::session_identity(&identity, true);
         assert_eq!(session_identity.endpoints.len(), 1);
         let names = session_identity
             .endpoints
@@ -1499,9 +1504,30 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_input_is_not_advertised_but_other_features_remain() {
+        let identity = crate::anchorapp::tls::generate_test_identity();
+        let names = |available| {
+            session_identity(&identity, available)
+                .endpoints
+                .into_iter()
+                .flat_map(|endpoint| endpoint.capabilities)
+                .map(|capability| capability.name)
+                .collect::<Vec<_>>()
+        };
+        let supported = names(true);
+        let unavailable = names(false);
+        assert!(supported.iter().any(|name| name == input::CAPABILITY_NAME));
+        assert!(!unavailable.iter().any(|name| name == input::CAPABILITY_NAME));
+        assert_eq!(
+            unavailable,
+            supported.into_iter().filter(|name| name != input::CAPABILITY_NAME).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn sdk_listener_binds_wildcard() {
         let identity = crate::anchorapp::tls::generate_test_identity();
-        let session_identity = session_identity(&identity);
+        let session_identity = session_identity(&identity, true);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -1536,7 +1562,7 @@ mod tests {
                 desktop.certificate_pem.clone(),
                 desktop.private_key_pem.clone(),
             ),
-            session_identity: session_identity(&desktop),
+            session_identity: session_identity(&desktop, true),
         })
         .unwrap();
         let address = listener.local_addr().unwrap();

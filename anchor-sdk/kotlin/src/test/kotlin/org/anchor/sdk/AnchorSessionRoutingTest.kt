@@ -20,6 +20,21 @@ import org.junit.Test
 
 class AnchorSessionRoutingTest {
     @Test
+    fun missingInputDoesNotPreventOpeningAnotherCapability() = runBlocking {
+        val session = connectSession(ScriptedTransport())
+        val error = expectSessionFailure {
+            session.openCapability(InputProtocol.ENDPOINT_ID, InputProtocol.CAPABILITY_NAME, 1)
+        }
+        assertEquals("peer does not advertise org.anchor.input@1", error.message)
+        session.openCapability(
+            ClipboardProtocol.ENDPOINT_ID,
+            ClipboardProtocol.CAPABILITY_NAME,
+            ClipboardProtocol.CAPABILITY_MAJOR,
+        )
+        Unit
+    }
+
+    @Test
     fun remotelyClosedCapabilityHandleCannotSendAnotherRecord() = runBlocking {
         val transport = ScriptedTransport()
         val session = connectSession(transport)
