@@ -32,6 +32,7 @@ __pycache__/
 *.keystore
 *.iml
 .gradle/
+.kotlin/
 local.properties
 .cxx/
 .externalNativeBuild/

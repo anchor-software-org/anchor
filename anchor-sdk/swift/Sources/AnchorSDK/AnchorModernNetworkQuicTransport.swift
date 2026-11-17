@@ -96,7 +96,7 @@ public final class AnchorModernNetworkQuicTransport: AnchorNetworkQuicTransport,
             throw AnchorNetworkTransportError.invalidPort
         }
         let canStart = withState {
-            guard connection == nil else { return false }
+            guard self.connection == nil else { return false }
             self.verification = verification
             peerCertificate = Data()
             terminalError = nil

@@ -51,7 +51,9 @@ devenv shell
 ```
 
 The Android SDK and NDK are not installed by Nix. Install them with Android's
-SDK tools. Set `ANDROID_SDK_ROOT` if the SDK is not at `~/Android/Sdk`.
+SDK tools, including platform 37 and Build Tools 36.0.0. The app and Kotlin
+SDK use Gradle 9.6.0, AGP 9.4.1, and built-in Kotlin 2.4.20. Set
+`ANDROID_SDK_ROOT` if the SDK is not at `~/Android/Sdk`.
 `ANDROID_NDK_ROOT` is optional; otherwise Anchor selects the newest NDK under
 `$ANDROID_SDK_ROOT/ndk`.
 
