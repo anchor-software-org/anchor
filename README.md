@@ -15,33 +15,34 @@ The supported desktop session is Linux Wayland. Android support requires
 Android 11 (API 30) or newer. See the [compatibility guide](docs/public/getting-started/compatibility.md)
 before installing.
 
-## Install and build
+## Install and develop
 
 For packages and compositor requirements
 [installation guide](docs/public/getting-started/installation.md).
 
+Development commands run inside one of two [devenv](https://devenv.sh/)
+environments. Enter the environment for the part of Anchor you are working on.
+
+To build and install the Android debug app:
 For development 
 [docs/developer/development-environment.md](docs/developer/development-environment.md)
 
 Quick start
 ```bash
-git clone --recursive <repository-url>
-cd anchor-desktop && devenv shell
+devenv shell
+android-install
+```
+
+To run the Linux desktop app in development:
+
+```bash
+cd anchor-desktop
+devenv shell
 dev
 ```
 
-## Roadmap 
-
-Right now this is very much in an early stage, I'm sure there are bugs for different hardware or devices that I have yet to squash. 
-Some current problems are support for different compositors, since I use sway it is the most supported along with Hyprland but 
-I'm looking for help in testing and extending compatibility to more systems. 
-
-Some future features that I would appreciate help in making or that I plan on making
-- Controlling my phone through my desktop without a janky solution (similar to windows phone for android)
-- Taking calls
-- Support for bluetooth 
-- Wifi direct connections (was attempted before but usually the hardware is the constraint) 
-- Audio passthrough, play phone audio through desktop and vice versa 
+See the [development environment guide](docs/developer/development-environment.md)
+for SDK setup, checks, production builds, and the complete command reference.
 
 ## Learn more
 

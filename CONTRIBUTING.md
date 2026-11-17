@@ -18,6 +18,23 @@ If you already cloned the repository, run:
 git submodule update --init --recursive
 ```
 
+Before running project commands, enter the correct environment. The repository
+root environment is for Android and Kotlin work:
+
+```bash
+devenv shell
+```
+
+The desktop environment is separate:
+
+```bash
+cd anchor-desktop
+devenv shell
+```
+
+Do not enter one environment and then change into the other project directory;
+the shell does not switch its dependencies when you change directories.
+
 ## Make a change
 
 Create a branch from `main`. Keep changes focused and explain the reason for
