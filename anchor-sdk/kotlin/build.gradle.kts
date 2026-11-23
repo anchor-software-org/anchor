@@ -56,7 +56,7 @@ dependencies {
     // consumers compiling against ClipboardProtocol also need the lite
     // runtime on their classpath.
     api("com.google.protobuf:protobuf-javalite:4.36.2")
-    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.87")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.79")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
